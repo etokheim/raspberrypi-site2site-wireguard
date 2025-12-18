@@ -586,6 +586,17 @@ main() {
     fi
     save_config_var "FIREWALL_ENABLED" "$FIREWALL_ENABLED"
 
+    # Ask about automatic updates (logs only, no email)
+    echo ""
+    echo -ne "🔄 Enable automatic updates (all packages) nightly at 03:00? [Y/n]: "
+    read -r auto_updates_choice
+    if [[ "$auto_updates_choice" =~ ^[Nn]$ ]]; then
+        AUTO_UPDATES_ENABLED="false"
+    else
+        AUTO_UPDATES_ENABLED="true"
+    fi
+    save_config_var "AUTO_UPDATES_ENABLED" "$AUTO_UPDATES_ENABLED"
+
     echo ""
     # Framed summary (fixed width)
     # Keep border the same as before, but give content one extra column
@@ -610,6 +621,11 @@ main() {
         printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• WAN firewall: ENABLED (allow SSH + WireGuard; drop other inbound; allow LAN management)"
     else
         printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• WAN firewall: DISABLED (WAN INPUT left unchanged beyond base rules)"
+    fi
+    if [ "$AUTO_UPDATES_ENABLED" = "true" ]; then
+        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Auto updates: ENABLED (all packages nightly at 03:00, logs only)"
+    else
+        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Auto updates: DISABLED"
     fi
     printf "╚%s╝\n" "$border_line"
     echo ""
@@ -776,6 +792,50 @@ EOF
         ensure_wan_firewall_rules
     else
         echo "[wan_firewall] Skipped (user disabled)" >> "$LOG_FILE"
+    fi
+
+    if [ "$AUTO_UPDATES_ENABLED" = "true" ]; then
+        # Create dated update log and prune to max 20
+        mkdir -p "$LOG_DIR"
+        update_log="$LOG_DIR/Update log $(date +%Y-%m-%d).log"
+        find "$LOG_DIR" -maxdepth 1 -type f -name 'Update log *.log' -printf '%T@ %p\n' 2>/dev/null | sort -nr | tail -n +21 | awk '{print $2}' | xargs -r rm -f
+
+        run_step "Configuring automatic updates" "bash -c \"
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update >> '$LOG_FILE' 2>&1
+            apt-get install -y unattended-upgrades >> '$LOG_FILE' 2>&1
+            cat > /etc/apt/apt.conf.d/51unattended-upgrades-gateway <<EOF
+Unattended-Upgrade::Origins-Pattern {
+    \\"origin=*\\";
+};
+Unattended-Upgrade::Automatic-Reboot \\"true\\";
+Unattended-Upgrade::Automatic-Reboot-Time \\"03:30\\";
+Unattended-Upgrade::AutoFixInterruptedDpkg \\"true\\";
+Unattended-Upgrade::MinimalSteps \\"true\\";
+Unattended-Upgrade::Verbose \\"true\\";
+Unattended-Upgrade::SyslogEnable \\"true\\";
+Unattended-Upgrade::SyslogFacility \\"daemon\\";
+Unattended-Upgrade::Mail \\"\\";
+Unattended-Upgrade::MailOnlyOnError \\"true\\";
+Unattended-Upgrade::Download-Upgradeable-Packages \\"true\\";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages \\"true\\";
+Unattended-Upgrade::Remove-New-Unused-Dependencies \\"true\\";
+Unattended-Upgrade::Remove-Unused-Dependencies \\"true\\";
+Unattended-Upgrade::Keep-Debs \\"false\\";
+};
+EOF
+            cat > /etc/apt/apt.conf.d/52periodic-gateway <<EOF
+APT::Periodic::Enable \\"1\\";
+APT::Periodic::Update-Package-Lists \\"1\\";
+APT::Periodic::Download-Upgradeable-Packages \\"1\\";
+APT::Periodic::AutocleanInterval \\"7\\";
+APT::Periodic::Unattended-Upgrade \\"1\\";
+APT::Periodic::Verbose \\"1\\";
+EOF
+            systemctl enable --now unattended-upgrades apt-daily.timer apt-daily-upgrade.timer >> '$LOG_FILE' 2>&1 || true
+        \""
+
+        echo "Automatic updates enabled; logs will reside under $LOG_DIR (dated 'Update log YYYY-MM-DD.log', max 20 kept)." >> "$update_log"
     fi
 
     echo ""

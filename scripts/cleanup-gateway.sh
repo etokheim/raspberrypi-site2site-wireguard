@@ -23,6 +23,16 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+remove_auto_updates() {
+    {
+        export DEBIAN_FRONTEND=noninteractive
+        systemctl disable --now unattended-upgrades apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+        rm -f /etc/apt/apt.conf.d/51unattended-upgrades-gateway /etc/apt/apt.conf.d/52periodic-gateway
+        apt-get purge -y unattended-upgrades >/dev/null 2>&1 || true
+        apt-get autoremove -y >/dev/null 2>&1 || true
+    } >> "$LOG_FILE" 2>&1
+}
+
 cleanup_wan_firewall_rules() {
     local wan_iface="$WAN_IFACE"
     local lan_iface="$LAN_IFACE"
@@ -124,9 +134,38 @@ main() {
     
     print_header
 
-    echo -e "${YELLOW}⚠️  This will remove WireGuard configuration and network settings.${NC}"
-    echo -e "   Press [ENTER] to continue or Ctrl+C to cancel."
-    read
+    # Planned changes summary
+    local box_w=95
+    local border_inner=95
+    local border_line
+    border_line=$(printf '═%.0s' $(seq 1 $border_inner))
+
+    echo "╔${border_line}╗"
+    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "📝 Planned changes (cleanup)"
+    echo "╠${border_line}╣"
+    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Stop WireGuard and remove wg0 config"
+    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Stop/disable DHCP (dnsmasq)"
+    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Stop/disable hostapd (if running)"
+    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Flush firewall/NAT and reset IP forwarding"
+    if [ "${FIREWALL_ENABLED:-true}" = "true" ]; then
+        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Remove WAN firewall rules"
+    else
+        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• WAN firewall rules were disabled (skip removal)"
+    fi
+    if [ "${AUTO_UPDATES_ENABLED:-false}" = "true" ]; then
+        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Disable and remove unattended-upgrades config"
+    else
+        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Automatic updates not enabled (skip removal)"
+    fi
+    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Restore network manager settings (nmcli/dhcpcd) to DHCP"
+    echo "╚${border_line}╝"
+    echo ""
+    echo -ne "Proceed with cleanup/restore? [Y/n]: "
+    read -r proceed_choice
+    if [[ "$proceed_choice" =~ ^[Nn]$ ]]; then
+        echo "Aborting cleanup by user request."
+        exit 1
+    fi
 
     run_step "Stopping WireGuard Service" "systemctl stop wg-quick@wg0; systemctl disable wg-quick@wg0"
     
@@ -149,6 +188,10 @@ main() {
     run_step "Flushing Firewall Rules" "iptables -t nat -F; iptables -F FORWARD; iptables -P FORWARD ACCEPT"
 
     run_step "Disabling IP Forwarding" "rm -f /etc/sysctl.d/99-vpn-gateway.conf && sysctl --system"
+
+    if [ "${AUTO_UPDATES_ENABLED:-false}" = "true" ]; then
+        run_step "Removing automatic updates configuration" "bash -c 'remove_auto_updates'"
+    fi
 
     echo -ne "⏳ ${CYAN}Restoring Network Configuration...${NC} "
     {
