@@ -22,6 +22,8 @@ save_config_var() {
     local var_name="$1"
     local var_value="$2"
     
+    echo "[DEBUG] Saving $var_name..." >> "$LOG_FILE"
+    
     # Create file if not exists
     if [ ! -f "$CONFIG_FILE" ]; then
         echo "# VPN Gateway Configuration" > "$CONFIG_FILE"
@@ -31,21 +33,28 @@ save_config_var() {
     
     # Check if var exists in file
     if grep -q "^$var_name=" "$CONFIG_FILE"; then
-        # Update existing line (using a temp file to avoid issues)
-        # Using simple sed with delimiter that likely won't appear in values (pipe |)
-        # Escape slashes in value for safety if using paths
-        local escaped_value=$(echo "$var_value" | sed 's/|/\\|/g') 
-        sed -i "s|^$var_name=.*|$var_name=\"$escaped_value\"|" "$CONFIG_FILE"
+        # Use grep -v to remove the line and then append the new one
+        # This avoids complex sed escaping issues
+        grep -v "^$var_name=" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp"
+        echo "$var_name=\"$var_value\"" >> "${CONFIG_FILE}.tmp"
+        mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+        chmod 600 "$CONFIG_FILE"
     else
         # Append new var
         echo "$var_name=\"$var_value\"" >> "$CONFIG_FILE"
     fi
+    echo "[DEBUG] Saved $var_name." >> "$LOG_FILE"
 }
 
 save_full_config() {
     # Legacy function kept for final save, but now redundant with incremental saves
     # We'll just update the timestamp header if we want, or do nothing.
     :
+}
+
+# Wrapper retained for compatibility
+save_config() {
+    save_full_config
 }
 
 # --- Colors & Styles ---
@@ -112,7 +121,7 @@ info() {
 }
 
 success() {
-    echo -e "${GREEN}✅ $1${NC}"
+    echo -e "${GREEN}✔ $1${NC}"
 }
 
 warn() {
@@ -170,6 +179,27 @@ run_step() {
     fi
 }
 
+# Ensure iptables forwarding/NAT rules exist for LAN -> wg0
+ensure_nat_rules() {
+    echo "[ensure_nat_rules] Verifying iptables rules for $LAN_IFACE -> wg0" >> "$LOG_FILE"
+    # Forward LAN to wg0
+    if ! iptables -C FORWARD -i "$LAN_IFACE" -o wg0 -j ACCEPT >/dev/null 2>&1; then
+        iptables -A FORWARD -i "$LAN_IFACE" -o wg0 -j ACCEPT >> "$LOG_FILE" 2>&1
+    fi
+    # Allow return traffic from wg0 to LAN
+    if ! iptables -C FORWARD -i wg0 -o "$LAN_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1; then
+        iptables -A FORWARD -i wg0 -o "$LAN_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT >> "$LOG_FILE" 2>&1
+    fi
+    # NAT out wg0
+    if ! iptables -t nat -C POSTROUTING -o wg0 -j MASQUERADE >/dev/null 2>&1; then
+        iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE >> "$LOG_FILE" 2>&1
+    fi
+    # NAT out WAN as secondary path (if desired)
+    if [ -n "$WAN_IFACE" ] && ! iptables -t nat -C POSTROUTING -o "$WAN_IFACE" -j MASQUERADE >/dev/null 2>&1; then
+        iptables -t nat -A POSTROUTING -o "$WAN_IFACE" -j MASQUERADE >> "$LOG_FILE" 2>&1
+    fi
+}
+
 # --- Main Logic ---
 
 check_root() {
@@ -191,38 +221,63 @@ select_interface() {
     local interfaces=$(get_interfaces)
     local chosen_iface=""
 
-    # Print UI to stderr so it doesn't get captured in the variable
+    # Print menu to stderr to keep stdout clean
+    echo "" >&2
     echo -e "${BOLD}$prompt_text${NC}" >&2
+
+    # Build arrays for selection
+    local idx=1
+    local iface_list=()
+    for iface in $interfaces; do
+        printf "   %2d) %s\n" "$idx" "$iface" >&2
+        iface_list+=("$iface")
+        idx=$((idx + 1))
+    done
+    echo "" >&2
+
+    # Build colored prompt
+    local prompt="👉 \e[1;34mSelect interface number"
     if [ -n "$default_iface" ]; then
-        echo -e "   (Default from config: ${YELLOW}$default_iface${NC})" >&2
+        prompt+=" [Default: \e[1;33m${default_iface}\e[0m]"
     fi
-    
-    PS3="👉 Select interface number: "
-    select iface in $interfaces; do
-        if [ -n "$iface" ]; then
-            chosen_iface="$iface"
+    prompt+=": \e[0m"
+
+    while true; do
+        # read from tty to avoid capture issues
+        read -r -p "$(echo -e "$prompt")" choice < /dev/tty
+
+        if [ -z "$choice" ] && [ -n "$default_iface" ]; then
+            chosen_iface="$default_iface"
+            break
+        elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#iface_list[@]}" ]; then
+            chosen_iface="${iface_list[$((choice-1))]}"
             break
         else
-            warn "Invalid selection. Please try again." >&2
+            if [ -n "$default_iface" ]; then
+                warn "Invalid selection. Press Enter for default or choose a valid number." >&2
+            else
+                warn "Invalid selection. Please try again." >&2
+            fi
         fi
     done
-    
-    # Only stdout the result
+
     echo "$chosen_iface"
 }
 
 get_wg_config() {
     # Pre-fill default from config if available
     local default_path="${WG_CONF_PATH:-}"
-    local prompt_msg="📂 Enter path to WireGuard peer config file"
-    if [ -n "$default_path" ]; then
-        prompt_msg="$prompt_msg [default: ${YELLOW}$default_path${NC}]"
-    fi
     
     while true; do
-        # Use echo -ne for color support in default value display
-        echo -ne "$prompt_msg: "
-        read -r input_path
+        # Prompt to stderr so it is visible when stdout is captured by command substitution.
+        # Use readline (-e) with optional initial text for tab completion and easier editing.
+        if [ -n "$default_path" ]; then
+            printf "📂 Enter path to WireGuard peer config file [default: \e[1;33m%s\e[0m]: " "$default_path" >&2
+            read -e -i "$default_path" -r input_path < /dev/tty
+        else
+            printf "📂 Enter path to WireGuard peer config file: " >&2
+            read -e -r input_path < /dev/tty
+        fi
         
         # Use input or default
         if [ -z "$input_path" ] && [ -n "$default_path" ]; then
@@ -231,14 +286,14 @@ get_wg_config() {
             wg_conf_path="$input_path"
         fi
 
-        echo -e "   ${BLUE}👉 This file contains your private key and peer settings for the home VPN.${NC}"
+        echo -e "   ${BLUE}👉 This file contains your private key and peer settings for the home VPN.${NC}" >&2
         if [ -f "$wg_conf_path" ]; then
             echo "$wg_conf_path"
             # Update global var for saving later
             WG_CONF_PATH="$wg_conf_path" 
             break
         else
-            warn "File not found: $wg_conf_path. Please try again."
+            warn "File not found: $wg_conf_path. Please try again." >&2
         fi
     done
 }
@@ -246,8 +301,17 @@ get_wg_config() {
 get_ip_range() {
     local default_cidr="${LAN_CIDR:-10.10.10.0/24}"
     
-    echo -ne "🌐 Enter LAN IP range (CIDR) [default: ${YELLOW}$default_cidr${NC}]: "
-    read -r input_cidr
+    # Debug logging
+    echo "[DEBUG] Entering get_ip_range function" >> "$LOG_FILE"
+    
+    # Prompt on stderr so it is visible even when this function is used in a
+    # command substitution (stdout is captured for the return value).
+    echo -ne "🌐 Enter LAN IP range (CIDR) [default: ${BOLD}${YELLOW}$default_cidr${NC}]: " >&2
+    
+    # Force read from terminal
+    read -r input_cidr < /dev/tty
+    
+    echo "[DEBUG] Read IP input: '$input_cidr'" >> "$LOG_FILE"
     
     if [ -z "$input_cidr" ]; then
         LAN_CIDR="$default_cidr"
@@ -255,7 +319,7 @@ get_ip_range() {
         LAN_CIDR="$input_cidr"
     fi
     
-    echo -e "   ${BLUE}👉 The private subnet for devices connecting to the AP (LAN side).${NC}"
+    echo -e "   ${BLUE}👉 The private subnet for devices connecting to the AP (LAN side).${NC}" >&2
     echo "$LAN_CIDR"
 }
 
@@ -274,6 +338,7 @@ main() {
     if ! dpkg -s dnsmasq >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS dnsmasq"; fi
     if ! dpkg -s iptables >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS iptables"; fi
     if ! dpkg -s qrencode >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS qrencode"; fi
+    if ! dpkg -s resolvconf >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS resolvconf"; fi
 
     if [ -n "$MISSING_PKGS" ]; then
         echo -e "   ${YELLOW}Missing packages:${NC}$MISSING_PKGS"
@@ -287,7 +352,7 @@ main() {
             run_step "Installing missing packages" "apt-get install -y $MISSING_PKGS"
         fi
     else
-        success "All base dependencies (wireguard, dnsmasq, iptables, qrencode) are already installed."
+        success "All base dependencies (wireguard, dnsmasq, iptables, qrencode, resolvconf) are already installed."
     fi
 
     echo ""
@@ -298,13 +363,6 @@ main() {
     echo -e "\n${BOLD}Step 1: Select the WAN interface${NC}"
     echo -e "   ${BLUE}ℹ️  This interface connects to the upstream Internet (e.g., USB adapter or built-in Ethernet connected to the site's router).${NC}"
     WAN_IFACE=$(select_interface "Available interfaces:" "$WAN_IFACE")
-    # Clean up output captured from select_interface (just in case)
-    # The select_interface function echoes prompts to stdout which are captured by $() if not redirected to stderr.
-    # We need to fix select_interface to print prompts to stderr or handle capture differently.
-    # Current issue: 'Available interfaces:' string is being captured.
-    
-    # FIX: Refactor select_interface to print UI to stderr so only the result goes to stdout
-    
     save_config_var "WAN_IFACE" "$WAN_IFACE"
     success "WAN Interface selected: $WAN_IFACE"
     
@@ -347,7 +405,7 @@ main() {
         default_ssid="${AP_SSID:-}"
         prompt_ssid="📡 Enter SSID (Network Name) for the AP"
         if [ -n "$default_ssid" ]; then
-             prompt_ssid="$prompt_ssid [default: ${YELLOW}$default_ssid${NC}]"
+             prompt_ssid="$prompt_ssid [default: ${BOLD}${YELLOW}$default_ssid${NC}]"
         fi
         echo -ne "$prompt_ssid: "
         read -r input_ssid
@@ -362,7 +420,7 @@ main() {
         default_pass="${AP_PASS:-}"
         prompt_pass="🔑 Enter Password for the AP (min 8 chars)"
         if [ -n "$default_pass" ]; then
-             prompt_pass="$prompt_pass [default: ${YELLOW}********${NC}]"
+             prompt_pass="$prompt_pass [default: ${BOLD}${YELLOW}********${NC}]"
         fi
         
         while true; do
@@ -384,12 +442,21 @@ main() {
                 echo "[DEBUG] Password too short." >> "$LOG_FILE"
             fi
         done
+        # Explicit log to confirm loop exit
+        echo "[DEBUG] Password accepted." >> "$LOG_FILE"
         save_config_var "AP_PASS" "$AP_PASS"
     else
         save_config_var "IS_WIRELESS" "false"
     fi
 
+    echo "" # Add newline for clarity
+    echo "[DEBUG] Starting IP Range prompt..." >> "$LOG_FILE"
+    
     LAN_CIDR=$(get_ip_range)
+    # The output of get_ip_range is captured into LAN_CIDR. 
+    # If get_ip_range has user prompts (read), they might be hidden/swallowed if not redirected to stderr!
+    # Just like with select_interface, we need to fix get_ip_range to print prompts to stderr.
+    
     save_config_var "LAN_CIDR" "$LAN_CIDR"
     LAN_IP=$(echo "$LAN_CIDR" | sed 's/\.0\/24$/.1/')
     
@@ -421,20 +488,28 @@ main() {
         
         # Detect Network Manager
         if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager; then
-            echo "Detected NetworkManager. Using nmcli..." >> "$LOG_FILE"
-            
-            # Create or modify connection for LAN interface
-            # Try to find existing connection for this interface
-            CON_NAME=$(nmcli -t -f NAME,DEVICE connection show | grep ":$LAN_IFACE$" | cut -d: -f1 | head -n1)
-            
-            if [ -z "$CON_NAME" ]; then
-                CON_NAME="Wired connection $LAN_IFACE" # Default name attempt or create new
-                nmcli con add type ethernet ifname "$LAN_IFACE" con-name "$CON_NAME" >> "$LOG_FILE" 2>&1
+            echo "Detected NetworkManager." >> "$LOG_FILE"
+
+            if [ "$IS_WIRELESS" = true ]; then
+                # Avoid NM connection type mismatches on wlan when hostapd will manage it.
+                echo "Wireless LAN: assigning static IP directly (bypassing nmcli connection profiles)." >> "$LOG_FILE"
+                ip addr flush dev "$LAN_IFACE" >> "$LOG_FILE" 2>&1 || true
+                ip addr add "$LAN_GATEWAY/24" dev "$LAN_IFACE" >> "$LOG_FILE" 2>&1
+                ip link set "$LAN_IFACE" up >> "$LOG_FILE" 2>&1
+            else
+                echo "Using nmcli for wired LAN." >> "$LOG_FILE"
+                # Create or modify connection for LAN interface
+                CON_NAME=$(nmcli -t -f NAME,DEVICE connection show | grep ":$LAN_IFACE$" | cut -d: -f1 | head -n1)
+                
+                if [ -z "$CON_NAME" ]; then
+                    CON_NAME="Wired connection $LAN_IFACE"
+                    nmcli con add type ethernet ifname "$LAN_IFACE" con-name "$CON_NAME" >> "$LOG_FILE" 2>&1
+                fi
+                
+                # Apply Static IP
+                nmcli con modify "$CON_NAME" ipv4.addresses "$LAN_GATEWAY/24" ipv4.method manual >> "$LOG_FILE" 2>&1
+                nmcli con up "$CON_NAME" >> "$LOG_FILE" 2>&1
             fi
-            
-            # Apply Static IP
-            nmcli con modify "$CON_NAME" ipv4.addresses "$LAN_GATEWAY/24" ipv4.method manual >> "$LOG_FILE" 2>&1
-            nmcli con up "$CON_NAME" >> "$LOG_FILE" 2>&1
             
         elif [ -f /etc/dhcpcd.conf ]; then
              echo "Detected dhcpcd..." >> "$LOG_FILE"
@@ -515,6 +590,9 @@ EOF
     \""
 
     run_step "Starting WireGuard VPN" "wg-quick up wg0 && systemctl enable wg-quick@wg0"
+
+    # Enforce required NAT/forward rules in case wg-quick skipped PostUp (e.g., interface already up)
+    ensure_nat_rules
 
     echo ""
     echo "╔════════════════════════════════════════════════════════════╗"

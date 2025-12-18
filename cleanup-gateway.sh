@@ -137,7 +137,7 @@ main() {
 
     echo ""
     echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║               ✅ Restore Complete!                         ║"
+    echo "║               ✔ Restore Complete!                         ║"
     echo "╚════════════════════════════════════════════════════════════╝"
     echo ""
     echo -e "The Pi should now be back to its original state."
