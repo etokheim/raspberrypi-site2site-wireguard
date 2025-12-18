@@ -139,6 +139,7 @@ get_wg_config() {
     while true; do
         echo -ne "📂 Enter path to WireGuard peer config file (e.g., /home/pi/wg0.conf): "
         read -e wg_conf_path
+        echo -e "   ${BLUE}👉 This file contains your private key and peer settings for the home VPN.${NC}"
         if [ -f "$wg_conf_path" ]; then
             echo "$wg_conf_path"
             break
@@ -151,6 +152,7 @@ get_wg_config() {
 get_ip_range() {
     echo -ne "🌐 Enter LAN IP range (CIDR) [default: ${YELLOW}10.10.10.0/24${NC}]: "
     read -e lan_cidr
+    echo -e "   ${BLUE}👉 The private subnet for devices connecting to the AP (LAN side).${NC}"
     if [ -z "$lan_cidr" ]; then
         lan_cidr="10.10.10.0/24"
     fi
@@ -174,18 +176,58 @@ main() {
     fi
 
     echo ""
-    info "Network Interface Configuration"
+    info "Network Interface Selection"
+    echo -e "   ${BLUE}👉 Identify which port connects to the Internet (WAN) and which serves the local private network (LAN).${NC}"
     echo "------------------------------------------------"
-    WAN_IFACE=$(select_interface "Select the WAN interface (Internet connection):")
-    success "WAN: $WAN_IFACE"
-    echo ""
-    LAN_IFACE=$(select_interface "Select the LAN interface (Access Point connection):")
-    success "LAN: $LAN_IFACE"
+    
+    echo -e "\n${BOLD}Step 1: Select the WAN interface${NC}"
+    echo -e "   ${BLUE}ℹ️  This interface connects to the upstream Internet (e.g., USB adapter or built-in Ethernet connected to the site's router).${NC}"
+    WAN_IFACE=$(select_interface "Available interfaces:")
+    success "WAN Interface selected: $WAN_IFACE"
+    
+    echo -e "\n${BOLD}Step 2: Select the LAN interface${NC}"
+    echo -e "   ${BLUE}ℹ️  This interface will host the secure private subnet (e.g., built-in Ethernet connected to your Access Point).${NC}"
+    echo -e "   ${YELLOW}👉 If you select a wireless interface (e.g., wlan0), the Pi will be configured as a Wi-Fi Access Point.${NC}"
+    LAN_IFACE=$(select_interface "Available interfaces:")
+    success "LAN Interface selected: $LAN_IFACE"
     echo ""
 
     if [ "$WAN_IFACE" == "$LAN_IFACE" ]; then
         error "WAN and LAN interfaces cannot be the same."
         exit 1
+    fi
+
+    # Check for Wireless LAN Interface
+    IS_WIRELESS=false
+    # More robust check: simple string matching
+    if echo "$LAN_IFACE" | grep -q "wlan"; then
+        IS_WIRELESS=true
+        info "Wireless LAN interface detected ($LAN_IFACE)."
+        echo -e "   ${BLUE}ℹ️  To use this interface for the private subnet, the Pi must act as a Wi-Fi Access Point.${NC}"
+        echo -e "   ${BLUE}ℹ️  This requires installing 'hostapd' (Host Access Point Daemon).${NC}"
+        
+        echo -ne "❓ ${YELLOW}Do you want to proceed with installing hostapd? [Y/n]${NC} "
+        read -r ap_install_choice
+        if [[ "$ap_install_choice" =~ ^[Nn]$ ]]; then
+            error "Cannot proceed with wireless LAN without hostapd. Exiting."
+            exit 1
+        fi
+        
+        run_step "Installing hostapd" "apt-get install -y hostapd"
+
+        echo -ne "📡 Enter SSID (Network Name) for the AP: "
+        read -e AP_SSID
+        
+        while true; do
+            echo -ne "🔑 Enter Password for the AP (min 8 chars): "
+            read -e -s AP_PASS
+            echo ""
+            if [ ${#AP_PASS} -ge 8 ]; then
+                break
+            else
+                warn "Password must be at least 8 characters."
+            fi
+        done
     fi
 
     LAN_CIDR=$(get_ip_range)
@@ -216,7 +258,7 @@ main() {
     # Since this involves complex multi-line writes, we'll write a temporary helper script or use a function.
     # Simpler: Just do the logic here but log it.
     
-    echo -ne "⏳ ${CYAN}Configuring Network Interfaces...${NC} "
+    echo -ne "⏳ ${CYAN}Configuring Network Interfaces (Static IP)...${NC} "
     {
         echo "[Configuring Network Interfaces]" >> "$LOG_FILE"
         if [ -f /etc/dhcpcd.conf ]; then
@@ -234,6 +276,7 @@ main() {
         fi
     } || { echo -e "[${RED}FAIL${NC}]"; exit 1; }
     echo -e "[${GREEN}DONE${NC}]"
+    echo -e "   ${BLUE}👉 Assigned static IP $LAN_GATEWAY to $LAN_IFACE (LAN)${NC}"
 
     # Configure dnsmasq
     echo -ne "⏳ ${CYAN}Configuring DHCP (dnsmasq)...${NC} "
@@ -250,6 +293,41 @@ EOF
         systemctl enable dnsmasq >> "$LOG_FILE" 2>&1
     } || { echo -e "[${RED}FAIL${NC}]"; exit 1; }
     echo -e "[${GREEN}DONE${NC}]"
+
+    # Configure hostapd if wireless
+    if [ "$IS_WIRELESS" = true ]; then
+        echo -ne "⏳ ${CYAN}Configuring Access Point (hostapd)...${NC} "
+        {
+            cat > /etc/hostapd/hostapd.conf <<EOF
+interface=$LAN_IFACE
+driver=nl80211
+ssid=$AP_SSID
+hw_mode=g
+channel=7
+wmm_enabled=0
+macaddr_acl=0
+auth_algs=1
+ignore_broadcast_ssid=0
+wpa=2
+wpa_passphrase=$AP_PASS
+wpa_key_mgmt=WPA-PSK
+wpa_pairwise=TKIP
+rsn_pairwise=CCMP
+EOF
+            # Point daemon to config
+            # (On some Pi OS versions, modifying /etc/default/hostapd is needed, but modern systemd service often looks at /etc/hostapd/hostapd.conf automatically or needs override)
+            # Standard Pi OS way:
+            sed -i 's|#DAEMON_CONF=""|DAEMON_CONF="/etc/hostapd/hostapd.conf"|' /etc/default/hostapd
+
+            # Unblock wlan
+            rfkill unblock wlan >> "$LOG_FILE" 2>&1
+            
+            systemctl unmask hostapd >> "$LOG_FILE" 2>&1
+            systemctl enable hostapd >> "$LOG_FILE" 2>&1
+            systemctl restart hostapd >> "$LOG_FILE" 2>&1
+        } || { echo -e "[${RED}FAIL${NC}]"; exit 1; }
+        echo -e "[${GREEN}DONE${NC}]"
+    fi
 
 
     run_step "Configuring Firewall / NAT Rules" "bash -c \"

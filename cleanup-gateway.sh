@@ -89,6 +89,11 @@ main() {
 
     run_step "Stopping DHCP Server (dnsmasq)" "systemctl stop dnsmasq; systemctl disable dnsmasq"
 
+    # Stop hostapd if it was installed/active
+    if systemctl is-active --quiet hostapd; then
+        run_step "Stopping Access Point (hostapd)" "systemctl stop hostapd; systemctl disable hostapd"
+    fi
+
     run_step "Flushing Firewall Rules" "iptables -t nat -F; iptables -F FORWARD; iptables -P FORWARD ACCEPT"
 
     run_step "Disabling IP Forwarding" "rm -f /etc/sysctl.d/99-vpn-gateway.conf && sysctl --system"
