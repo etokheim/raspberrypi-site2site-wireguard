@@ -21,6 +21,27 @@ NC='\033[0m' # No Color
 
 # --- UI Functions ---
 
+# Trap Function for Ctrl+C
+cleanup_on_interrupt() {
+    echo ""
+    echo -e "${RED}${BOLD}🚨 Setup Interrupted!${NC}"
+    echo -e "${YELLOW}The system might be in an inconsistent state.${NC}"
+    echo ""
+    echo -ne "❓ ${CYAN}Do you want to run the cleanup script to restore original settings? [Y/n]${NC} "
+    read -r cleanup_choice
+    if [[ ! "$cleanup_choice" =~ ^[Nn]$ ]]; then
+        info "Running cleanup script..."
+        if [ -f "./cleanup-gateway.sh" ]; then
+            ./cleanup-gateway.sh
+        else
+            error "Cleanup script not found! Please run cleanup-gateway.sh manually."
+        fi
+    else
+        warn "Exiting without cleanup. You may need to manually fix network configurations."
+    fi
+    exit 1
+}
+
 # Initialize Log
 init_log() {
     echo "--- VPN Gateway Setup Log Started: $(date) ---" > "$LOG_FILE"
@@ -160,6 +181,7 @@ get_ip_range() {
 }
 
 main() {
+    trap cleanup_on_interrupt SIGINT
     init_log
     check_root
     print_header
