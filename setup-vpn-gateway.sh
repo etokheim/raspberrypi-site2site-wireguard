@@ -109,23 +109,25 @@ main() {
 
     # Enable IP forwarding
     echo "Enabling IP forwarding..."
-    sed -i 's/#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/' /etc/sysctl.conf
-    sysctl -p
+    echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-vpn-gateway.conf
+    sysctl -p /etc/sysctl.d/99-vpn-gateway.conf
 
     # Configure static IP for LAN interface
     echo "Configuring static IP for $LAN_IFACE..."
-    # Using dhcpcd.conf is common on Pi OS, but let's check if we should use creating a file in /etc/network/interfaces.d/ or systemd-networkd
-    # Raspberry Pi OS (modern) often uses dhcpcd. Let's append to dhcpcd.conf if it exists, otherwise use nmcli or ip command? 
-    # To be safe and persistent across reboots without conflicting with NetworkManager/dhcpcd too much:
+    
     if [ -f /etc/dhcpcd.conf ]; then
-        if grep -q "interface $LAN_IFACE" /etc/dhcpcd.conf; then
-            echo "Warning: $LAN_IFACE configuration already exists in /etc/dhcpcd.conf. Please check manually."
-        else
-            echo "" >> /etc/dhcpcd.conf
-            echo "interface $LAN_IFACE" >> /etc/dhcpcd.conf
-            echo "static ip_address=$LAN_GATEWAY/24" >> /etc/dhcpcd.conf
-            echo "nohook wpa_supplicant" >> /etc/dhcpcd.conf 
-        fi
+        # Remove old block if it exists
+        sed -i '/# VPN-GATEWAY-START/,/# VPN-GATEWAY-END/d' /etc/dhcpcd.conf
+        
+        # Append new block
+        {
+            echo "# VPN-GATEWAY-START"
+            echo "interface $LAN_IFACE"
+            echo "static ip_address=$LAN_GATEWAY/24"
+            echo "nohook wpa_supplicant"
+            echo "# VPN-GATEWAY-END"
+        } >> /etc/dhcpcd.conf
+        
         # Restart dhcpcd to apply
         systemctl restart dhcpcd
     else
@@ -155,19 +157,10 @@ EOF
         exit 1
     fi
 
-    # Add PostUp/PostDown rules
-    # We use sed to insert after [Interface] line
-    # Forwarding rules:
-    # 1. Masquerade traffic leaving WAN_IFACE (if not going through VPN? Actually, usually we route traffic THROUGH VPN)
-    # Wait, the request is "site-to-site connectivity". 
-    # Usually this means:
-    # - Traffic from LAN ($LAN_CIDR) going to Remote VPN Subnet -> goes via wg0
-    # - Traffic from LAN ($LAN_CIDR) going to Internet -> goes via WAN_IFACE (Direct) OR via wg0 (VPN Tunnel)
-    # Assuming user wants VPN connectivity to home network, and maybe internet via VPN?
-    # Standard "Gateway" usually implies NATting LAN traffic out via wg0.
-    
-    # Let's assume split-tunnel or full-tunnel is defined in AllowedIPs of the peer config provided.
-    # We just need to ensure packets from LAN can enter wg0.
+    # Clean up any existing PostUp/PostDown rules we might have added previously
+    # (Simple approach: we don't remove them here to avoid damaging user custom rules,
+    # but since this copies a fresh file from WG_CONF_SRC each time, we actually start fresh!)
+    # Note: Lines 106-107 copy the fresh source file. So we are already idempotent regarding the destination file content!
     
     POST_UP="PostUp = iptables -A FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT; iptables -A FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE"
     POST_DOWN="PostDown = iptables -D FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT; iptables -D FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -D POSTROUTING -o wg0 -j MASQUERADE"
