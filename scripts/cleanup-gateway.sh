@@ -6,8 +6,13 @@
 
 set -o pipefail
 
-CONFIG_FILE="vpn_gateway.conf"
-LOG_FILE="vpn_cleanup.log"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+LOG_DIR="$ROOT_DIR/logs"
+LOG_FILE="$LOG_DIR/vpn_cleanup.log"
+CONFIG_FILE="$ROOT_DIR/vpn-gateway.conf"
+LEGACY_CONFIG_1="$ROOT_DIR/gateway.conf"
+LEGACY_CONFIG_2="$ROOT_DIR/vpn_gateway.conf"
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -19,6 +24,7 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 init_log() {
+    mkdir -p "$LOG_DIR"
     echo "--- VPN Gateway Cleanup Log Started: $(date) ---" > "$LOG_FILE"
 }
 
@@ -79,6 +85,13 @@ main() {
     check_root
     
     # Load config if available to identify LAN interface
+    if [ ! -f "$CONFIG_FILE" ]; then
+        if [ -f "$LEGACY_CONFIG_1" ]; then
+            mv "$LEGACY_CONFIG_1" "$CONFIG_FILE"
+        elif [ -f "$LEGACY_CONFIG_2" ]; then
+            mv "$LEGACY_CONFIG_2" "$CONFIG_FILE"
+        fi
+    fi
     if [ -f "$CONFIG_FILE" ]; then
         source "$CONFIG_FILE"
         echo "Loaded configuration from $CONFIG_FILE" >> "$LOG_FILE"

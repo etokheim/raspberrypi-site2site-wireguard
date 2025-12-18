@@ -6,15 +6,65 @@
 
 set -o pipefail
 
-# --- Configuration & Globals ---
-LOG_FILE="vpn_setup.log"
-CONFIG_FILE="vpn_gateway.conf"
+# --- Paths & Configuration ---
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+LOG_DIR="$ROOT_DIR/logs"
+LOG_FILE="$LOG_DIR/vpn_setup.log"
+CONFIG_FILE="$ROOT_DIR/vpn-gateway.conf"
+LEGACY_CONFIG_1="$ROOT_DIR/gateway.conf"
+LEGACY_CONFIG_2="$ROOT_DIR/vpn_gateway.conf"
 TERM_WIDTH=$(tput cols)
 
 # --- Configuration Loading ---
 load_config() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        if [ -f "$LEGACY_CONFIG_1" ]; then
+            mv "$LEGACY_CONFIG_1" "$CONFIG_FILE"
+        elif [ -f "$LEGACY_CONFIG_2" ]; then
+            mv "$LEGACY_CONFIG_2" "$CONFIG_FILE"
+        fi
+    fi
     if [ -f "$CONFIG_FILE" ]; then
         source "$CONFIG_FILE"
+    fi
+}
+
+is_wg_active() {
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet wg-quick@wg0; then
+        return 0
+    fi
+    ip link show wg0 >/dev/null 2>&1
+}
+
+reset_previous_lan_iface() {
+    local old_iface="$1"
+    local new_iface="$2"
+    local old_wireless="$3"
+
+    if [ -z "$old_iface" ] || [ "$old_iface" = "$new_iface" ]; then
+        return
+    fi
+
+    echo "[Reconfig] Clearing previous LAN interface $old_iface" >> "$LOG_FILE"
+
+    # Detach NetworkManager configuration on the previous LAN interface
+    if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager; then
+        local old_con
+        old_con=$(nmcli -t -f NAME,DEVICE connection show | grep ":$old_iface$" | cut -d: -f1 | head -n1)
+        if [ -n "$old_con" ]; then
+            nmcli con modify "$old_con" ipv4.method auto >> "$LOG_FILE" 2>&1 || true
+            nmcli con down "$old_con" >> "$LOG_FILE" 2>&1 || true
+        fi
+    fi
+
+    # Flush any static addresses on the old LAN interface
+    ip addr flush dev "$old_iface" >> "$LOG_FILE" 2>&1 || true
+
+    # If we previously configured hostapd on that interface but are no longer wireless, stop it
+    if [ "$old_wireless" = "true" ] && ! echo "$new_iface" | grep -q "wlan"; then
+        systemctl stop hostapd >> "$LOG_FILE" 2>&1 || true
+        systemctl disable hostapd >> "$LOG_FILE" 2>&1 || true
     fi
 }
 
@@ -87,8 +137,9 @@ cleanup_on_interrupt() {
     
     if [[ ! "$cleanup_choice" =~ ^[Nn]$ ]]; then
         info "\nRunning cleanup script..."
-        if [ -f "./cleanup-gateway.sh" ]; then
-            ./cleanup-gateway.sh
+        local cleanup_script="$ROOT_DIR/scripts/cleanup-gateway.sh"
+        if [ -f "$cleanup_script" ]; then
+            bash "$cleanup_script"
         else
             error "Cleanup script not found! Please run cleanup-gateway.sh manually."
         fi
@@ -100,6 +151,7 @@ cleanup_on_interrupt() {
 
 # Initialize Log
 init_log() {
+    mkdir -p "$LOG_DIR"
     echo "--- VPN Gateway Setup Log Started: $(date) ---" > "$LOG_FILE"
 }
 
@@ -326,6 +378,10 @@ get_ip_range() {
 main() {
     trap cleanup_on_interrupt SIGINT
     load_config # Load defaults from file if it exists
+    PREV_LAN_IFACE="$LAN_IFACE"
+    PREV_WAN_IFACE="$WAN_IFACE"
+    PREV_LAN_CIDR="$LAN_CIDR"
+    PREV_IS_WIRELESS="${IS_WIRELESS:-false}"
     init_log
     check_root
     print_header
@@ -371,6 +427,10 @@ main() {
     echo -e "   ${YELLOW}👉 If you select a wireless interface (e.g., wlan0), the Pi will be configured as a Wi-Fi Access Point.${NC}"
     LAN_IFACE=$(select_interface "Available interfaces:" "$LAN_IFACE")
     save_config_var "LAN_IFACE" "$LAN_IFACE"
+    if [ -n "$PREV_LAN_IFACE" ] && [ "$PREV_LAN_IFACE" != "$LAN_IFACE" ]; then
+        info "Detected LAN change: $PREV_LAN_IFACE -> $LAN_IFACE (cleaning old interface state)"
+        reset_previous_lan_iface "$PREV_LAN_IFACE" "$LAN_IFACE" "$PREV_IS_WIRELESS"
+    fi
     success "LAN Interface selected: $LAN_IFACE"
     echo ""
 
@@ -485,6 +545,10 @@ main() {
     echo -ne "⏳ ${CYAN}Configuring Network Interfaces (Static IP)...${NC} "
     {
         echo "[Configuring Network Interfaces]" >> "$LOG_FILE"
+        if [ -n "$PREV_LAN_CIDR" ] && [ "$PREV_LAN_CIDR" != "$LAN_CIDR" ]; then
+            echo "[Reconfig] LAN CIDR change: $PREV_LAN_CIDR -> $LAN_CIDR" >> "$LOG_FILE"
+        fi
+        ip addr flush dev "$LAN_IFACE" >> "$LOG_FILE" 2>&1 || true
         
         # Detect Network Manager
         if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager; then
@@ -493,7 +557,6 @@ main() {
             if [ "$IS_WIRELESS" = true ]; then
                 # Avoid NM connection type mismatches on wlan when hostapd will manage it.
                 echo "Wireless LAN: assigning static IP directly (bypassing nmcli connection profiles)." >> "$LOG_FILE"
-                ip addr flush dev "$LAN_IFACE" >> "$LOG_FILE" 2>&1 || true
                 ip addr add "$LAN_GATEWAY/24" dev "$LAN_IFACE" >> "$LOG_FILE" 2>&1
                 ip link set "$LAN_IFACE" up >> "$LOG_FILE" 2>&1
             else
@@ -589,7 +652,12 @@ EOF
         awk -v up=\\\"\$POST_UP\\\" -v down=\\\"\$POST_DOWN\\\" '/\[Interface\]/ { print; print up; print down; next } 1' '$WG_CONF_DEST' > '${WG_CONF_DEST}.tmp' && mv '${WG_CONF_DEST}.tmp' '$WG_CONF_DEST'
     \""
 
-    run_step "Starting WireGuard VPN" "wg-quick up wg0 && systemctl enable wg-quick@wg0"
+    run_step "Ensuring WireGuard VPN is running" "bash -c \"
+        if ip link show wg0 >/dev/null 2>&1; then
+            wg-quick down wg0 || true;
+        fi
+        wg-quick up wg0 && systemctl enable wg-quick@wg0
+    \""
 
     # Enforce required NAT/forward rules in case wg-quick skipped PostUp (e.g., interface already up)
     ensure_nat_rules
