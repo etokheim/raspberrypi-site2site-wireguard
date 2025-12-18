@@ -36,16 +36,18 @@ SEO-friendly terms: *Raspberry Pi site-to-site VPN*, *WireGuard gateway*, *home 
    ```bash
    git clone https://github.com/your/repo.git vpn-project
    cd vpn-project
-   chmod +x setup-vpn-gateway.sh cleanup-gateway.sh
    ```
 3) Copy your WireGuard peer config to the Pi (e.g., `/home/pi/wg-peer.conf`).
-4) Run the installer  
+4) Run the entrypoint (prompts for everything)  
    ```bash
-   sudo ./setup-vpn-gateway.sh
+   sudo ./gateway-manage-or-setup.sh
    ```
    - Select WAN and LAN (Enter accepts defaults).  
    - If LAN is Wi‑Fi (e.g., `wlan0`), enter SSID/password; hostapd is auto-configured.  
-   - Provide the WireGuard config path (tab completion enabled).
+   - Provide the WireGuard config path (tab completion enabled).  
+   - Opt into WAN firewall hardening (allow SSH + WireGuard, drop other inbound).  
+   - Opt into automatic updates (all packages nightly at 03:00, logs only; max 20 update logs kept).  
+   - Review the framed “Planned changes” summary, then confirm to apply.
 5) Connect devices  
    - Wired: plug a switch/AP into the Pi’s LAN.  
    - Wi‑Fi: connect to the SSID you set. Clients get `10.10.10.x` and route through WireGuard to your home network.
@@ -77,14 +79,21 @@ nslookup google.com 10.10.10.1  # DNS via dnsmasq
 ```
 
 ## Logs and artifacts
-- Setup log: `vpn_setup.log`
-- Cleanup log: `vpn_cleanup.log`
-- Config file: `vpn_gateway.conf` (git-ignored)
+- Setup log: `logs/vpn_setup.log`
+- Cleanup log: `logs/vpn_cleanup.log`
+- Update logs (if auto-updates enabled): `logs/Update log YYYY-MM-DD.log` (max 20 kept)
+- Config file: `vpn-gateway.conf` (git-ignored)
 
 ## Cleanup / revert
-```bash
-sudo ./cleanup-gateway.sh
-```
+- Via entrypoint: `sudo ./gateway-manage-or-setup.sh --cleanup`
+- Direct script: `sudo ./scripts/cleanup-gateway.sh`
+
+Cleanup shows a planned-changes summary and will:
+- Stop/disable WireGuard, dnsmasq, hostapd (if running)
+- Remove WAN firewall rules (if they were enabled)
+- Flush firewall/NAT rules; reset IP forwarding
+- Restore NetworkManager/dhcpcd to DHCP
+- Remove unattended-upgrades config/timers if auto updates were enabled
 
 ## Troubleshooting
 - **wg-quick DNS errors**: ensure `resolvconf` is installed (handled by the script) and the endpoint hostname resolves.  
