@@ -1,49 +1,95 @@
-# Remote Site-to-Site VPN Gateway
+# Raspberry Pi Site-to-Site VPN Gateway (WireGuard)
 
-## Overview
+_TLDR - Example use cases:_
+- _Let's a Raspberry Pi create a WIFI network on which all connected clients think they are on your home network - even though they are off-site!_
+- _Create a safe and private WIFI while traveling_
+- _Create an extension of your home network_
 
-This project configures a **Raspberry Pi 4** running **Raspberry Pi OS Lite** as a VPN gateway.
+---
 
-The primary goal is to create a **secure, site-to-site sub-network** that sits behind an existing, potentially unsecure or restricted subnet. By establishing an outbound **WireGuard** tunnel to a trusted home network, this setup provides a private, bidirectional extension of the home network into the remote location, bypassing local network restrictions.
+Build a **plug-and-play site-to-site VPN** with a single **Raspberry Pi** and **one Ethernet cable**. The script turns the Pi into:
+- A **WireGuard VPN client** that extends your home network to a remote site.
+- A **DHCP router + NAT** for a private subnet.
+- An optional **Wi‑Fi access point** so every device on that Wi‑Fi “pretends” to be on your home network - no router changes needed.
 
-## Constraints & Challenges
+SEO-friendly terms: *Raspberry Pi site-to-site VPN*, *WireGuard gateway*, *home network extension*, *remote office Wi‑Fi to home network*, *plug-and-play VPN router*.
 
-- **Host Device**: Raspberry Pi 4.
-- **Network Access**: No administrative access to the underlying network infrastructure (router/ISP).
-- **No Port Forwarding**: Cannot configure port forwarding; likely behind NAT/CGNAT.
+## Why this is simple
+- Works behind **NAT/CGNAT** (outbound WireGuard only; no port forwarding).
+- Zero router config at the remote site—plug in WAN Ethernet, run one script.
+- If you enable Wi‑Fi, the Pi broadcasts an SSID that tunnels straight to home.
 
-## Goals
+## Hardware
+- Raspberry Pi 4 (or similar Pi; Wi‑Fi-capable if you want an AP)
+- One Ethernet cable (WAN to the existing onsite network)
+- Optional: USB Ethernet adapter if you prefer wired LAN plus Wi‑Fi WAN/LAN
 
-1.  **Secure Subnet**: Create a private subnet for devices at the remote location.
-2.  **Site-to-Site Connectivity**: Establish a persistent VPN tunnel to the home network.
-3.  **Bidirectional Access**: Ensure all devices on the remote subnet are reachable from the home network, and home network devices are reachable from the remote subnet.
+## Software / Files
+- Raspberry Pi OS Lite
+- WireGuard peer config from your home network (e.g., `wg0.conf`/peer file)
 
-## Architecture
+## Quick start (about 5 minutes)
+1) Prep the Pi  
+   - Flash Raspberry Pi OS Lite, enable SSH, boot, then:  
+     `sudo apt-get update && sudo apt-get upgrade -y`
+2) Get the project  
+   ```bash
+   git clone https://github.com/your/repo.git vpn-project
+   cd vpn-project
+   chmod +x setup-vpn-gateway.sh cleanup-gateway.sh
+   ```
+3) Copy your WireGuard peer config to the Pi (e.g., `/home/pi/wg-peer.conf`).
+4) Run the installer  
+   ```bash
+   sudo ./setup-vpn-gateway.sh
+   ```
+   - Select WAN and LAN (Enter accepts defaults).  
+   - If LAN is Wi‑Fi (e.g., `wlan0`), enter SSID/password; hostapd is auto-configured.  
+   - Provide the WireGuard config path (tab completion enabled).
+5) Connect devices  
+   - Wired: plug a switch/AP into the Pi’s LAN.  
+   - Wi‑Fi: connect to the SSID you set. Clients get `10.10.10.x` and route through WireGuard to your home network.
 
-The solution uses **WireGuard** for the VPN tunnel. Given the inability to open inbound ports at the remote site:
-- The remote Pi initiates a persistent *outbound* WireGuard connection to the home network (which acts as the "server" or has a publicly accessible endpoint).
-- `PersistentKeepalive` is used to maintain the NAT mapping.
+## What the script sets up
+- **WireGuard** at `/etc/wireguard/wg0.conf`, `wg-quick@wg0` enabled, PostUp/PostDown iptables rules.
+- **Routing/NAT**: iptables forwarding and MASQUERADE from LAN → `wg0` (WAN MASQUERADE as secondary).
+- **DHCP/DNS**: dnsmasq on the LAN/AP subnet; DNS served by the Pi.
+- **Static IP**: gateway `10.10.10.1/24` on the LAN/AP interface.
+- **Access Point (optional)**: hostapd with your SSID/password when LAN is wireless.
+- **Resilience**: enforces NAT rules after bring-up in case PostUp is skipped.
 
-## Network Topology
+## Default network plan (changeable at prompts)
+- Subnet: `10.10.10.0/24`
+- Gateway: `10.10.10.1`
+- DHCP pool: `10.10.10.10 - 10.10.10.250`
 
-The Raspberry Pi acts as a router between the restricted on-site network and a new private subnet:
+## Verify it works
+On the Pi:
+```bash
+wg show
+curl https://ifconfig.me   # should show your home/central egress IP
+```
+On a client connected to the Pi LAN/AP:
+```bash
+ping 10.10.10.1                 # gateway reachability
+ping 1.1.1.1                    # routing/NAT
+nslookup google.com 10.10.10.1  # DNS via dnsmasq
+```
 
-- **WAN (Internet)**: Connected via a **secondary network adapter** (e.g., USB Ethernet). This interface connects to the existing on-site network to access the internet.
-- **LAN (Private Subnet)**: The **built-in Ethernet port** serves as the gateway for the secure subnet.
-- **Access Point**: A wireless access point connects to the LAN port to provide Wi-Fi to local devices.
+## Logs and artifacts
+- Setup log: `vpn_setup.log`
+- Cleanup log: `vpn_cleanup.log`
+- Config file: `vpn_gateway.conf` (git-ignored)
 
-## Software Requirements
+## Cleanup / revert
+```bash
+sudo ./cleanup-gateway.sh
+```
 
-- **OS**: Raspberry Pi OS Lite (minimal, headless).
-- **VPN**: WireGuard.
+## Troubleshooting
+- **wg-quick DNS errors**: ensure `resolvconf` is installed (handled by the script) and the endpoint hostname resolves.  
+- **Clients get DHCP but no internet**: check `iptables -t nat -S | grep MASQUERADE` and `iptables -S FORWARD | egrep 'wlan0|wg0'`. The script enforces these rules, but verify after reboots.  
+- **Using a wired AP instead of Pi Wi‑Fi**: choose the Pi’s Wi‑Fi as WAN and plug your wired AP/switch into the Pi’s Ethernet as LAN.
 
-## Hardware Requirements
-
-- Raspberry Pi 4
-- Secondary Network Adapter (USB Ethernet)
-- Wireless Access Point (AP)
-- Ethernet cables
-
-## Getting Started
-
-*Documentation in progress.*
+## One-line pitch
+Set up a **Raspberry Pi WireGuard site-to-site VPN** in minutes. One Ethernet cable in, optional Pi Wi‑Fi out, and every device on that Wi‑Fi (or LAN) behaves as if it’s on your **home network**—no router changes, no port forwarding, fully NAT-friendly. Perfect for remote offices, cabins, and temporary sites.
