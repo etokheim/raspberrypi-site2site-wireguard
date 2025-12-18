@@ -6,6 +6,7 @@
 
 set -o pipefail
 
+CONFIG_FILE="vpn_gateway.conf"
 LOG_FILE="vpn_cleanup.log"
 
 # --- Colors ---
@@ -76,6 +77,13 @@ check_root() {
 main() {
     init_log
     check_root
+    
+    # Load config if available to identify LAN interface
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+        echo "Loaded configuration from $CONFIG_FILE" >> "$LOG_FILE"
+    fi
+    
     print_header
 
     echo -e "${YELLOW}⚠️  This will remove WireGuard configuration and network settings.${NC}"
@@ -100,10 +108,31 @@ main() {
 
     echo -ne "⏳ ${CYAN}Restoring Network Configuration...${NC} "
     {
-        if [ -f /etc/dhcpcd.conf ]; then
+        # NetworkManager Restore
+        if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager; then
+             if [ -n "$LAN_IFACE" ]; then
+                 # We know the interface! Try to find the connection we modified.
+                 # Our setup script creates/uses "Wired connection $LAN_IFACE" or similar.
+                 # Let's try to find connection by device name.
+                 CON_NAME=$(nmcli -t -f NAME,DEVICE connection show | grep ":$LAN_IFACE$" | cut -d: -f1 | head -n1)
+                 
+                 if [ -n "$CON_NAME" ]; then
+                     echo "Resetting NetworkManager connection '$CON_NAME' to auto..." >> "$LOG_FILE"
+                     nmcli con modify "$CON_NAME" ipv4.method auto >> "$LOG_FILE" 2>&1
+                     # Re-apply
+                     nmcli con up "$CON_NAME" >> "$LOG_FILE" 2>&1
+                 else
+                     echo "  [WARNING] Could not find NetworkManager connection for interface $LAN_IFACE" >> "$LOG_FILE"
+                 fi
+             else
+                 echo "  [WARNING] LAN Interface unknown (no config file). Cannot automatically revert static IP." >> "$LOG_FILE"
+                 echo "  Please run 'nmcli con modify <conn_name> ipv4.method auto' manually." >> "$LOG_FILE"
+             fi
+             
+        elif [ -f /etc/dhcpcd.conf ]; then
             sed -i '/# VPN-GATEWAY-START/,/# VPN-GATEWAY-END/d' /etc/dhcpcd.conf
+            systemctl restart dhcpcd >> "$LOG_FILE" 2>&1
         fi
-        systemctl restart dhcpcd >> "$LOG_FILE" 2>&1
     } && echo -e " [${GREEN}DONE${NC}]" || echo -e " [${RED}FAIL${NC}]"
 
     echo ""
@@ -113,6 +142,18 @@ main() {
     echo ""
     echo -e "The Pi should now be back to its original state."
     echo -e "See ${YELLOW}$LOG_FILE${NC} for details."
+    
+    if [ -f "$CONFIG_FILE" ]; then
+        echo ""
+        echo -ne "❓ ${CYAN}Do you want to delete the configuration file ($CONFIG_FILE)? [y/N]${NC} "
+        read -r delete_conf
+        if [[ "$delete_conf" =~ ^[Yy]$ ]]; then
+            rm "$CONFIG_FILE"
+            echo -e "   [${GREEN}Deleted${NC}] $CONFIG_FILE"
+        else
+            echo -e "   [${YELLOW}Kept${NC}] $CONFIG_FILE (Useful for re-running setup)"
+        fi
+    fi
 }
 
 main

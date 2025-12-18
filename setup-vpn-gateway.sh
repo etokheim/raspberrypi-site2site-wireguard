@@ -8,7 +8,45 @@ set -o pipefail
 
 # --- Configuration & Globals ---
 LOG_FILE="vpn_setup.log"
+CONFIG_FILE="vpn_gateway.conf"
 TERM_WIDTH=$(tput cols)
+
+# --- Configuration Loading ---
+load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+    fi
+}
+
+save_config_var() {
+    local var_name="$1"
+    local var_value="$2"
+    
+    # Create file if not exists
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "# VPN Gateway Configuration" > "$CONFIG_FILE"
+        echo "# Generated on $(date)" >> "$CONFIG_FILE"
+        chmod 600 "$CONFIG_FILE"
+    fi
+    
+    # Check if var exists in file
+    if grep -q "^$var_name=" "$CONFIG_FILE"; then
+        # Update existing line (using a temp file to avoid issues)
+        # Using simple sed with delimiter that likely won't appear in values (pipe |)
+        # Escape slashes in value for safety if using paths
+        local escaped_value=$(echo "$var_value" | sed 's/|/\\|/g') 
+        sed -i "s|^$var_name=.*|$var_name=\"$escaped_value\"|" "$CONFIG_FILE"
+    else
+        # Append new var
+        echo "$var_name=\"$var_value\"" >> "$CONFIG_FILE"
+    fi
+}
+
+save_full_config() {
+    # Legacy function kept for final save, but now redundant with incremental saves
+    # We'll just update the timestamp header if we want, or do nothing.
+    :
+}
 
 # --- Colors & Styles ---
 RED='\033[0;31m'
@@ -23,21 +61,30 @@ NC='\033[0m' # No Color
 
 # Trap Function for Ctrl+C
 cleanup_on_interrupt() {
+    # Disable the trap to prevent recursion (Ctrl+C again will kill immediately)
+    trap - SIGINT
+    
+    # Reset terminal state in case a read was interrupted
+    stty sane
+
     echo ""
     echo -e "${RED}${BOLD}🚨 Setup Interrupted!${NC}"
     echo -e "${YELLOW}The system might be in an inconsistent state.${NC}"
     echo ""
+    
+    # Use read without timeout
     echo -ne "❓ ${CYAN}Do you want to run the cleanup script to restore original settings? [Y/n]${NC} "
     read -r cleanup_choice
+    
     if [[ ! "$cleanup_choice" =~ ^[Nn]$ ]]; then
-        info "Running cleanup script..."
+        info "\nRunning cleanup script..."
         if [ -f "./cleanup-gateway.sh" ]; then
             ./cleanup-gateway.sh
         else
             error "Cleanup script not found! Please run cleanup-gateway.sh manually."
         fi
     else
-        warn "Exiting without cleanup. You may need to manually fix network configurations."
+        warn "\nExiting without cleanup. You may need to manually fix network configurations."
     fi
     exit 1
 }
@@ -140,29 +187,55 @@ get_interfaces() {
 # Function to prompt for interface selection
 select_interface() {
     local prompt_text="$1"
+    local default_iface="$2"
     local interfaces=$(get_interfaces)
     local chosen_iface=""
 
-    echo -e "${BOLD}$prompt_text${NC}"
+    # Print UI to stderr so it doesn't get captured in the variable
+    echo -e "${BOLD}$prompt_text${NC}" >&2
+    if [ -n "$default_iface" ]; then
+        echo -e "   (Default from config: ${YELLOW}$default_iface${NC})" >&2
+    fi
+    
     PS3="👉 Select interface number: "
     select iface in $interfaces; do
         if [ -n "$iface" ]; then
             chosen_iface="$iface"
             break
         else
-            warn "Invalid selection. Please try again."
+            warn "Invalid selection. Please try again." >&2
         fi
     done
+    
+    # Only stdout the result
     echo "$chosen_iface"
 }
 
 get_wg_config() {
+    # Pre-fill default from config if available
+    local default_path="${WG_CONF_PATH:-}"
+    local prompt_msg="📂 Enter path to WireGuard peer config file"
+    if [ -n "$default_path" ]; then
+        prompt_msg="$prompt_msg [default: ${YELLOW}$default_path${NC}]"
+    fi
+    
     while true; do
-        echo -ne "📂 Enter path to WireGuard peer config file (e.g., /home/pi/wg0.conf): "
-        read -e wg_conf_path
+        # Use echo -ne for color support in default value display
+        echo -ne "$prompt_msg: "
+        read -r input_path
+        
+        # Use input or default
+        if [ -z "$input_path" ] && [ -n "$default_path" ]; then
+            wg_conf_path="$default_path"
+        else
+            wg_conf_path="$input_path"
+        fi
+
         echo -e "   ${BLUE}👉 This file contains your private key and peer settings for the home VPN.${NC}"
         if [ -f "$wg_conf_path" ]; then
             echo "$wg_conf_path"
+            # Update global var for saving later
+            WG_CONF_PATH="$wg_conf_path" 
             break
         else
             warn "File not found: $wg_conf_path. Please try again."
@@ -171,30 +244,50 @@ get_wg_config() {
 }
 
 get_ip_range() {
-    echo -ne "🌐 Enter LAN IP range (CIDR) [default: ${YELLOW}10.10.10.0/24${NC}]: "
-    read -e lan_cidr
-    echo -e "   ${BLUE}👉 The private subnet for devices connecting to the AP (LAN side).${NC}"
-    if [ -z "$lan_cidr" ]; then
-        lan_cidr="10.10.10.0/24"
+    local default_cidr="${LAN_CIDR:-10.10.10.0/24}"
+    
+    echo -ne "🌐 Enter LAN IP range (CIDR) [default: ${YELLOW}$default_cidr${NC}]: "
+    read -r input_cidr
+    
+    if [ -z "$input_cidr" ]; then
+        LAN_CIDR="$default_cidr"
+    else
+        LAN_CIDR="$input_cidr"
     fi
-    echo "$lan_cidr"
+    
+    echo -e "   ${BLUE}👉 The private subnet for devices connecting to the AP (LAN side).${NC}"
+    echo "$LAN_CIDR"
 }
 
 main() {
     trap cleanup_on_interrupt SIGINT
+    load_config # Load defaults from file if it exists
     init_log
     check_root
     print_header
 
     info "Checking System Dependencies..."
-    echo -ne "❓ ${YELLOW}Do you want to install necessary packages (wireguard, dnsmasq, iptables)? [Y/n]${NC} "
-    read -r install_choice
-    if [[ "$install_choice" =~ ^[Nn]$ ]]; then
-        error "Package installation is required to proceed. Exiting."
-        exit 1
+    
+    # Check which packages are missing
+    MISSING_PKGS=""
+    if ! dpkg -s wireguard >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS wireguard"; fi
+    if ! dpkg -s dnsmasq >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS dnsmasq"; fi
+    if ! dpkg -s iptables >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS iptables"; fi
+    if ! dpkg -s qrencode >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS qrencode"; fi
+
+    if [ -n "$MISSING_PKGS" ]; then
+        echo -e "   ${YELLOW}Missing packages:${NC}$MISSING_PKGS"
+        echo -ne "❓ ${YELLOW}Do you want to install necessary packages?$MISSING_PKGS [Y/n]${NC} "
+        read -r install_choice
+        if [[ "$install_choice" =~ ^[Nn]$ ]]; then
+            error "Package installation is required to proceed. Exiting."
+            exit 1
+        else
+            run_step "Updating package list" "apt-get update"
+            run_step "Installing missing packages" "apt-get install -y $MISSING_PKGS"
+        fi
     else
-        run_step "Updating package list" "apt-get update"
-        run_step "Installing WireGuard, dnsmasq, iptables" "apt-get install -y wireguard dnsmasq qrencode iptables"
+        success "All base dependencies (wireguard, dnsmasq, iptables, qrencode) are already installed."
     fi
 
     echo ""
@@ -204,13 +297,22 @@ main() {
     
     echo -e "\n${BOLD}Step 1: Select the WAN interface${NC}"
     echo -e "   ${BLUE}ℹ️  This interface connects to the upstream Internet (e.g., USB adapter or built-in Ethernet connected to the site's router).${NC}"
-    WAN_IFACE=$(select_interface "Available interfaces:")
+    WAN_IFACE=$(select_interface "Available interfaces:" "$WAN_IFACE")
+    # Clean up output captured from select_interface (just in case)
+    # The select_interface function echoes prompts to stdout which are captured by $() if not redirected to stderr.
+    # We need to fix select_interface to print prompts to stderr or handle capture differently.
+    # Current issue: 'Available interfaces:' string is being captured.
+    
+    # FIX: Refactor select_interface to print UI to stderr so only the result goes to stdout
+    
+    save_config_var "WAN_IFACE" "$WAN_IFACE"
     success "WAN Interface selected: $WAN_IFACE"
     
     echo -e "\n${BOLD}Step 2: Select the LAN interface${NC}"
     echo -e "   ${BLUE}ℹ️  This interface will host the secure private subnet (e.g., built-in Ethernet connected to your Access Point).${NC}"
     echo -e "   ${YELLOW}👉 If you select a wireless interface (e.g., wlan0), the Pi will be configured as a Wi-Fi Access Point.${NC}"
-    LAN_IFACE=$(select_interface "Available interfaces:")
+    LAN_IFACE=$(select_interface "Available interfaces:" "$LAN_IFACE")
+    save_config_var "LAN_IFACE" "$LAN_IFACE"
     success "LAN Interface selected: $LAN_IFACE"
     echo ""
 
@@ -224,35 +326,71 @@ main() {
     # More robust check: simple string matching
     if echo "$LAN_IFACE" | grep -q "wlan"; then
         IS_WIRELESS=true
+        save_config_var "IS_WIRELESS" "true"
         info "Wireless LAN interface detected ($LAN_IFACE)."
         echo -e "   ${BLUE}ℹ️  To use this interface for the private subnet, the Pi must act as a Wi-Fi Access Point.${NC}"
         echo -e "   ${BLUE}ℹ️  This requires installing 'hostapd' (Host Access Point Daemon).${NC}"
         
-        echo -ne "❓ ${YELLOW}Do you want to proceed with installing hostapd? [Y/n]${NC} "
-        read -r ap_install_choice
-        if [[ "$ap_install_choice" =~ ^[Nn]$ ]]; then
-            error "Cannot proceed with wireless LAN without hostapd. Exiting."
-            exit 1
+        if dpkg -s hostapd >/dev/null 2>&1; then
+             success "'hostapd' is already installed."
+        else
+            echo -ne "❓ ${YELLOW}Do you want to proceed with installing hostapd? [Y/n]${NC} "
+            read -r ap_install_choice
+            if [[ "$ap_install_choice" =~ ^[Nn]$ ]]; then
+                error "Cannot proceed with wireless LAN without hostapd. Exiting."
+                exit 1
+            fi
+            run_step "Installing hostapd" "apt-get install -y hostapd"
+        fi
+
+        # Pre-fill SSID from config
+        default_ssid="${AP_SSID:-}"
+        prompt_ssid="📡 Enter SSID (Network Name) for the AP"
+        if [ -n "$default_ssid" ]; then
+             prompt_ssid="$prompt_ssid [default: ${YELLOW}$default_ssid${NC}]"
+        fi
+        echo -ne "$prompt_ssid: "
+        read -r input_ssid
+        if [ -z "$input_ssid" ] && [ -n "$default_ssid" ]; then
+            AP_SSID="$default_ssid"
+        else
+            AP_SSID="$input_ssid"
+        fi
+        save_config_var "AP_SSID" "$AP_SSID"
+        
+        # Pre-fill Password from config (warn user)
+        default_pass="${AP_PASS:-}"
+        prompt_pass="🔑 Enter Password for the AP (min 8 chars)"
+        if [ -n "$default_pass" ]; then
+             prompt_pass="$prompt_pass [default: ${YELLOW}********${NC}]"
         fi
         
-        run_step "Installing hostapd" "apt-get install -y hostapd"
-
-        echo -ne "📡 Enter SSID (Network Name) for the AP: "
-        read -e AP_SSID
-        
         while true; do
-            echo -ne "🔑 Enter Password for the AP (min 8 chars): "
-            read -e -s AP_PASS
+            echo -ne "$prompt_pass: "
+            read -r -s input_pass
             echo ""
-            if [ ${#AP_PASS} -ge 8 ]; then
+            
+            # Logging input length only, not the password itself
+            echo "[DEBUG] Password input received. Length: ${#input_pass}" >> "$LOG_FILE"
+            
+            if [ -z "$input_pass" ] && [ -n "$default_pass" ]; then
+                AP_PASS="$default_pass"
+                break
+            elif [ ${#input_pass} -ge 8 ]; then
+                AP_PASS="$input_pass"
                 break
             else
                 warn "Password must be at least 8 characters."
+                echo "[DEBUG] Password too short." >> "$LOG_FILE"
             fi
         done
+        save_config_var "AP_PASS" "$AP_PASS"
+    else
+        save_config_var "IS_WIRELESS" "false"
     fi
 
     LAN_CIDR=$(get_ip_range)
+    save_config_var "LAN_CIDR" "$LAN_CIDR"
     LAN_IP=$(echo "$LAN_CIDR" | sed 's/\.0\/24$/.1/')
     
     SUBNET_BASE=$(echo "$LAN_CIDR" | cut -d'/' -f1)
@@ -268,6 +406,7 @@ main() {
     echo ""
 
     WG_CONF_SRC=$(get_wg_config)
+    save_config_var "WG_CONF_PATH" "$WG_CONF_SRC"
     WG_CONF_DEST="/etc/wireguard/wg0.conf"
 
     echo ""
@@ -276,14 +415,29 @@ main() {
     run_step "Enabling IP Forwarding" "echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-vpn-gateway.conf && sysctl -p /etc/sysctl.d/99-vpn-gateway.conf"
 
     # Configure static IP for LAN interface
-    # We construct the command carefully to pass to run_step
-    # Since this involves complex multi-line writes, we'll write a temporary helper script or use a function.
-    # Simpler: Just do the logic here but log it.
-    
     echo -ne "⏳ ${CYAN}Configuring Network Interfaces (Static IP)...${NC} "
     {
         echo "[Configuring Network Interfaces]" >> "$LOG_FILE"
-        if [ -f /etc/dhcpcd.conf ]; then
+        
+        # Detect Network Manager
+        if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager; then
+            echo "Detected NetworkManager. Using nmcli..." >> "$LOG_FILE"
+            
+            # Create or modify connection for LAN interface
+            # Try to find existing connection for this interface
+            CON_NAME=$(nmcli -t -f NAME,DEVICE connection show | grep ":$LAN_IFACE$" | cut -d: -f1 | head -n1)
+            
+            if [ -z "$CON_NAME" ]; then
+                CON_NAME="Wired connection $LAN_IFACE" # Default name attempt or create new
+                nmcli con add type ethernet ifname "$LAN_IFACE" con-name "$CON_NAME" >> "$LOG_FILE" 2>&1
+            fi
+            
+            # Apply Static IP
+            nmcli con modify "$CON_NAME" ipv4.addresses "$LAN_GATEWAY/24" ipv4.method manual >> "$LOG_FILE" 2>&1
+            nmcli con up "$CON_NAME" >> "$LOG_FILE" 2>&1
+            
+        elif [ -f /etc/dhcpcd.conf ]; then
+             echo "Detected dhcpcd..." >> "$LOG_FILE"
              sed -i '/# VPN-GATEWAY-START/,/# VPN-GATEWAY-END/d' /etc/dhcpcd.conf
              {
                 echo "# VPN-GATEWAY-START"
@@ -294,6 +448,7 @@ main() {
             } >> /etc/dhcpcd.conf
             systemctl restart dhcpcd >> "$LOG_FILE" 2>&1
         else
+            echo "No supported network manager found (NetworkManager or dhcpcd). Falling back to 'ip addr'..." >> "$LOG_FILE"
             ip addr add "$LAN_GATEWAY/24" dev "$LAN_IFACE" >> "$LOG_FILE" 2>&1
         fi
     } || { echo -e "[${RED}FAIL${NC}]"; exit 1; }
@@ -372,6 +527,9 @@ EOF
     echo -e "   • VPN Interface: ${BOLD}wg0${NC}"
     echo ""
     info "Setup log saved to: $LOG_FILE"
+    
+    save_config
+    info "Configuration saved to: $CONFIG_FILE"
 }
 
 main
