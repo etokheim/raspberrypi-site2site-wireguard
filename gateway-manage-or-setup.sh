@@ -20,6 +20,19 @@ an interactive prompt is shown.
 EOF
 }
 
+print_banner() {
+    cat <<'EOF'
+   ____ _ _        ____        _              _       
+  / ___(_) |_ ___ / ___|  __ _| |_ ___   ___ | |_ ___ 
+ | |  _| | __/ _ \ |  _  / _` | __/ _ \ / _ \| __/ __|
+ | |_| | | ||  __/ |_| | (_| | || (_) | (_) | |_\__ \
+  \____|_|\__\___|\____| \__,_|\__\___/ \___/ \__|___/
+
+            Site2Site Gateway — using WireGuard on Raspberry Pi
+EOF
+    echo ""
+}
+
 ensure_config_migrated() {
     if [ -f "$CONFIG_FILE" ]; then
         return
@@ -162,6 +175,7 @@ if [ ! -f "$SETUP_SCRIPT" ] || [ ! -f "$CLEANUP_SCRIPT" ]; then
     exit 1
 fi
 
+print_banner
 ensure_config_migrated
 
 case "$1" in

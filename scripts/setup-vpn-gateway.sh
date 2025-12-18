@@ -30,6 +30,30 @@ load_config() {
     fi
 }
 
+detect_ssh_port() {
+    if [ -n "${SSH_PORT:-}" ]; then
+        return
+    fi
+    local detected
+    detected=$(grep -iE '^Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null | tail -n1 | awk '{print $2}')
+    if echo "$detected" | grep -qE '^[0-9]+$'; then
+        SSH_PORT="$detected"
+    else
+        SSH_PORT="22"
+    fi
+    save_config_var "SSH_PORT" "$SSH_PORT"
+}
+
+parse_wg_listen_port() {
+    local cfg="$1"
+    local port
+    port=$(grep -iE '^ListenPort' "$cfg" 2>/dev/null | tail -n1 | awk -F'=' '{gsub(/ /,"",$2); print $2}')
+    if echo "$port" | grep -qE '^[0-9]+$'; then
+        WG_LISTEN_PORT="$port"
+        save_config_var "WG_LISTEN_PORT" "$WG_LISTEN_PORT"
+    fi
+}
+
 is_wg_active() {
     if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet wg-quick@wg0; then
         return 0
@@ -120,6 +144,12 @@ NC='\033[0m' # No Color
 
 # Trap Function for Ctrl+C
 cleanup_on_interrupt() {
+    if [ "${APPLYING_CHANGES:-false}" = "false" ]; then
+        echo ""
+        echo "Aborted before applying changes. No modifications were made."
+        exit 1
+    fi
+
     # Disable the trap to prevent recursion (Ctrl+C again will kill immediately)
     trap - SIGINT
     
@@ -249,6 +279,38 @@ ensure_nat_rules() {
     # NAT out WAN as secondary path (if desired)
     if [ -n "$WAN_IFACE" ] && ! iptables -t nat -C POSTROUTING -o "$WAN_IFACE" -j MASQUERADE >/dev/null 2>&1; then
         iptables -t nat -A POSTROUTING -o "$WAN_IFACE" -j MASQUERADE >> "$LOG_FILE" 2>&1
+    fi
+}
+
+ensure_wan_firewall_rules() {
+    echo "[wan_firewall] Applying hardened INPUT rules for WAN=$WAN_IFACE" >> "$LOG_FILE"
+    local ssh_port="${SSH_PORT:-22}"
+
+    # Allow LAN management traffic
+    if ! iptables -C INPUT -i "$LAN_IFACE" -j ACCEPT >/dev/null 2>&1; then
+        iptables -A INPUT -i "$LAN_IFACE" -j ACCEPT >> "$LOG_FILE" 2>&1
+    fi
+
+    # Allow established/related on WAN
+    if ! iptables -C INPUT -i "$WAN_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1; then
+        iptables -A INPUT -i "$WAN_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT >> "$LOG_FILE" 2>&1
+    fi
+
+    # Allow SSH on WAN
+    if ! iptables -C INPUT -i "$WAN_IFACE" -p tcp --dport "$ssh_port" -j ACCEPT >/dev/null 2>&1; then
+        iptables -A INPUT -i "$WAN_IFACE" -p tcp --dport "$ssh_port" -j ACCEPT >> "$LOG_FILE" 2>&1
+    fi
+
+    # Allow WireGuard listen port if present
+    if [ -n "${WG_LISTEN_PORT:-}" ]; then
+        if ! iptables -C INPUT -i "$WAN_IFACE" -p udp --dport "$WG_LISTEN_PORT" -j ACCEPT >/dev/null 2>&1; then
+            iptables -A INPUT -i "$WAN_IFACE" -p udp --dport "$WG_LISTEN_PORT" -j ACCEPT >> "$LOG_FILE" 2>&1
+        fi
+    fi
+
+    # Drop everything else on WAN INPUT
+    if ! iptables -C INPUT -i "$WAN_IFACE" -j DROP >/dev/null 2>&1; then
+        iptables -A INPUT -i "$WAN_IFACE" -j DROP >> "$LOG_FILE" 2>&1
     fi
 }
 
@@ -386,32 +448,6 @@ main() {
     check_root
     print_header
 
-    info "Checking System Dependencies..."
-    
-    # Check which packages are missing
-    MISSING_PKGS=""
-    if ! dpkg -s wireguard >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS wireguard"; fi
-    if ! dpkg -s dnsmasq >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS dnsmasq"; fi
-    if ! dpkg -s iptables >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS iptables"; fi
-    if ! dpkg -s qrencode >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS qrencode"; fi
-    if ! dpkg -s resolvconf >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS resolvconf"; fi
-
-    if [ -n "$MISSING_PKGS" ]; then
-        echo -e "   ${YELLOW}Missing packages:${NC}$MISSING_PKGS"
-        echo -ne "❓ ${YELLOW}Do you want to install necessary packages?$MISSING_PKGS [Y/n]${NC} "
-        read -r install_choice
-        if [[ "$install_choice" =~ ^[Nn]$ ]]; then
-            error "Package installation is required to proceed. Exiting."
-            exit 1
-        else
-            run_step "Updating package list" "apt-get update"
-            run_step "Installing missing packages" "apt-get install -y $MISSING_PKGS"
-        fi
-    else
-        success "All base dependencies (wireguard, dnsmasq, iptables, qrencode, resolvconf) are already installed."
-    fi
-
-    echo ""
     info "Network Interface Selection"
     echo -e "   ${BLUE}👉 Identify which port connects to the Internet (WAN) and which serves the local private network (LAN).${NC}"
     echo "------------------------------------------------"
@@ -534,7 +570,82 @@ main() {
 
     WG_CONF_SRC=$(get_wg_config)
     save_config_var "WG_CONF_PATH" "$WG_CONF_SRC"
+    parse_wg_listen_port "$WG_CONF_SRC"
+    detect_ssh_port
     WG_CONF_DEST="/etc/wireguard/wg0.conf"
+
+    # Ask whether to configure firewall (WAN hardening)
+    local default_fw="${FIREWALL_ENABLED:-true}"
+    echo ""
+    echo -ne "🛡️  Configure WAN firewall (allow SSH + WireGuard, drop other inbound)? [Y/n]: "
+    read -r fw_choice
+    if [[ "$fw_choice" =~ ^[Nn]$ ]]; then
+        FIREWALL_ENABLED="false"
+    else
+        FIREWALL_ENABLED="true"
+    fi
+    save_config_var "FIREWALL_ENABLED" "$FIREWALL_ENABLED"
+
+    echo ""
+    # Framed summary (fixed width)
+    # Keep border the same as before, but give content one extra column
+    local box_w=95
+    local border_inner=95 # fixed to retain outer width while widening content
+    local border_line
+    border_line=$(printf '═%.0s' $(seq 1 $border_inner))
+
+    printf "╔%s╗\n" "$border_line"
+    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "📝 Planned changes"
+    printf "╠%s╣\n" "$border_line"
+    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Configure WAN: $WAN_IFACE"
+    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Configure LAN: $LAN_IFACE (static $LAN_GATEWAY / $LAN_CIDR)"
+    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• WireGuard config: $WG_CONF_SRC -> $WG_CONF_DEST"
+    if [ -n "${WG_LISTEN_PORT:-}" ]; then
+        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• WireGuard listen UDP port: $WG_LISTEN_PORT (allowed on WAN)"
+    else
+        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• WireGuard listen UDP port: (not detected in config)"
+    fi
+    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• SSH port allowed on WAN: ${SSH_PORT:-22}"
+    if [ "$FIREWALL_ENABLED" = "true" ]; then
+        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• WAN firewall: ENABLED (allow SSH + WireGuard; drop other inbound; allow LAN management)"
+    else
+        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• WAN firewall: DISABLED (WAN INPUT left unchanged beyond base rules)"
+    fi
+    printf "╚%s╝\n" "$border_line"
+    echo ""
+    echo -ne "Proceed with applying these changes? [Y/n]: "
+    read -r proceed_choice
+    if [[ "$proceed_choice" =~ ^[Nn]$ ]]; then
+        warn "Aborting setup by user request."
+        exit 1
+    fi
+
+    APPLYING_CHANGES=true
+
+    info "Checking System Dependencies..."
+    
+    # Check which packages are missing
+    MISSING_PKGS=""
+    if ! dpkg -s wireguard >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS wireguard"; fi
+    if ! dpkg -s dnsmasq >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS dnsmasq"; fi
+    if ! dpkg -s iptables >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS iptables"; fi
+    if ! dpkg -s qrencode >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS qrencode"; fi
+    if ! dpkg -s resolvconf >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS resolvconf"; fi
+
+    if [ -n "$MISSING_PKGS" ]; then
+        echo -e "   ${YELLOW}Missing packages:${NC}$MISSING_PKGS"
+        echo -ne "❓ ${YELLOW}Do you want to install necessary packages?$MISSING_PKGS [Y/n]${NC} "
+        read -r install_choice
+        if [[ "$install_choice" =~ ^[Nn]$ ]]; then
+            error "Package installation is required to proceed. Exiting."
+            exit 1
+        else
+            run_step "Updating package list" "apt-get update"
+            run_step "Installing missing packages" "apt-get install -y $MISSING_PKGS"
+        fi
+    else
+        success "All base dependencies (wireguard, dnsmasq, iptables, qrencode, resolvconf) are already installed."
+    fi
 
     echo ""
     run_step "Installing WireGuard config" "cp \"$WG_CONF_SRC\" \"$WG_CONF_DEST\" && chmod 600 \"$WG_CONF_DEST\""
@@ -661,6 +772,11 @@ EOF
 
     # Enforce required NAT/forward rules in case wg-quick skipped PostUp (e.g., interface already up)
     ensure_nat_rules
+    if [ "$FIREWALL_ENABLED" = "true" ]; then
+        ensure_wan_firewall_rules
+    else
+        echo "[wan_firewall] Skipped (user disabled)" >> "$LOG_FILE"
+    fi
 
     echo ""
     echo "╔════════════════════════════════════════════════════════════╗"

@@ -23,6 +23,31 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+cleanup_wan_firewall_rules() {
+    local wan_iface="$WAN_IFACE"
+    local lan_iface="$LAN_IFACE"
+    local ssh_port="${SSH_PORT:-22}"
+    local wg_port="${WG_LISTEN_PORT:-}"
+
+    if [ -n "$lan_iface" ] && iptables -C INPUT -i "$lan_iface" -j ACCEPT >/dev/null 2>&1; then
+        iptables -D INPUT -i "$lan_iface" -j ACCEPT >> "$LOG_FILE" 2>&1 || true
+    fi
+    if [ -n "$wan_iface" ]; then
+        if iptables -C INPUT -i "$wan_iface" -m state --state RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1; then
+            iptables -D INPUT -i "$wan_iface" -m state --state RELATED,ESTABLISHED -j ACCEPT >> "$LOG_FILE" 2>&1 || true
+        fi
+        if iptables -C INPUT -i "$wan_iface" -p tcp --dport "$ssh_port" -j ACCEPT >/dev/null 2>&1; then
+            iptables -D INPUT -i "$wan_iface" -p tcp --dport "$ssh_port" -j ACCEPT >> "$LOG_FILE" 2>&1 || true
+        fi
+        if [ -n "$wg_port" ] && iptables -C INPUT -i "$wan_iface" -p udp --dport "$wg_port" -j ACCEPT >/dev/null 2>&1; then
+            iptables -D INPUT -i "$wan_iface" -p udp --dport "$wg_port" -j ACCEPT >> "$LOG_FILE" 2>&1 || true
+        fi
+        if iptables -C INPUT -i "$wan_iface" -j DROP >/dev/null 2>&1; then
+            iptables -D INPUT -i "$wan_iface" -j DROP >> "$LOG_FILE" 2>&1 || true
+        fi
+    fi
+}
+
 init_log() {
     mkdir -p "$LOG_DIR"
     echo "--- VPN Gateway Cleanup Log Started: $(date) ---" > "$LOG_FILE"
@@ -113,6 +138,12 @@ main() {
     # Stop hostapd if it was installed/active
     if systemctl is-active --quiet hostapd; then
         run_step "Stopping Access Point (hostapd)" "systemctl stop hostapd; systemctl disable hostapd"
+    fi
+
+    if [ "${FIREWALL_ENABLED:-true}" = "true" ]; then
+        run_step "Removing WAN firewall rules" "cleanup_wan_firewall_rules"
+    else
+        echo "Skipping WAN firewall cleanup (disabled in config)" >> "$LOG_FILE"
     fi
 
     run_step "Flushing Firewall Rules" "iptables -t nat -F; iptables -F FORWARD; iptables -P FORWARD ACCEPT"
