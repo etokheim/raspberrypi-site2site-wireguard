@@ -55,6 +55,15 @@ remove_hardware_watchdog() {
     fi
 }
 
+cleanup_dns_resolvconf() {
+    # If dnsmasq registered 127.0.0.1 with resolvconf, it might persist after service stop.
+    # We must explicitly remove it to restore upstream DNS.
+    if command -v resolvconf >/dev/null 2>&1; then
+        echo "[cleanup_dns] Removing lo.dnsmasq from resolvconf..." >> "$LOG_FILE"
+        resolvconf -d lo.dnsmasq >> "$LOG_FILE" 2>&1 || true
+    fi
+}
+
 cleanup_gateway_nat_rules() {
     local lan_iface="$LAN_IFACE"
     local wan_iface="$WAN_IFACE"
@@ -230,6 +239,8 @@ main() {
     run_step "Ensuring WireGuard Interface Down" "if ip link show wg0 >/dev/null 2>&1; then wg-quick down wg0; fi"
 
     run_step "Stopping DHCP Server (dnsmasq)" "systemctl stop dnsmasq; systemctl disable dnsmasq"
+    
+    run_step "Cleaning up resolvconf (DNS)" "cleanup_dns_resolvconf"
 
     # Stop hostapd if it was installed/active
     if systemctl is-active --quiet hostapd; then
