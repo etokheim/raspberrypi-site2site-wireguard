@@ -118,6 +118,7 @@ check_root() {
 main() {
     init_log
     check_root
+    NONINTERACTIVE="${NONINTERACTIVE:-false}"
     
     # Load config if available to identify LAN interface
     if [ ! -f "$CONFIG_FILE" ]; then

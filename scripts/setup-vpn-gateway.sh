@@ -25,6 +25,10 @@ load_config() {
             mv "$LEGACY_CONFIG_2" "$CONFIG_FILE"
         fi
     fi
+
+    if [ "$WATCHDOG_ENABLED" = "true" ]; then
+        ensure_watchdog
+    fi
     if [ -f "$CONFIG_FILE" ]; then
         source "$CONFIG_FILE"
     fi
@@ -69,6 +73,85 @@ parse_wg_listen_port() {
         WG_LISTEN_PORT="$port"
         save_config_var "WG_LISTEN_PORT" "$WG_LISTEN_PORT"
     fi
+}
+
+ensure_service_restart_policy() {
+    local svc="$1"
+    local dropin_dir="/etc/systemd/system/${svc}.d"
+    mkdir -p "$dropin_dir"
+    cat > "${dropin_dir}/override.conf" <<EOF
+[Service]
+Restart=on-failure
+RestartSec=5
+EOF
+    systemctl daemon-reload >> "$LOG_FILE" 2>&1 || true
+}
+
+ensure_watchdog() {
+    run_step "Enabling watchdog" "bash -c \"
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update >> '$LOG_FILE' 2>&1
+        apt-get install -y watchdog >> '$LOG_FILE' 2>&1
+        if [ -f /etc/watchdog.conf ] && [ ! -f /etc/watchdog.conf.bak_gateway ]; then
+            cp /etc/watchdog.conf /etc/watchdog.conf.bak_gateway
+        fi
+        cat > /etc/watchdog.conf <<EOF
+watchdog-device = /dev/watchdog
+max-load-1 = 24
+interface = $LAN_IFACE
+realtime = yes
+priority = 1
+EOF
+        systemctl enable --now watchdog >> '$LOG_FILE' 2>&1 || true
+    \""
+}
+
+disable_unused_services() {
+    local services=("avahi-daemon.service" "avahi-daemon.socket" "cups.service" "cups-browsed.service" "bluetooth.service")
+    for svc in "${services[@]}"; do
+        if systemctl list-unit-files | grep -q "^${svc}"; then
+            systemctl disable --now "$svc" >> "$LOG_FILE" 2>&1 || true
+        fi
+    done
+}
+
+ensure_wg_perms() {
+    local path="$1"
+    if [ ! -f "$path" ]; then
+        warn "WireGuard config not found at $path (skipping perm check)."
+        return
+    fi
+    local mode owner group
+    mode=$(stat -c "%a" "$path")
+    owner=$(stat -c "%U" "$path")
+    group=$(stat -c "%G" "$path")
+    if [ "$mode" -le 600 ] && [ "$owner" = "root" ] && [ "$group" = "root" ]; then
+        return
+    fi
+    if [ "$NONINTERACTIVE" = "true" ]; then
+        info "Non-interactive: fixing WireGuard config permissions at $path"
+        chown root:root "$path"
+        chmod 600 "$path"
+        return
+    fi
+    echo -ne "❓ ${YELLOW}WireGuard config $path has loose permissions ($mode $owner:$group). Fix to 600 root:root? [Y/n]${NC} "
+    read -r fix_perm
+    if [[ ! "$fix_perm" =~ ^[Nn]$ ]]; then
+        chown root:root "$path"
+        chmod 600 "$path"
+        success "Permissions corrected for $path"
+    else
+        warn "Left WireGuard config permissions unchanged."
+    fi
+}
+
+disable_unused_services() {
+    local services=("avahi-daemon.service" "avahi-daemon.socket" "cups.service" "cups-browsed.service" "bluetooth.service")
+    for svc in "${services[@]}"; do
+        if systemctl list-unit-files | grep -q "^${svc}"; then
+            systemctl disable --now "$svc" >> "$LOG_FILE" 2>&1 || true
+        fi
+    done
 }
 
 is_wg_active() {
@@ -626,11 +709,13 @@ main() {
     parse_wg_listen_port "$WG_CONF_SRC"
     detect_ssh_port
     WG_CONF_DEST="/etc/wireguard/wg0.conf"
+    ensure_wg_perms "$WG_CONF_SRC"
 
     if [ "$USE_EXISTING_CONFIG" = true ]; then
         info "Using existing firewall and auto-update preferences from config."
         FIREWALL_ENABLED="${FIREWALL_ENABLED:-true}"
         AUTO_UPDATES_ENABLED="${AUTO_UPDATES_ENABLED:-false}"
+        WATCHDOG_ENABLED="${WATCHDOG_ENABLED:-false}"
     else
         # Ask whether to configure firewall (WAN hardening)
         local default_fw="${FIREWALL_ENABLED:-true}"
@@ -654,6 +739,16 @@ main() {
             AUTO_UPDATES_ENABLED="true"
         fi
         save_config_var "AUTO_UPDATES_ENABLED" "$AUTO_UPDATES_ENABLED"
+
+        echo ""
+        echo -ne "🛠️  Enable watchdog (auto-reboot on hang)? [Y/n]: "
+        read -r watchdog_choice
+        if [[ "$watchdog_choice" =~ ^[Nn]$ ]]; then
+            WATCHDOG_ENABLED="false"
+        else
+            WATCHDOG_ENABLED="true"
+        fi
+        save_config_var "WATCHDOG_ENABLED" "$WATCHDOG_ENABLED"
     fi
 
     echo ""
@@ -682,9 +777,14 @@ main() {
         printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• WAN firewall: DISABLED (WAN INPUT left unchanged beyond base rules)"
     fi
     if [ "$AUTO_UPDATES_ENABLED" = "true" ]; then
-        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Auto updates: ENABLED (all packages nightly at 03:00, logs only)"
+        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Auto updates: ENABLED (all packages nightly at 03:00)"
     else
         printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Auto updates: DISABLED"
+    fi
+    if [ "$WATCHDOG_ENABLED" = "true" ]; then
+        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Watchdog: ENABLED (auto-reboot on hang)"
+    else
+        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Watchdog: DISABLED"
     fi
     printf "╚%s╝\n" "$border_line"
     echo ""
@@ -798,6 +898,7 @@ EOF
         systemctl enable dnsmasq >> "$LOG_FILE" 2>&1
     } || { echo -e "[${RED}FAIL${NC}]"; exit 1; }
     echo -e "[${GREEN}DONE${NC}]"
+    ensure_service_restart_policy "dnsmasq"
 
     # Configure hostapd if wireless
     if [ "$IS_WIRELESS" = true ]; then
@@ -832,6 +933,7 @@ EOF
             systemctl restart hostapd >> "$LOG_FILE" 2>&1
         } || { echo -e "[${RED}FAIL${NC}]"; exit 1; }
         echo -e "[${GREEN}DONE${NC}]"
+        ensure_service_restart_policy "hostapd"
     fi
 
 
@@ -848,6 +950,7 @@ EOF
         fi
         wg-quick up wg0 && systemctl enable wg-quick@wg0
     \""
+    ensure_service_restart_policy "wg-quick@wg0"
 
     # Enforce required NAT/forward rules in case wg-quick skipped PostUp (e.g., interface already up)
     ensure_nat_rules
@@ -893,6 +996,10 @@ EOF
             systemctl enable --now unattended-upgrades apt-daily.timer apt-daily-upgrade.timer >> '$LOG_FILE' 2>&1 || true
         \""
 
+    fi
+
+    if [ "$WATCHDOG_ENABLED" = "true" ]; then
+        ensure_watchdog
     fi
 
     echo ""
