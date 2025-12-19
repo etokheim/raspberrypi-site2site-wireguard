@@ -407,11 +407,11 @@ progress_find_step() {
 }
 
 progress_draw_box() {
-    # Box is 76 chars: ║ + space + 72 content + space + ║
+    # Box is 76 chars: │ + space + 72 content + space + │
     local box_w=76
     local content_w=72
     local border
-    border=$(printf '═%.0s' $(seq 1 $((box_w - 2))))
+    border=$(printf '─%.0s' $(seq 1 $((box_w - 2))))
     
     # Move cursor up to redraw if we've drawn before
     if [ "$PROGRESS_BOX_LINES" -gt 0 ]; then
@@ -424,9 +424,9 @@ progress_draw_box() {
     local lines=0
     
     # Header
-    echo -e "${CYAN}╔${border}╗${NC}"
-    echo -e "${CYAN}║${NC} ${BOLD}${YELLOW}⚡ Setup Progress${NC}$(printf '%*s' $((content_w - 16)) '') ${CYAN}║${NC}"
-    echo -e "${CYAN}╠${border}╣${NC}"
+    echo -e "${CYAN}╭${border}╮${NC}"
+    echo -e "${CYAN}│${NC} ${BOLD}${YELLOW}⚡ Setup Progress${NC}$(printf '%*s' $((content_w - 16)) '') ${CYAN}│${NC}"
+    echo -e "${CYAN}├${border}┤${NC}"
     lines=$((lines + 3))
     
     # Steps
@@ -467,15 +467,15 @@ progress_draw_box() {
         
         # Print the line
         if [ -n "$extra" ]; then
-            echo -e "${CYAN}║${NC} ${color}${icon} ${step}${NC} ${DIM}${extra}${NC}$(printf '%*s' $padding '') ${CYAN}║${NC}"
+            echo -e "${CYAN}│${NC} ${color}${icon} ${step}${NC} ${DIM}${extra}${NC}$(printf '%*s' $padding '') ${CYAN}│${NC}"
         else
-            echo -e "${CYAN}║${NC} ${color}${icon} ${step}${NC}$(printf '%*s' $padding '') ${CYAN}║${NC}"
+            echo -e "${CYAN}│${NC} ${color}${icon} ${step}${NC}$(printf '%*s' $padding '') ${CYAN}│${NC}"
         fi
         lines=$((lines + 1))
     done
     
     # Footer
-    echo -e "${CYAN}╚${border}╝${NC}"
+    echo -e "${CYAN}╰${border}╯${NC}"
     lines=$((lines + 1))
     
     PROGRESS_BOX_LINES=$lines

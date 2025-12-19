@@ -59,11 +59,11 @@ progress_find_step() {
 }
 
 progress_draw_box() {
-    # Box is 76 chars: ║ + space + 72 content + space + ║
+    # Box is 76 chars: │ + space + 72 content + space + │
     local box_w=76
     local content_w=72
     local border
-    border=$(printf '═%.0s' $(seq 1 $((box_w - 2))))
+    border=$(printf '─%.0s' $(seq 1 $((box_w - 2))))
     
     # Move cursor up and clear lines if we've drawn before
     if [ "$PROGRESS_BOX_LINES" -gt 0 ]; then
@@ -75,9 +75,9 @@ progress_draw_box() {
     local lines=0
     
     # Header
-    echo -e "${RED}╔${border}╗${NC}"
-    echo -e "${RED}║${NC} ${BOLD}${YELLOW}🧹 Cleanup Progress${NC}$(printf '%*s' $((content_w - 18)) '') ${RED}║${NC}"
-    echo -e "${RED}╠${border}╣${NC}"
+    echo -e "${RED}╭${border}╮${NC}"
+    echo -e "${RED}│${NC} ${BOLD}${YELLOW}🧹 Cleanup Progress${NC}$(printf '%*s' $((content_w - 18)) '') ${RED}│${NC}"
+    echo -e "${RED}├${border}┤${NC}"
     lines=$((lines + 3))
     
     # Steps
@@ -118,15 +118,15 @@ progress_draw_box() {
         
         # Print the line
         if [ -n "$extra" ]; then
-            echo -e "${RED}║${NC} ${color}${icon} ${step}${NC} ${DIM}${extra}${NC}$(printf '%*s' $padding '') ${RED}║${NC}"
+            echo -e "${RED}│${NC} ${color}${icon} ${step}${NC} ${DIM}${extra}${NC}$(printf '%*s' $padding '') ${RED}│${NC}"
         else
-            echo -e "${RED}║${NC} ${color}${display_text}${NC}$(printf '%*s' $padding '') ${RED}║${NC}"
+            echo -e "${RED}│${NC} ${color}${display_text}${NC}$(printf '%*s' $padding '') ${RED}│${NC}"
         fi
         lines=$((lines + 1))
     done
     
     # Footer
-    echo -e "${RED}╚${border}╝${NC}"
+    echo -e "${RED}╰${border}╯${NC}"
     lines=$((lines + 1))
     
     PROGRESS_BOX_LINES=$lines
@@ -455,9 +455,9 @@ main() {
     progress_draw_box
 
     echo ""
-    echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}${BOLD}║                          ✔ Restore Complete!                            ║${NC}"
-    echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${GREEN}${BOLD}╭──────────────────────────────────────────────────────────────────────────╮${NC}"
+    echo -e "${GREEN}${BOLD}│                          ✔ Restore Complete!                            │${NC}"
+    echo -e "${GREEN}${BOLD}╰──────────────────────────────────────────────────────────────────────────╯${NC}"
     echo ""
     echo -e "The Pi should now be back to its original state."
     echo -e "See ${YELLOW}$LOG_FILE${NC} for details."
