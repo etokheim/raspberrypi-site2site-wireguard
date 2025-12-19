@@ -735,7 +735,7 @@ main() {
         fi
         save_config_var "IS_WIRELESS" "${IS_WIRELESS:-false}"
         
-        # Ensure hostapd is installed for wireless configs
+        # Check if hostapd is needed for wireless configs (will install later with other deps)
         if [ "$IS_WIRELESS" = "true" ] || [ "$IS_WIRELESS" = true ]; then
             if ! is_pkg_installed hostapd; then
                 info "Wireless LAN requires hostapd (not installed)."
@@ -745,7 +745,9 @@ main() {
                     error "Cannot proceed with wireless LAN without hostapd. Exiting."
                     exit 1
                 fi
-                run_step "Installing hostapd" "apt-get install -y hostapd"
+                INSTALL_HOSTAPD="true"
+            else
+                INSTALL_HOSTAPD="false"
             fi
         fi
     else
@@ -761,6 +763,7 @@ main() {
             
             if is_pkg_installed hostapd; then
                  success "'hostapd' is already installed."
+                 INSTALL_HOSTAPD="false"
             else
                 echo -ne "❓ ${YELLOW}Do you want to proceed with installing hostapd? [Y/n]${NC} "
                 read -r ap_install_choice
@@ -768,7 +771,7 @@ main() {
                     error "Cannot proceed with wireless LAN without hostapd. Exiting."
                     exit 1
                 fi
-                run_step "Installing hostapd" "apt-get install -y hostapd"
+                INSTALL_HOSTAPD="true"
             fi
 
             # Pre-fill SSID from config
@@ -936,8 +939,13 @@ main() {
     printf "╔%s╗\n" "$border_line"
     printf "║ %-*.*s ║\n" "$box_w" "$box_w" "📝 Planned changes"
     printf "╠%s╣\n" "$border_line"
-    if [ "$INSTALL_DEPENDENCIES" = "true" ]; then
-        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Install packages:$MISSING_PKGS"
+    # Build package list for display (include hostapd if needed)
+    local display_pkgs="$MISSING_PKGS"
+    if [ "${INSTALL_HOSTAPD:-}" = "true" ]; then
+        display_pkgs="$display_pkgs hostapd"
+    fi
+    if [ "$INSTALL_DEPENDENCIES" = "true" ] || [ "${INSTALL_HOSTAPD:-}" = "true" ]; then
+        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Install packages:$display_pkgs"
     else
         printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• System packages: already installed"
     fi
@@ -982,6 +990,12 @@ main() {
     fi
 
     # Install system dependencies if needed (user already confirmed at start)
+    # Add hostapd to package list if wireless AP is needed
+    if [ "${INSTALL_HOSTAPD:-}" = "true" ]; then
+        MISSING_PKGS="$MISSING_PKGS hostapd"
+        INSTALL_DEPENDENCIES="true"
+    fi
+    
     if [ "$INSTALL_DEPENDENCIES" = "true" ] && [ -n "$MISSING_PKGS" ]; then
         run_step "Updating package list" "apt-get update"
         # Preseed iptables-persistent to avoid interactive prompts
