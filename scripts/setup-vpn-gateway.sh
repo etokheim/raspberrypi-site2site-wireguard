@@ -14,7 +14,7 @@ LOG_FILE="$LOG_DIR/vpn_setup.log"
 CONFIG_FILE="$ROOT_DIR/vpn-gateway.conf"
 LEGACY_CONFIG_1="$ROOT_DIR/gateway.conf"
 LEGACY_CONFIG_2="$ROOT_DIR/vpn_gateway.conf"
-TERM_WIDTH=$(tput cols)
+TERM_WIDTH=$(tput cols 2>/dev/null || echo 80)
 
 # --- Configuration Loading ---
 load_config() {
@@ -72,35 +72,60 @@ parse_wg_listen_port() {
     fi
 }
 
-ensure_service_restart_policy() {
-    local svc="$1"
-    local dropin_dir="/etc/systemd/system/${svc}.d"
-    mkdir -p "$dropin_dir"
-    cat > "${dropin_dir}/override.conf" <<EOF
-[Service]
-Restart=on-failure
-RestartSec=5
-EOF
-    systemctl daemon-reload >> "$LOG_FILE" 2>&1 || true
-}
-
-ensure_watchdog() {
-    run_step "Enabling watchdog" "bash -c \"
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update >> '$LOG_FILE' 2>&1
-        apt-get install -y watchdog >> '$LOG_FILE' 2>&1
-        if [ -f /etc/watchdog.conf ] && [ ! -f /etc/watchdog.conf.bak_gateway ]; then
-            cp /etc/watchdog.conf /etc/watchdog.conf.bak_gateway
-        fi
-        cat > /etc/watchdog.conf <<EOF
+do_hardware_watchdog_setup() {
+    # Hardware watchdog: Uses the Pi's BCM2835 watchdog timer (/dev/watchdog)
+    # If the system hangs and stops petting the watchdog, the hardware reboots the Pi
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update >> "$LOG_FILE" 2>&1
+    apt-get install -y watchdog >> "$LOG_FILE" 2>&1
+    if [ -f /etc/watchdog.conf ] && [ ! -f /etc/watchdog.conf.bak_gateway ]; then
+        cp /etc/watchdog.conf /etc/watchdog.conf.bak_gateway
+    fi
+    cat > /etc/watchdog.conf <<EOF
 watchdog-device = /dev/watchdog
 max-load-1 = 24
 interface = $LAN_IFACE
 realtime = yes
 priority = 1
 EOF
-        systemctl enable --now watchdog >> '$LOG_FILE' 2>&1 || true
-    \""
+    systemctl enable --now watchdog >> "$LOG_FILE" 2>&1 || true
+}
+
+ensure_hardware_watchdog() {
+    run_step "Enabling hardware watchdog (auto-reboot on hang)" "do_hardware_watchdog_setup"
+}
+
+do_software_watchdog_setup() {
+    # Software watchdog: systemd restart policies for critical services
+    # If a service crashes, systemd automatically restarts it after 5 seconds
+    local services=("dnsmasq" "wg-quick@wg0")
+    
+    for svc in "${services[@]}"; do
+        local dropin_dir="/etc/systemd/system/${svc}.d"
+        mkdir -p "$dropin_dir"
+        cat > "${dropin_dir}/override.conf" <<EOF
+[Service]
+Restart=on-failure
+RestartSec=5
+EOF
+    done
+    
+    # hostapd only if wireless mode
+    if [ "${IS_WIRELESS:-false}" = "true" ]; then
+        local dropin_dir="/etc/systemd/system/hostapd.d"
+        mkdir -p "$dropin_dir"
+        cat > "${dropin_dir}/override.conf" <<EOF
+[Service]
+Restart=on-failure
+RestartSec=5
+EOF
+    fi
+    
+    systemctl daemon-reload >> "$LOG_FILE" 2>&1 || true
+}
+
+ensure_software_watchdog() {
+    run_step "Configuring software watchdog (service restart policies)" "do_software_watchdog_setup"
 }
 
 disable_unused_services() {
@@ -122,9 +147,20 @@ ensure_wg_perms() {
     mode=$(stat -c "%a" "$path")
     owner=$(stat -c "%U" "$path")
     group=$(stat -c "%G" "$path")
-    if [ "$mode" -le 600 ] && [ "$owner" = "root" ] && [ "$group" = "root" ]; then
+    
+    # Check if permissions are secure: exactly 600 (or stricter like 400), owned by root:root
+    local needs_fix=false
+    if [ "$owner" != "root" ] || [ "$group" != "root" ]; then
+        needs_fix=true
+    elif [ "$mode" != "600" ] && [ "$mode" != "400" ]; then
+        # Allow 600 or 400, reject anything else (e.g., 644, 755)
+        needs_fix=true
+    fi
+    
+    if [ "$needs_fix" = "false" ]; then
         return
     fi
+    
     if [ "$NONINTERACTIVE" = "true" ]; then
         info "Non-interactive: fixing WireGuard config permissions at $path"
         chown root:root "$path"
@@ -147,6 +183,62 @@ is_wg_active() {
         return 0
     fi
     ip link show wg0 >/dev/null 2>&1
+}
+
+do_configure_wg_firewall_rules() {
+    if ! grep -q '\[Interface\]' "$WG_CONF_DEST"; then
+        echo "ERROR: No [Interface] section found in $WG_CONF_DEST" >> "$LOG_FILE"
+        return 1
+    fi
+    
+    local POST_UP="PostUp = iptables -A FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT; iptables -A FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE; iptables -t nat -A POSTROUTING -o $WAN_IFACE -j MASQUERADE"
+    local POST_DOWN="PostDown = iptables -D FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT; iptables -D FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -D POSTROUTING -o wg0 -j MASQUERADE; iptables -t nat -D POSTROUTING -o $WAN_IFACE -j MASQUERADE"
+    
+    awk -v up="$POST_UP" -v down="$POST_DOWN" '/\[Interface\]/ { print; print up; print down; next } 1' "$WG_CONF_DEST" > "${WG_CONF_DEST}.tmp" && mv "${WG_CONF_DEST}.tmp" "$WG_CONF_DEST"
+}
+
+do_start_wireguard() {
+    if ip link show wg0 >/dev/null 2>&1; then
+        wg-quick down wg0 || true
+    fi
+    wg-quick up wg0 && systemctl enable wg-quick@wg0
+}
+
+do_configure_auto_updates() {
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update >> "$LOG_FILE" 2>&1
+    apt-get install -y unattended-upgrades >> "$LOG_FILE" 2>&1
+    
+    cat > /etc/apt/apt.conf.d/51unattended-upgrades-gateway <<'EOF'
+Unattended-Upgrade::Origins-Pattern {
+    "origin=*";
+};
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-Time "03:30";
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::Verbose "true";
+Unattended-Upgrade::SyslogEnable "true";
+Unattended-Upgrade::SyslogFacility "daemon";
+Unattended-Upgrade::Mail "";
+Unattended-Upgrade::MailOnlyOnError "true";
+Unattended-Upgrade::Download-Upgradeable-Packages "true";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Keep-Debs "false";
+EOF
+
+    cat > /etc/apt/apt.conf.d/52periodic-gateway <<'EOF'
+APT::Periodic::Enable "1";
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
+APT::Periodic::AutocleanInterval "7";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::Verbose "1";
+EOF
+
+    systemctl enable --now unattended-upgrades apt-daily.timer apt-daily-upgrade.timer >> "$LOG_FILE" 2>&1 || true
 }
 
 reset_previous_lan_iface() {
@@ -326,10 +418,10 @@ run_step() {
     # Spinner loop
     local delay=0.1
     local spinstr='|/-\'
-    while [ "$(ps a | awk '{print $1}' | grep $pid)" ]; do
+    while kill -0 $pid 2>/dev/null; do
         local temp=${spinstr#?}
         printf " [%c]  " "$spinstr"
-        local spinstr=$temp${spinstr%"$temp"}
+        spinstr=$temp${spinstr%"$temp"}
         sleep $delay
         printf "\b\b\b\b\b\b"
     done
@@ -629,13 +721,30 @@ main() {
             if [ -n "$default_ssid" ]; then
                  prompt_ssid="$prompt_ssid [default: ${BOLD}${YELLOW}$default_ssid${NC}]"
             fi
-            echo -ne "$prompt_ssid: "
-            read -r input_ssid
-            if [ -z "$input_ssid" ] && [ -n "$default_ssid" ]; then
-                AP_SSID="$default_ssid"
-            else
-                AP_SSID="$input_ssid"
-            fi
+            
+            while true; do
+                echo -ne "$prompt_ssid: "
+                read -r input_ssid
+                if [ -z "$input_ssid" ] && [ -n "$default_ssid" ]; then
+                    AP_SSID="$default_ssid"
+                    break
+                elif [ -n "$input_ssid" ]; then
+                    # Validate SSID: 1-32 characters, no control characters or quotes
+                    if [ ${#input_ssid} -gt 32 ]; then
+                        warn "SSID must be 32 characters or less."
+                        continue
+                    fi
+                    # Check for problematic characters (quotes, backslashes, control chars)
+                    if echo "$input_ssid" | grep -qE '["\x27\\]|[[:cntrl:]]'; then
+                        warn "SSID cannot contain quotes, backslashes, or control characters."
+                        continue
+                    fi
+                    AP_SSID="$input_ssid"
+                    break
+                else
+                    warn "SSID cannot be empty."
+                fi
+            done
             save_config_var "AP_SSID" "$AP_SSID"
             
             # Pre-fill Password from config (warn user)
@@ -656,13 +765,23 @@ main() {
                 if [ -z "$input_pass" ] && [ -n "$default_pass" ]; then
                     AP_PASS="$default_pass"
                     break
-                elif [ ${#input_pass} -ge 8 ]; then
-                    AP_PASS="$input_pass"
-                    break
-                else
+                elif [ ${#input_pass} -lt 8 ]; then
                     warn "Password must be at least 8 characters."
                     echo "[DEBUG] Password too short." >> "$LOG_FILE"
+                    continue
+                elif [ ${#input_pass} -gt 63 ]; then
+                    warn "Password must be 63 characters or less."
+                    echo "[DEBUG] Password too long." >> "$LOG_FILE"
+                    continue
                 fi
+                # Check for problematic characters (quotes, backslashes, control chars)
+                if echo "$input_pass" | grep -qE '["\x27\\]|[[:cntrl:]]'; then
+                    warn "Password cannot contain quotes, backslashes, or control characters."
+                    echo "[DEBUG] Password contains invalid characters." >> "$LOG_FILE"
+                    continue
+                fi
+                AP_PASS="$input_pass"
+                break
             done
             # Explicit log to confirm loop exit
             echo "[DEBUG] Password accepted." >> "$LOG_FILE"
@@ -718,7 +837,6 @@ main() {
         WATCHDOG_ENABLED="${WATCHDOG_ENABLED:-false}"
     else
         # Ask whether to configure firewall (WAN hardening)
-        local default_fw="${FIREWALL_ENABLED:-true}"
         echo ""
         echo -ne "🛡️  Configure WAN firewall (allow SSH + WireGuard, drop other inbound)? [Y/n]: "
         read -r fw_choice
@@ -741,7 +859,7 @@ main() {
         save_config_var "AUTO_UPDATES_ENABLED" "$AUTO_UPDATES_ENABLED"
 
         echo ""
-        echo -ne "🛠️  Enable watchdog (auto-reboot on hang)? [Y/n]: "
+        echo -ne "🛠️  Enable hardware watchdog (kernel-level auto-reboot on system hang)? [Y/n]: "
         read -r watchdog_choice
         if [[ "$watchdog_choice" =~ ^[Nn]$ ]]; then
             WATCHDOG_ENABLED="false"
@@ -781,10 +899,11 @@ main() {
     else
         printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Auto updates: DISABLED"
     fi
+    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Software watchdog: ENABLED (systemd auto-restart for services)"
     if [ "$WATCHDOG_ENABLED" = "true" ]; then
-        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Watchdog: ENABLED (auto-reboot on hang)"
+        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Hardware watchdog: ENABLED (kernel-level reboot on system hang)"
     else
-        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Watchdog: DISABLED"
+        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Hardware watchdog: DISABLED"
     fi
     printf "╚%s╝\n" "$border_line"
     echo ""
@@ -799,11 +918,6 @@ main() {
             exit 1
         fi
         APPLYING_CHANGES=true
-    fi
-
-    # Only generate watchdog config after the user has reviewed planned changes
-    if [ "$WATCHDOG_ENABLED" = "true" ]; then
-        ensure_watchdog
     fi
 
     info "Checking System Dependencies..."
@@ -903,7 +1017,6 @@ EOF
         systemctl enable dnsmasq >> "$LOG_FILE" 2>&1
     } || { echo -e "[${RED}FAIL${NC}]"; exit 1; }
     echo -e "[${GREEN}DONE${NC}]"
-    ensure_service_restart_policy "dnsmasq"
 
     # Configure hostapd if wireless
     if [ "$IS_WIRELESS" = true ]; then
@@ -922,7 +1035,7 @@ ignore_broadcast_ssid=0
 wpa=2
 wpa_passphrase=$AP_PASS
 wpa_key_mgmt=WPA-PSK
-wpa_pairwise=TKIP
+wpa_pairwise=CCMP
 rsn_pairwise=CCMP
 EOF
             # Point daemon to config
@@ -938,24 +1051,11 @@ EOF
             systemctl restart hostapd >> "$LOG_FILE" 2>&1
         } || { echo -e "[${RED}FAIL${NC}]"; exit 1; }
         echo -e "[${GREEN}DONE${NC}]"
-        ensure_service_restart_policy "hostapd"
     fi
 
+    run_step "Configuring Firewall / NAT Rules" "do_configure_wg_firewall_rules"
 
-    run_step "Configuring Firewall / NAT Rules" "bash -c \"
-        if ! grep -q '\[Interface\]' '$WG_CONF_DEST'; then exit 1; fi;
-        POST_UP='PostUp = iptables -A FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT; iptables -A FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE; iptables -t nat -A POSTROUTING -o $WAN_IFACE -j MASQUERADE';
-        POST_DOWN='PostDown = iptables -D FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT; iptables -D FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -D POSTROUTING -o wg0 -j MASQUERADE; iptables -t nat -D POSTROUTING -o $WAN_IFACE -j MASQUERADE';
-        awk -v up=\\\"\$POST_UP\\\" -v down=\\\"\$POST_DOWN\\\" '/\[Interface\]/ { print; print up; print down; next } 1' '$WG_CONF_DEST' > '${WG_CONF_DEST}.tmp' && mv '${WG_CONF_DEST}.tmp' '$WG_CONF_DEST'
-    \""
-
-    run_step "Ensuring WireGuard VPN is running" "bash -c \"
-        if ip link show wg0 >/dev/null 2>&1; then
-            wg-quick down wg0 || true;
-        fi
-        wg-quick up wg0 && systemctl enable wg-quick@wg0
-    \""
-    ensure_service_restart_policy "wg-quick@wg0"
+    run_step "Ensuring WireGuard VPN is running" "do_start_wireguard"
 
     # Enforce required NAT/forward rules in case wg-quick skipped PostUp (e.g., interface already up)
     ensure_nat_rules
@@ -966,45 +1066,16 @@ EOF
     fi
 
     if [ "$AUTO_UPDATES_ENABLED" = "true" ]; then
-        run_step "Configuring automatic updates" "bash -c \"
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update >> '$LOG_FILE' 2>&1
-            apt-get install -y unattended-upgrades >> '$LOG_FILE' 2>&1
-            cat > /etc/apt/apt.conf.d/51unattended-upgrades-gateway <<EOF
-Unattended-Upgrade::Origins-Pattern {
-    \\"origin=*\\";
-};
-Unattended-Upgrade::Automatic-Reboot \\"true\\";
-Unattended-Upgrade::Automatic-Reboot-Time \\"03:30\\";
-Unattended-Upgrade::AutoFixInterruptedDpkg \\"true\\";
-Unattended-Upgrade::MinimalSteps \\"true\\";
-Unattended-Upgrade::Verbose \\"true\\";
-Unattended-Upgrade::SyslogEnable \\"true\\";
-Unattended-Upgrade::SyslogFacility \\"daemon\\";
-Unattended-Upgrade::Mail \\"\\";
-Unattended-Upgrade::MailOnlyOnError \\"true\\";
-Unattended-Upgrade::Download-Upgradeable-Packages \\"true\\";
-Unattended-Upgrade::Remove-Unused-Kernel-Packages \\"true\\";
-Unattended-Upgrade::Remove-New-Unused-Dependencies \\"true\\";
-Unattended-Upgrade::Remove-Unused-Dependencies \\"true\\";
-Unattended-Upgrade::Keep-Debs \\"false\\";
-};
-EOF
-            cat > /etc/apt/apt.conf.d/52periodic-gateway <<EOF
-APT::Periodic::Enable \\"1\\";
-APT::Periodic::Update-Package-Lists \\"1\\";
-APT::Periodic::Download-Upgradeable-Packages \\"1\\";
-APT::Periodic::AutocleanInterval \\"7\\";
-APT::Periodic::Unattended-Upgrade \\"1\\";
-APT::Periodic::Verbose \\"1\\";
-EOF
-            systemctl enable --now unattended-upgrades apt-daily.timer apt-daily-upgrade.timer >> '$LOG_FILE' 2>&1 || true
-        \""
-
+        run_step "Configuring automatic updates" "do_configure_auto_updates"
     fi
 
+    # --- Watchdog Configuration (at the end, after all services are set up) ---
+    # Software watchdog: systemd auto-restart for critical services (always enabled)
+    ensure_software_watchdog
+
+    # Hardware watchdog: kernel-level reboot on system hang (optional)
     if [ "$WATCHDOG_ENABLED" = "true" ]; then
-        ensure_watchdog
+        ensure_hardware_watchdog
     fi
 
     echo ""

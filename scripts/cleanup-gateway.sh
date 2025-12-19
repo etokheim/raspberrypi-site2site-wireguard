@@ -33,6 +33,51 @@ remove_auto_updates() {
     } >> "$LOG_FILE" 2>&1
 }
 
+remove_software_watchdog() {
+    # Remove systemd drop-in overrides for service restart policies
+    local services=("dnsmasq" "wg-quick@wg0" "hostapd")
+    for svc in "${services[@]}"; do
+        local dropin_dir="/etc/systemd/system/${svc}.d"
+        if [ -d "$dropin_dir" ]; then
+            rm -rf "$dropin_dir" >> "$LOG_FILE" 2>&1 || true
+        fi
+    done
+    systemctl daemon-reload >> "$LOG_FILE" 2>&1 || true
+}
+
+remove_hardware_watchdog() {
+    # Stop and disable hardware watchdog service
+    systemctl disable --now watchdog 2>/dev/null >> "$LOG_FILE" 2>&1 || true
+    
+    # Restore original watchdog.conf if backup exists
+    if [ -f /etc/watchdog.conf.bak_gateway ]; then
+        mv /etc/watchdog.conf.bak_gateway /etc/watchdog.conf >> "$LOG_FILE" 2>&1 || true
+    fi
+}
+
+cleanup_gateway_nat_rules() {
+    local lan_iface="$LAN_IFACE"
+    local wan_iface="$WAN_IFACE"
+    
+    # Remove specific forward rules (LAN -> wg0)
+    if [ -n "$lan_iface" ]; then
+        if iptables -C FORWARD -i "$lan_iface" -o wg0 -j ACCEPT >/dev/null 2>&1; then
+            iptables -D FORWARD -i "$lan_iface" -o wg0 -j ACCEPT >> "$LOG_FILE" 2>&1 || true
+        fi
+        if iptables -C FORWARD -i wg0 -o "$lan_iface" -m state --state RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1; then
+            iptables -D FORWARD -i wg0 -o "$lan_iface" -m state --state RELATED,ESTABLISHED -j ACCEPT >> "$LOG_FILE" 2>&1 || true
+        fi
+    fi
+    
+    # Remove specific NAT rules
+    if iptables -t nat -C POSTROUTING -o wg0 -j MASQUERADE >/dev/null 2>&1; then
+        iptables -t nat -D POSTROUTING -o wg0 -j MASQUERADE >> "$LOG_FILE" 2>&1 || true
+    fi
+    if [ -n "$wan_iface" ] && iptables -t nat -C POSTROUTING -o "$wan_iface" -j MASQUERADE >/dev/null 2>&1; then
+        iptables -t nat -D POSTROUTING -o "$wan_iface" -j MASQUERADE >> "$LOG_FILE" 2>&1 || true
+    fi
+}
+
 cleanup_wan_firewall_rules() {
     local wan_iface="$WAN_IFACE"
     local lan_iface="$LAN_IFACE"
@@ -89,10 +134,10 @@ run_step() {
     
     local delay=0.1
     local spinstr='|/-\'
-    while [ "$(ps a | awk '{print $1}' | grep $pid)" ]; do
+    while kill -0 $pid 2>/dev/null; do
         local temp=${spinstr#?}
         printf " [%c]  " "$spinstr"
-        local spinstr=$temp${spinstr%"$temp"}
+        spinstr=$temp${spinstr%"$temp"}
         sleep $delay
         printf "\b\b\b\b\b\b"
     done
@@ -159,6 +204,13 @@ main() {
         printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Automatic updates not enabled (skip removal)"
     fi
     printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Restore network manager settings (nmcli/dhcpcd) to DHCP"
+    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Remove software watchdog (systemd drop-in overrides)"
+    if [ "${WATCHDOG_ENABLED:-false}" = "true" ]; then
+        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Remove hardware watchdog configuration"
+    else
+        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Hardware watchdog not enabled (skip removal)"
+    fi
+    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Restore backup configs (dnsmasq.conf, hostapd.conf if applicable)"
     echo "╚${border_line}╝"
     echo ""
     if [ "${NONINTERACTIVE:-false}" = "true" ]; then
@@ -190,7 +242,7 @@ main() {
         echo "Skipping WAN firewall cleanup (disabled in config)" >> "$LOG_FILE"
     fi
 
-    run_step "Flushing Firewall Rules" "iptables -t nat -F; iptables -F FORWARD; iptables -P FORWARD ACCEPT"
+    run_step "Removing gateway NAT/forward rules" "cleanup_gateway_nat_rules"
 
     run_step "Disabling IP Forwarding" "rm -f /etc/sysctl.d/99-vpn-gateway.conf && sysctl --system"
 
@@ -198,8 +250,20 @@ main() {
         run_step "Removing automatic updates configuration" "remove_auto_updates"
     fi
 
+    run_step "Removing software watchdog configuration" "remove_software_watchdog"
+
+    if [ "${WATCHDOG_ENABLED:-false}" = "true" ]; then
+        run_step "Removing hardware watchdog configuration" "remove_hardware_watchdog"
+    fi
+
     echo -ne "⏳ ${CYAN}Restoring Network Configuration...${NC} "
     {
+        # Flush static IP from LAN interface (especially for wireless where we bypassed nmcli)
+        if [ -n "$LAN_IFACE" ]; then
+            echo "Flushing IP addresses from $LAN_IFACE..." >> "$LOG_FILE"
+            ip addr flush dev "$LAN_IFACE" >> "$LOG_FILE" 2>&1 || true
+        fi
+
         # NetworkManager Restore
         if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager; then
              if [ -n "$LAN_IFACE" ]; then
@@ -224,6 +288,32 @@ main() {
         elif [ -f /etc/dhcpcd.conf ]; then
             sed -i '/# VPN-GATEWAY-START/,/# VPN-GATEWAY-END/d' /etc/dhcpcd.conf
             systemctl restart dhcpcd >> "$LOG_FILE" 2>&1
+        fi
+    } && echo -e " [${GREEN}DONE${NC}]" || echo -e " [${RED}FAIL${NC}]"
+
+    # Restore backup configuration files
+    echo -ne "⏳ ${CYAN}Restoring backup configuration files...${NC} "
+    {
+        # Restore dnsmasq.conf backup
+        if [ -f /etc/dnsmasq.conf.bak ]; then
+            echo "Restoring /etc/dnsmasq.conf from backup..." >> "$LOG_FILE"
+            mv /etc/dnsmasq.conf.bak /etc/dnsmasq.conf >> "$LOG_FILE" 2>&1 || true
+        fi
+
+        # Remove hostapd configuration if wireless was used
+        if [ "${IS_WIRELESS:-false}" = "true" ]; then
+            echo "Removing hostapd configuration..." >> "$LOG_FILE"
+            rm -f /etc/hostapd/hostapd.conf >> "$LOG_FILE" 2>&1 || true
+            # Restore /etc/default/hostapd to default
+            if [ -f /etc/default/hostapd ]; then
+                sed -i 's|DAEMON_CONF="/etc/hostapd/hostapd.conf"|#DAEMON_CONF=""|' /etc/default/hostapd >> "$LOG_FILE" 2>&1 || true
+            fi
+        fi
+
+        # Remove WireGuard configuration
+        if [ -f /etc/wireguard/wg0.conf ]; then
+            echo "Removing /etc/wireguard/wg0.conf..." >> "$LOG_FILE"
+            rm -f /etc/wireguard/wg0.conf >> "$LOG_FILE" 2>&1 || true
         fi
     } && echo -e " [${GREEN}DONE${NC}]" || echo -e " [${RED}FAIL${NC}]"
 
