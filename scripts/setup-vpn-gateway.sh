@@ -38,6 +38,7 @@ has_full_config() {
 show_existing_config() {
     local box_w=76
     local content_w=$((box_w - 2))  # Inside the │ borders
+    local field_w=$((content_w - 20))  # For "   Label:           " (20 chars)
     local border
     border=$(printf '─%.0s' $(seq 1 $content_w))
     
@@ -50,38 +51,37 @@ show_existing_config() {
     
     # Truncate WG path if too long
     local wg_display="${WG_CONF_PATH:-<unset>}"
-    local wg_field_w=$((content_w - 21))
-    if [ ${#wg_display} -gt $wg_field_w ]; then
-        wg_display="...${wg_display: -$((wg_field_w - 3))}"
+    if [ ${#wg_display} -gt $field_w ]; then
+        wg_display="...${wg_display: -$((field_w - 3))}"
     fi
     
     echo ""
     echo -e "${CYAN}╭${border}╮${NC}"
-    printf "${CYAN}│${NC} ${BOLD}📄 Loaded Configuration${NC}%*s${CYAN}│${NC}\n" $((content_w - 24)) ""
-    printf "${CYAN}│${NC}    ${DIM}%-$((content_w - 5))s${NC}${CYAN}│${NC}\n" "$config_display"
+    echo -e "${CYAN}│${NC} ${BOLD}📄 Loaded Configuration${NC}$(printf '%*s' $((content_w - 25)) '') ${CYAN}│${NC}"
+    printf "${CYAN}│${NC}    %-$((content_w - 5))s ${CYAN}│${NC}\n" "${DIM}${config_display}${NC}"
     echo -e "${CYAN}├${border}┤${NC}"
-    printf "${CYAN}│${NC}   WAN interface:   ${BOLD}%-$((content_w - 21))s${NC}${CYAN}│${NC}\n" "${WAN_IFACE:-<unset>}"
-    printf "${CYAN}│${NC}   LAN interface:   ${BOLD}%-$((content_w - 21))s${NC}${CYAN}│${NC}\n" "${LAN_IFACE:-<unset>}"
-    printf "${CYAN}│${NC}   LAN CIDR:        ${BOLD}%-$((content_w - 21))s${NC}${CYAN}│${NC}\n" "${LAN_CIDR:-<unset>}"
-    printf "${CYAN}│${NC}   WireGuard:       ${DIM}%-$((content_w - 21))s${NC}${CYAN}│${NC}\n" "$wg_display"
+    printf "${CYAN}│${NC}   WAN interface:   ${BOLD}%-${field_w}s${NC} ${CYAN}│${NC}\n" "${WAN_IFACE:-<unset>}"
+    printf "${CYAN}│${NC}   LAN interface:   ${BOLD}%-${field_w}s${NC} ${CYAN}│${NC}\n" "${LAN_IFACE:-<unset>}"
+    printf "${CYAN}│${NC}   LAN CIDR:        ${BOLD}%-${field_w}s${NC} ${CYAN}│${NC}\n" "${LAN_CIDR:-<unset>}"
+    printf "${CYAN}│${NC}   WireGuard:       ${DIM}%-${field_w}s${NC} ${CYAN}│${NC}\n" "$wg_display"
     if [ "${IS_WIRELESS:-false}" = "true" ]; then
-        printf "${CYAN}│${NC}   Wi-Fi SSID:      ${BOLD}%-$((content_w - 21))s${NC}${CYAN}│${NC}\n" "${AP_SSID:-<unset>}"
+        printf "${CYAN}│${NC}   Wi-Fi SSID:      ${BOLD}%-${field_w}s${NC} ${CYAN}│${NC}\n" "${AP_SSID:-<unset>}"
     fi
     echo -e "${CYAN}├${border}┤${NC}"
     if [ "${FIREWALL_ENABLED:-true}" = "true" ]; then
-        printf "${CYAN}│${NC}   ${GREEN}✔${NC} %-$((content_w - 6))s${CYAN}│${NC}\n" "Firewall enabled"
+        printf "${CYAN}│${NC}   ${GREEN}✔${NC} %-$((content_w - 6))s ${CYAN}│${NC}\n" "Firewall enabled"
     else
-        printf "${CYAN}│${NC}   ${DIM}○${NC} %-$((content_w - 6))s${CYAN}│${NC}\n" "Firewall disabled"
+        printf "${CYAN}│${NC}   ${DIM}○${NC} %-$((content_w - 6))s ${CYAN}│${NC}\n" "Firewall disabled"
     fi
     if [ "${AUTO_UPDATES_ENABLED:-false}" = "true" ]; then
-        printf "${CYAN}│${NC}   ${GREEN}✔${NC} %-$((content_w - 6))s${CYAN}│${NC}\n" "Auto-updates enabled"
+        printf "${CYAN}│${NC}   ${GREEN}✔${NC} %-$((content_w - 6))s ${CYAN}│${NC}\n" "Auto-updates enabled"
     else
-        printf "${CYAN}│${NC}   ${DIM}○${NC} %-$((content_w - 6))s${CYAN}│${NC}\n" "Auto-updates disabled"
+        printf "${CYAN}│${NC}   ${DIM}○${NC} %-$((content_w - 6))s ${CYAN}│${NC}\n" "Auto-updates disabled"
     fi
     if [ "${WATCHDOG_ENABLED:-false}" = "true" ]; then
-        printf "${CYAN}│${NC}   ${GREEN}✔${NC} %-$((content_w - 6))s${CYAN}│${NC}\n" "Hardware watchdog enabled"
+        printf "${CYAN}│${NC}   ${GREEN}✔${NC} %-$((content_w - 6))s ${CYAN}│${NC}\n" "Hardware watchdog enabled"
     else
-        printf "${CYAN}│${NC}   ${DIM}○${NC} %-$((content_w - 6))s${CYAN}│${NC}\n" "Hardware watchdog disabled"
+        printf "${CYAN}│${NC}   ${DIM}○${NC} %-$((content_w - 6))s ${CYAN}│${NC}\n" "Hardware watchdog disabled"
     fi
     echo -e "${CYAN}╰${border}╯${NC}"
     echo ""
