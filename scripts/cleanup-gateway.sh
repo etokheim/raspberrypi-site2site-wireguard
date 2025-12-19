@@ -256,6 +256,10 @@ main() {
         run_step "Removing hardware watchdog configuration" "remove_hardware_watchdog"
     fi
 
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        run_step "Saving empty firewall rules to persistence" "netfilter-persistent save"
+    fi
+
     echo -ne "⏳ ${CYAN}Restoring Network Configuration...${NC} "
     {
         # Flush static IP from LAN interface (especially for wireless where we bypassed nmcli)

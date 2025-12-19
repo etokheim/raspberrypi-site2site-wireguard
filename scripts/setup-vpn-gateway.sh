@@ -194,6 +194,10 @@ do_configure_wg_firewall_rules() {
     local POST_UP="PostUp = iptables -A FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT; iptables -A FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE; iptables -t nat -A POSTROUTING -o $WAN_IFACE -j MASQUERADE"
     local POST_DOWN="PostDown = iptables -D FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT; iptables -D FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -D POSTROUTING -o wg0 -j MASQUERADE; iptables -t nat -D POSTROUTING -o $WAN_IFACE -j MASQUERADE"
     
+    # Remove existing PostUp/PostDown rules to prevent duplication if re-running
+    sed -i '/^PostUp =/d' "$WG_CONF_DEST"
+    sed -i '/^PostDown =/d' "$WG_CONF_DEST"
+
     awk -v up="$POST_UP" -v down="$POST_DOWN" '/\[Interface\]/ { print; print up; print down; next } 1' "$WG_CONF_DEST" > "${WG_CONF_DEST}.tmp" && mv "${WG_CONF_DEST}.tmp" "$WG_CONF_DEST"
 }
 
@@ -491,6 +495,12 @@ ensure_wan_firewall_rules() {
     # Drop everything else on WAN INPUT
     if ! iptables -C INPUT -i "$WAN_IFACE" -j DROP >/dev/null 2>&1; then
         iptables -A INPUT -i "$WAN_IFACE" -j DROP >> "$LOG_FILE" 2>&1
+    fi
+
+    # Save rules to persistence
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        echo "[wan_firewall] Saving rules via netfilter-persistent..." >> "$LOG_FILE"
+        netfilter-persistent save >> "$LOG_FILE" 2>&1
     fi
 }
 
@@ -929,6 +939,7 @@ main() {
     if ! dpkg -s iptables >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS iptables"; fi
     if ! dpkg -s qrencode >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS qrencode"; fi
     if ! dpkg -s resolvconf >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS resolvconf"; fi
+    if ! dpkg -s iptables-persistent >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS iptables-persistent"; fi
 
     if [ -n "$MISSING_PKGS" ]; then
         echo -e "   ${YELLOW}Missing packages:${NC}$MISSING_PKGS"
@@ -939,10 +950,13 @@ main() {
             exit 1
         else
             run_step "Updating package list" "apt-get update"
+            # Preseed iptables-persistent to avoid interactive prompts
+            echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections 2>/dev/null || true
+            echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections 2>/dev/null || true
             run_step "Installing missing packages" "apt-get install -y $MISSING_PKGS"
         fi
     else
-        success "All base dependencies (wireguard, dnsmasq, iptables, qrencode, resolvconf) are already installed."
+        success "All base dependencies (wireguard, dnsmasq, iptables, qrencode, resolvconf, iptables-persistent) are already installed."
     fi
 
     echo ""
