@@ -407,10 +407,11 @@ progress_find_step() {
 }
 
 progress_draw_box() {
-    local box_w=95
-    local inner_w=$((box_w - 2))  # Content width (minus borders)
+    # Box is 76 chars: ║ + space + 72 content + space + ║
+    local box_w=76
+    local content_w=72
     local border
-    border=$(printf '═%.0s' $(seq 1 $box_w))
+    border=$(printf '═%.0s' $(seq 1 $((box_w - 2))))
     
     # Move cursor up to redraw if we've drawn before
     if [ "$PROGRESS_BOX_LINES" -gt 0 ]; then
@@ -423,9 +424,9 @@ progress_draw_box() {
     local lines=0
     
     # Header
-    printf "${CYAN}╔%s╗${NC}\n" "$border"
-    printf "${CYAN}║${NC} ${BOLD}${YELLOW}⚡ Setup Progress${NC}%*s${CYAN}║${NC}\n" $((inner_w - 17)) ""
-    printf "${CYAN}╠%s╣${NC}\n" "$border"
+    echo -e "${CYAN}╔${border}╗${NC}"
+    echo -e "${CYAN}║${NC} ${BOLD}${YELLOW}⚡ Setup Progress${NC}$(printf '%*s' $((content_w - 16)) '') ${CYAN}║${NC}"
+    echo -e "${CYAN}╠${border}╣${NC}"
     lines=$((lines + 3))
     
     # Steps
@@ -443,28 +444,38 @@ progress_draw_box() {
             skip)    icon="◌"; color="${DIM}" ;;
         esac
         
-        # Calculate visible text length (icon=1 + space=1 + step + possible space + extra)
-        local base_text="$icon $step"
-        local base_len=${#base_text}
-        local extra_len=0
-        [ -n "$extra" ] && extra_len=$((${#extra} + 1))  # +1 for space before extra
-        local total_len=$((base_len + extra_len))
+        # Build the display text (for length calculation)
+        local display_text="$icon $step"
+        [ -n "$extra" ] && display_text="$display_text $extra"
         
-        # Calculate padding needed
-        local padding=$((inner_w - total_len))
-        [ $padding -lt 0 ] && padding=0
+        # Truncate if too long
+        local text_len=${#display_text}
+        if [ $text_len -gt $content_w ]; then
+            if [ -n "$extra" ]; then
+                # Truncate step to fit
+                local max_step=$((content_w - ${#extra} - 6))  # icon + spaces + ...
+                step="${step:0:$max_step}..."
+                display_text="$icon $step $extra"
+            else
+                step="${step:0:$((content_w - 4))}..."
+                display_text="$icon $step"
+            fi
+            text_len=${#display_text}
+        fi
+        
+        local padding=$((content_w - text_len))
         
         # Print the line
         if [ -n "$extra" ]; then
-            printf "${CYAN}║${NC} ${color}%s %s${NC} ${DIM}%s${NC}%*s${CYAN}║${NC}\n" "$icon" "$step" "$extra" "$padding" ""
+            echo -e "${CYAN}║${NC} ${color}${icon} ${step}${NC} ${DIM}${extra}${NC}$(printf '%*s' $padding '') ${CYAN}║${NC}"
         else
-            printf "${CYAN}║${NC} ${color}%s %s${NC}%*s${CYAN}║${NC}\n" "$icon" "$step" "$padding" ""
+            echo -e "${CYAN}║${NC} ${color}${icon} ${step}${NC}$(printf '%*s' $padding '') ${CYAN}║${NC}"
         fi
         lines=$((lines + 1))
     done
     
     # Footer
-    printf "${CYAN}╚%s╝${NC}\n" "$border"
+    echo -e "${CYAN}╚${border}╝${NC}"
     lines=$((lines + 1))
     
     PROGRESS_BOX_LINES=$lines
