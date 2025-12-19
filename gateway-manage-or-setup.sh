@@ -148,10 +148,12 @@ run_stop() {
                 echo "Failed to disable wg-quick@wg0" >&2
                 status=1
             fi
-        fi
-        if ! wg-quick down wg0 2>/dev/null; then
-            echo "wg-quick down wg0 failed (may already be down)" >&2
-            status=1
+        else
+            # No systemd - use wg-quick directly
+            if ! wg-quick down wg0 2>/dev/null; then
+                echo "wg-quick down wg0 failed" >&2
+                status=1
+            fi
         fi
     else
         echo "WireGuard (wg0) is not active."
@@ -238,7 +240,11 @@ for arg in "$@"; do
     esac
 done
 
-set -- "${ARGS[@]}"
+if [ ${#ARGS[@]} -gt 0 ]; then
+    set -- "${ARGS[@]}"
+else
+    set --
+fi
 
 if [ $# -gt 1 ]; then
     echo "Too many arguments: $*" >&2
