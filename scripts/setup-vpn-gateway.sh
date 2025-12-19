@@ -1347,9 +1347,7 @@ HOSTAPD_EOF
     progress_draw_box
 
     echo ""
-    echo -e "${GREEN}${BOLD}╔════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}${BOLD}║                  🎉 Setup Complete! 🎉                     ║${NC}"
-    echo -e "${GREEN}${BOLD}╚════════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${GREEN}${BOLD}🎉 Setup Complete!${NC}"
     echo ""
     success "Status:"
     echo -e "   • WAN Interface: ${BOLD}$WAN_IFACE${NC}"

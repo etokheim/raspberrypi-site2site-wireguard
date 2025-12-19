@@ -455,9 +455,7 @@ main() {
     progress_draw_box
 
     echo ""
-    echo -e "${GREEN}${BOLD}╭──────────────────────────────────────────────────────────────────────────╮${NC}"
-    echo -e "${GREEN}${BOLD}│                          ✔ Restore Complete!                             │${NC}"
-    echo -e "${GREEN}${BOLD}╰──────────────────────────────────────────────────────────────────────────╯${NC}"
+    echo -e "${GREEN}${BOLD}✔ Restore Complete!${NC}"
     echo ""
     echo -e "The Pi should now be back to its original state."
     echo -e "See ${YELLOW}$LOG_FILE${NC} for details."
