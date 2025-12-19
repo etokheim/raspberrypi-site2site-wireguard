@@ -36,16 +36,36 @@ has_full_config() {
 }
 
 show_existing_config() {
-    echo "📄 Existing configuration loaded from $CONFIG_FILE:"
-    echo "  • WAN interface: ${WAN_IFACE:-<unset>}"
-    echo "  • LAN interface: ${LAN_IFACE:-<unset>}"
-    echo "  • LAN CIDR: ${LAN_CIDR:-<unset>}"
-    echo "  • WireGuard config: ${WG_CONF_PATH:-<unset>}"
+    echo ""
+    echo -e "${CYAN}╭─────────────────────────────────────────────────────────────────╮${NC}"
+    echo -e "${CYAN}│${NC} ${BOLD}📄 Loaded Configuration${NC}                                        ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}    ${DIM}$CONFIG_FILE${NC}"
+    echo -e "${CYAN}├─────────────────────────────────────────────────────────────────┤${NC}"
+    echo -e "${CYAN}│${NC}   WAN interface:   ${BOLD}${WAN_IFACE:-<unset>}${NC}"
+    echo -e "${CYAN}│${NC}   LAN interface:   ${BOLD}${LAN_IFACE:-<unset>}${NC}"
+    echo -e "${CYAN}│${NC}   LAN CIDR:        ${BOLD}${LAN_CIDR:-<unset>}${NC}"
+    echo -e "${CYAN}│${NC}   WireGuard:       ${DIM}${WG_CONF_PATH:-<unset>}${NC}"
     if [ "${IS_WIRELESS:-false}" = "true" ]; then
-        echo "  • Wi‑Fi SSID: ${AP_SSID:-<unset>}"
+        echo -e "${CYAN}│${NC}   Wi-Fi SSID:      ${BOLD}${AP_SSID:-<unset>}${NC}"
     fi
-    echo "  • Firewall: ${FIREWALL_ENABLED:-true}"
-    echo "  • Auto updates: ${AUTO_UPDATES_ENABLED:-false}"
+    echo -e "${CYAN}├─────────────────────────────────────────────────────────────────┤${NC}"
+    if [ "${FIREWALL_ENABLED:-true}" = "true" ]; then
+        echo -e "${CYAN}│${NC}   ${GREEN}✔${NC} Firewall enabled"
+    else
+        echo -e "${CYAN}│${NC}   ${DIM}○${NC} Firewall disabled"
+    fi
+    if [ "${AUTO_UPDATES_ENABLED:-false}" = "true" ]; then
+        echo -e "${CYAN}│${NC}   ${GREEN}✔${NC} Auto-updates enabled"
+    else
+        echo -e "${CYAN}│${NC}   ${DIM}○${NC} Auto-updates disabled"
+    fi
+    if [ "${WATCHDOG_ENABLED:-false}" = "true" ]; then
+        echo -e "${CYAN}│${NC}   ${GREEN}✔${NC} Hardware watchdog enabled"
+    else
+        echo -e "${CYAN}│${NC}   ${DIM}○${NC} Hardware watchdog disabled"
+    fi
+    echo -e "${CYAN}╰─────────────────────────────────────────────────────────────────╯${NC}"
+    echo ""
 }
 
 detect_ssh_port() {

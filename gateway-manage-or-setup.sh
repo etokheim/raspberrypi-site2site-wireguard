@@ -10,6 +10,17 @@ CONFIG_FILE="$ROOT_DIR/vpn-gateway.conf"
 LEGACY_CONFIG_1="$ROOT_DIR/gateway.conf"
 LEGACY_CONFIG_2="$ROOT_DIR/vpn_gateway.conf"
 
+# --- Colors ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
 usage() {
     cat <<EOF
 Usage: $(basename "$0") [--setup|--cleanup|--start|--stop|--yes|--help]
@@ -25,8 +36,8 @@ EOF
 }
 
 print_banner() {
+    echo -e "${YELLOW}"
     cat <<'EOF'
-
                ('-.     .-') _     ('-.    (`\ .-') /`  ('-.                 
               ( OO ).-.(  OO) )  _(  OO)    `.( OO ),' ( OO ).-.             
   ,----.      / . --. //     '._(,------.,--./  .--.   / . --. /  ,--.   ,--.
@@ -36,9 +47,9 @@ print_banner() {
 (|  | '. (_/  |  .-.  |   |  |   |  .--' |         |   |  .-.  | |   /  /\_  
  |  '--'  |   |  | |  |   |  |   |  `---.|   ,'.   |   |  | |  | `-./  /.__) 
   `------'    `--' `--'   `--'   `------''--'   '--'   `--' `--'   `--'      
-
-            Site2Site Gateway — using WireGuard on Raspberry Pi
 EOF
+    echo -e "${NC}"
+    echo -e "${BOLD}            Site2Site Gateway — using WireGuard on Raspberry Pi${NC}"
     echo ""
 }
 
@@ -187,30 +198,38 @@ prompt_choice() {
     if is_wg_active; then active=true; fi
 
     if [ "$configured" = false ] && [ "$active" = false ]; then
-        echo "No existing gateway configuration detected. Launching setup..."
+        echo -e "${CYAN}No existing gateway configuration detected. Launching setup...${NC}"
         run_setup
         return
     fi
 
-    echo "Gateway status:"
+    # Status box
+    echo -e "${CYAN}╭─────────────────────────────────────────────────────────────────╮${NC}"
+    echo -e "${CYAN}│${NC} ${BOLD}Gateway Status${NC}                                                ${CYAN}│${NC}"
+    echo -e "${CYAN}├─────────────────────────────────────────────────────────────────┤${NC}"
     if [ "$configured" = true ]; then
-        echo "  - Config: present at $CONFIG_FILE"
+        echo -e "${CYAN}│${NC}   ${GREEN}●${NC} Config:    ${DIM}$CONFIG_FILE${NC}"
     else
-        echo "  - Config: not found"
+        echo -e "${CYAN}│${NC}   ${RED}○${NC} Config:    ${DIM}not found${NC}"
     fi
     if [ "$active" = true ]; then
-        echo "  - WireGuard: active (wg0)"
+        echo -e "${CYAN}│${NC}   ${GREEN}●${NC} WireGuard: ${GREEN}active${NC} (wg0)"
     else
-        echo "  - WireGuard: inactive"
+        echo -e "${CYAN}│${NC}   ${DIM}○${NC} WireGuard: ${DIM}inactive${NC}"
     fi
+    echo -e "${CYAN}╰─────────────────────────────────────────────────────────────────╯${NC}"
     echo ""
-    echo "Select an action:"
-    echo "  1) Edit/reconfigure gateway (rerun setup)"
-    echo "  2) Cleanup/restore gateway"
-    echo "  3) Start gateway (WireGuard)"
-    echo "  4) Stop gateway (WireGuard)"
-    echo "  q) Quit"
-    echo -n "Choice [1/2/3/4/q]: "
+    
+    # Menu
+    echo -e "${BOLD}Select an action:${NC}"
+    echo ""
+    echo -e "   ${CYAN}1)${NC} Edit/reconfigure gateway ${DIM}(rerun setup)${NC}"
+    echo -e "   ${RED}2)${NC} Cleanup/restore gateway"
+    echo -e "   ${GREEN}3)${NC} Start gateway ${DIM}(WireGuard + services)${NC}"
+    echo -e "   ${YELLOW}4)${NC} Stop gateway ${DIM}(WireGuard + services)${NC}"
+    echo -e "   ${DIM}q)${NC} Quit"
+    echo ""
+    echo -ne "${BOLD}Choice [1/2/3/4/q]:${NC} "
     read -r choice
 
     case "$choice" in
@@ -219,7 +238,7 @@ prompt_choice() {
         3) run_start ;;
         4) run_stop ;;
         q|Q) echo "Exiting."; exit 0 ;;
-        *) echo "Invalid choice."; prompt_choice ;;
+        *) echo -e "${RED}Invalid choice.${NC}"; prompt_choice ;;
     esac
 }
 
