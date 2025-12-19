@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -o pipefail
+set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPTS_DIR="$ROOT_DIR/scripts"
@@ -54,9 +54,16 @@ ensure_config_migrated() {
 }
 
 is_wg_active() {
-    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet wg-quick@wg0; then
-        return 0
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl is-active --quiet wg-quick@wg0
+        return
     fi
+
+    if command -v wg >/dev/null 2>&1; then
+        wg show wg0 >/dev/null 2>&1
+        return
+    fi
+
     ip link show wg0 >/dev/null 2>&1
 }
 
@@ -92,11 +99,17 @@ run_start() {
     if [ "${IS_WIRELESS:-false}" = "true" ]; then
         echo "Starting Access Point (hostapd)..."
         rfkill unblock wlan >/dev/null 2>&1 || true
-        systemctl start hostapd >/dev/null 2>&1 || true
+        if ! systemctl start hostapd >/dev/null 2>&1; then
+            echo "Failed to start hostapd" >&2
+            return 1
+        fi
     fi
 
     echo "Starting DHCP (dnsmasq)..."
-    systemctl start dnsmasq >/dev/null 2>&1 || true
+    if ! systemctl start dnsmasq >/dev/null 2>&1; then
+        echo "Failed to start dnsmasq" >&2
+        return 1
+    fi
 
     if is_wg_active; then
         echo "WireGuard (wg0) already active."
@@ -104,21 +117,42 @@ run_start() {
     fi
     echo "Starting WireGuard (wg0)..."
     if command -v systemctl >/dev/null 2>&1; then
-        systemctl start wg-quick@wg0 && systemctl enable wg-quick@wg0
+        if ! systemctl start wg-quick@wg0; then
+            echo "Failed to start wg-quick@wg0" >&2
+            return 1
+        fi
+        if ! systemctl enable wg-quick@wg0; then
+            echo "Failed to enable wg-quick@wg0" >&2
+            return 1
+        fi
     else
-        wg-quick up wg0
+        if ! wg-quick up wg0; then
+            echo "Failed to bring up wg0 via wg-quick" >&2
+            return 1
+        fi
     fi
 }
 
 run_stop() {
+    local status=0
     load_config_if_present
 
     if is_wg_active; then
         echo "Stopping WireGuard (wg0)..."
         if command -v systemctl >/dev/null 2>&1; then
-            systemctl stop wg-quick@wg0 && systemctl disable wg-quick@wg0
+            if ! systemctl stop wg-quick@wg0; then
+                echo "Failed to stop wg-quick@wg0" >&2
+                status=1
+            fi
+            if ! systemctl disable wg-quick@wg0; then
+                echo "Failed to disable wg-quick@wg0" >&2
+                status=1
+            fi
         fi
-        wg-quick down wg0 2>/dev/null || true
+        if ! wg-quick down wg0 2>/dev/null; then
+            echo "wg-quick down wg0 failed (may already be down)" >&2
+            status=1
+        fi
     else
         echo "WireGuard (wg0) is not active."
     fi
@@ -126,11 +160,19 @@ run_stop() {
     # Stop AP if wireless was configured or hostapd is active
     if [ "${IS_WIRELESS:-false}" = "true" ] || systemctl is-active --quiet hostapd; then
         echo "Stopping Access Point (hostapd)..."
-        systemctl stop hostapd >/dev/null 2>&1 || true
+        if ! systemctl stop hostapd >/dev/null 2>&1; then
+            echo "Failed to stop hostapd" >&2
+            status=1
+        fi
     fi
 
     echo "Stopping DHCP (dnsmasq)..."
-    systemctl stop dnsmasq >/dev/null 2>&1 || true
+    if ! systemctl stop dnsmasq >/dev/null 2>&1; then
+        echo "Failed to stop dnsmasq" >&2
+        status=1
+    fi
+
+    return $status
 }
 
 prompt_choice() {
@@ -198,7 +240,13 @@ done
 
 set -- "${ARGS[@]}"
 
-case "$1" in
+if [ $# -gt 1 ]; then
+    echo "Too many arguments: $*" >&2
+    usage
+    exit 1
+fi
+
+case "${1:-}" in
     --setup|-s)
         run_setup
         ;;
