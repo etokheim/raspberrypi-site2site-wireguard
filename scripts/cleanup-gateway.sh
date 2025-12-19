@@ -14,14 +14,172 @@ CONFIG_FILE="$ROOT_DIR/vpn-gateway.conf"
 LEGACY_CONFIG_1="$ROOT_DIR/gateway.conf"
 LEGACY_CONFIG_2="$ROOT_DIR/vpn_gateway.conf"
 
-# --- Colors ---
+# --- Colors & Styles ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
 BOLD='\033[1m'
+DIM='\033[2m'
 NC='\033[0m'
+
+# --- Progress Box System ---
+declare -a PROGRESS_STEPS=()
+declare -a PROGRESS_STATUS=()
+declare -a PROGRESS_EXTRA=()
+PROGRESS_BOX_LINES=0
+
+progress_add_step() {
+    local name="$1"
+    local extra="${2:-}"
+    PROGRESS_STEPS+=("$name")
+    PROGRESS_STATUS+=("pending")
+    PROGRESS_EXTRA+=("$extra")
+}
+
+progress_set_status() {
+    local index="$1"
+    local status="$2"
+    local extra="${3:-}"
+    PROGRESS_STATUS[$index]="$status"
+    [ -n "$extra" ] && PROGRESS_EXTRA[$index]="$extra"
+}
+
+progress_find_step() {
+    local name="$1"
+    for i in "${!PROGRESS_STEPS[@]}"; do
+        if [[ "${PROGRESS_STEPS[$i]}" == "$name" ]]; then
+            echo "$i"
+            return
+        fi
+    done
+    echo "-1"
+}
+
+progress_draw_box() {
+    local box_w=95
+    local inner_w=$((box_w - 2))
+    local border
+    border=$(printf '═%.0s' $(seq 1 $box_w))
+    
+    # Move cursor up and clear lines if we've drawn before
+    if [ "$PROGRESS_BOX_LINES" -gt 0 ]; then
+        for ((j=0; j<PROGRESS_BOX_LINES; j++)); do
+            printf "\033[A\033[2K"
+        done
+    fi
+    
+    local lines=0
+    
+    # Header
+    printf "${RED}╔%s╗${NC}\n" "$border"
+    printf "${RED}║${NC} ${BOLD}${YELLOW}🧹 Cleanup Progress${NC}%*s${RED}║${NC}\n" $((inner_w - 19)) ""
+    printf "${RED}╠%s╣${NC}\n" "$border"
+    lines=$((lines + 3))
+    
+    # Steps
+    for i in "${!PROGRESS_STEPS[@]}"; do
+        local step="${PROGRESS_STEPS[$i]}"
+        local status="${PROGRESS_STATUS[$i]}"
+        local extra="${PROGRESS_EXTRA[$i]}"
+        local icon color
+        
+        case "$status" in
+            pending) icon="○"; color="${DIM}" ;;
+            running) icon="◐"; color="${YELLOW}" ;;
+            done)    icon="✔"; color="${GREEN}" ;;
+            fail)    icon="✖"; color="${RED}" ;;
+            skip)    icon="◌"; color="${DIM}" ;;
+        esac
+        
+        # Calculate visible text length
+        local base_text="$icon $step"
+        local base_len=${#base_text}
+        local extra_len=0
+        [ -n "$extra" ] && extra_len=$((${#extra} + 1))
+        local total_len=$((base_len + extra_len))
+        
+        # Calculate padding needed
+        local padding=$((inner_w - total_len))
+        [ $padding -lt 0 ] && padding=0
+        
+        # Print the line
+        if [ -n "$extra" ]; then
+            printf "${RED}║${NC} ${color}%s %s${NC} ${DIM}%s${NC}%*s${RED}║${NC}\n" "$icon" "$step" "$extra" "$padding" ""
+        else
+            printf "${RED}║${NC} ${color}%s %s${NC}%*s${RED}║${NC}\n" "$icon" "$step" "$padding" ""
+        fi
+        lines=$((lines + 1))
+    done
+    
+    # Footer
+    printf "${RED}╚%s╝${NC}\n" "$border"
+    lines=$((lines + 1))
+    
+    PROGRESS_BOX_LINES=$lines
+}
+
+progress_run_step() {
+    local step_name="$1"
+    shift
+    local cmd="$@"
+    
+    local idx
+    idx=$(progress_find_step "$step_name")
+    if [ "$idx" = "-1" ]; then
+        # Step not in list, just run it
+        eval "$cmd" >> "$LOG_FILE" 2>&1
+        return $?
+    fi
+    
+    progress_set_status "$idx" "running"
+    progress_draw_box
+    
+    # Run the command in background
+    echo "[$step_name] Executing: $cmd" >> "$LOG_FILE"
+    eval "$cmd" >> "$LOG_FILE" 2>&1 &
+    local pid=$!
+    
+    # Animated spinner while waiting
+    local spin_frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local frame=0
+    
+    printf "   "
+    while kill -0 $pid 2>/dev/null; do
+        printf "\r   ${YELLOW}${spin_frames[$frame]}${NC} Running: ${DIM}%s${NC}   " "$step_name"
+        frame=$(( (frame + 1) % ${#spin_frames[@]} ))
+        sleep 0.1
+    done
+    printf "\r\033[K"
+    
+    wait $pid
+    local exit_code=$?
+    
+    if [ $exit_code -eq 0 ]; then
+        progress_set_status "$idx" "done"
+    else
+        progress_set_status "$idx" "fail"
+    fi
+    progress_draw_box
+    
+    return $exit_code
+}
+
+progress_skip_step() {
+    local step_name="$1"
+    local idx
+    idx=$(progress_find_step "$step_name")
+    [ "$idx" != "-1" ] && progress_set_status "$idx" "skip"
+}
+
+progress_clear() {
+    PROGRESS_STEPS=()
+    PROGRESS_STATUS=()
+    PROGRESS_EXTRA=()
+    PROGRESS_BOX_LINES=0
+}
 
 remove_auto_updates() {
     {
@@ -118,49 +276,11 @@ init_log() {
 }
 
 print_header() {
-    clear
-    echo -e "${RED}${BOLD}"
-    echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║           VPN Gateway Cleanup / Restore                    ║"
-    echo "╚════════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
+    echo ""
     echo -e "📄 Log file: ${YELLOW}$LOG_FILE${NC}"
     echo ""
 }
 
-run_step() {
-    local msg="$1"
-    shift
-    local cmd="$@"
-    
-    echo -ne "⏳ ${CYAN}${msg}${NC} "
-    
-    {
-        echo "[$msg] Executing: $cmd" >> "$LOG_FILE"
-        eval "$cmd" >> "$LOG_FILE" 2>&1
-    } & 
-    local pid=$!
-    
-    local delay=0.1
-    local spinstr='|/-\'
-    while kill -0 $pid 2>/dev/null; do
-        local temp=${spinstr#?}
-        printf " [%c]  " "$spinstr"
-        spinstr=$temp${spinstr%"$temp"}
-        sleep $delay
-        printf "\b\b\b\b\b\b"
-    done
-    wait $pid
-    local exit_code=$?
-    printf "       \b\b\b\b\b\b\b"
-
-    if [ $exit_code -eq 0 ]; then
-        echo -e "[${GREEN}DONE${NC}]"
-    else
-        echo -e "[${RED}FAIL${NC}]" # Don't exit on fail in cleanup, try to continue
-        echo "Error in: $msg. Check log." >> "$LOG_FILE"
-    fi
-}
 
 check_root() {
     if [ "$EUID" -ne 0 ]; then
@@ -189,153 +309,144 @@ main() {
     
     print_header
 
-    # Planned changes summary
-    local box_w=95
-    local border_inner=95
-    local border_line
-    border_line=$(printf '═%.0s' $(seq 1 $border_inner))
-
-    echo "╔${border_line}╗"
-    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "📝 Planned changes (cleanup)"
-    echo "╠${border_line}╣"
-    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Stop WireGuard and remove wg0 config"
-    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Stop/disable DHCP (dnsmasq)"
-    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Stop/disable hostapd (if running)"
-    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Flush firewall/NAT and reset IP forwarding"
+    # --- Build Progress Steps ---
+    progress_clear
+    
+    progress_add_step "Stop WireGuard service"
+    progress_add_step "Bring down WireGuard interface"
+    progress_add_step "Stop DHCP server" "(dnsmasq)"
+    progress_add_step "Clean up DNS" "(resolvconf)"
+    
+    # Check if hostapd is active
+    local hostapd_active=false
+    if systemctl is-active --quiet hostapd 2>/dev/null; then
+        hostapd_active=true
+        progress_add_step "Stop Access Point" "(hostapd)"
+    fi
+    
     if [ "${FIREWALL_ENABLED:-true}" = "true" ]; then
-        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Remove WAN firewall rules"
-    else
-        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• WAN firewall rules were disabled (skip removal)"
+        progress_add_step "Remove WAN firewall rules"
     fi
+    
+    progress_add_step "Remove NAT/forward rules"
+    progress_add_step "Disable IP forwarding"
+    
     if [ "${AUTO_UPDATES_ENABLED:-false}" = "true" ]; then
-        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Disable and remove unattended-upgrades config"
-    else
-        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Automatic updates not enabled (skip removal)"
+        progress_add_step "Remove auto-updates config"
     fi
-    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Restore network manager settings (nmcli/dhcpcd) to DHCP"
-    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Remove software watchdog (systemd drop-in overrides)"
+    
+    progress_add_step "Remove software watchdog"
+    
     if [ "${WATCHDOG_ENABLED:-false}" = "true" ]; then
-        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Remove hardware watchdog configuration"
-    else
-        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Hardware watchdog not enabled (skip removal)"
+        progress_add_step "Remove hardware watchdog"
     fi
-    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Restore backup configs (dnsmasq.conf, hostapd.conf if applicable)"
-    echo "╚${border_line}╝"
+    
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        progress_add_step "Save firewall rules"
+    fi
+    
+    progress_add_step "Restore network config"
+    progress_add_step "Restore backup files"
+    
+    # Draw initial progress box
+    progress_draw_box
+    
     echo ""
     if [ "${NONINTERACTIVE:-false}" = "true" ]; then
         echo "Non-interactive mode: proceeding with cleanup."
     else
-        echo -ne "Proceed with cleanup/restore? [Y/n]: "
+        echo -ne "${BOLD}Proceed with cleanup/restore? [Y/n]:${NC} "
         read -r proceed_choice
         if [[ "$proceed_choice" =~ ^[Nn]$ ]]; then
             echo "Aborting cleanup by user request."
             exit 1
         fi
     fi
-
-    run_step "Stopping WireGuard Service" "systemctl stop wg-quick@wg0; systemctl disable wg-quick@wg0"
     
-    # Also try manual down in case it wasn't a service
-    run_step "Ensuring WireGuard Interface Down" "if ip link show wg0 >/dev/null 2>&1; then wg-quick down wg0; fi"
+    # Reset box lines after prompt
+    PROGRESS_BOX_LINES=0
+    echo ""
 
-    run_step "Stopping DHCP Server (dnsmasq)" "systemctl stop dnsmasq; systemctl disable dnsmasq"
+    # --- Execute Steps ---
     
-    run_step "Cleaning up resolvconf (DNS)" "cleanup_dns_resolvconf"
+    progress_run_step "Stop WireGuard service" "systemctl stop wg-quick@wg0 2>/dev/null; systemctl disable wg-quick@wg0 2>/dev/null; true"
+    
+    progress_run_step "Bring down WireGuard interface" "if ip link show wg0 >/dev/null 2>&1; then wg-quick down wg0 2>/dev/null; fi; true"
 
-    # Stop hostapd if it was installed/active
-    if systemctl is-active --quiet hostapd; then
-        run_step "Stopping Access Point (hostapd)" "systemctl stop hostapd; systemctl disable hostapd"
+    progress_run_step "Stop DHCP server" "systemctl stop dnsmasq 2>/dev/null; systemctl disable dnsmasq 2>/dev/null; true"
+    
+    progress_run_step "Clean up DNS" "cleanup_dns_resolvconf"
+
+    if [ "$hostapd_active" = true ]; then
+        progress_run_step "Stop Access Point" "systemctl stop hostapd; systemctl disable hostapd"
     fi
 
     if [ "${FIREWALL_ENABLED:-true}" = "true" ]; then
-        run_step "Removing WAN firewall rules" "cleanup_wan_firewall_rules"
-    else
-        echo "Skipping WAN firewall cleanup (disabled in config)" >> "$LOG_FILE"
+        progress_run_step "Remove WAN firewall rules" "cleanup_wan_firewall_rules"
     fi
 
-    run_step "Removing gateway NAT/forward rules" "cleanup_gateway_nat_rules"
+    progress_run_step "Remove NAT/forward rules" "cleanup_gateway_nat_rules"
 
-    run_step "Disabling IP Forwarding" "rm -f /etc/sysctl.d/99-vpn-gateway.conf && sysctl --system"
+    progress_run_step "Disable IP forwarding" "rm -f /etc/sysctl.d/99-vpn-gateway.conf && sysctl --system >/dev/null 2>&1"
 
     if [ "${AUTO_UPDATES_ENABLED:-false}" = "true" ]; then
-        run_step "Removing automatic updates configuration" "remove_auto_updates"
+        progress_run_step "Remove auto-updates config" "remove_auto_updates"
     fi
 
-    run_step "Removing software watchdog configuration" "remove_software_watchdog"
+    progress_run_step "Remove software watchdog" "remove_software_watchdog"
 
     if [ "${WATCHDOG_ENABLED:-false}" = "true" ]; then
-        run_step "Removing hardware watchdog configuration" "remove_hardware_watchdog"
+        progress_run_step "Remove hardware watchdog" "remove_hardware_watchdog"
     fi
 
     if command -v netfilter-persistent >/dev/null 2>&1; then
-        run_step "Saving empty firewall rules to persistence" "netfilter-persistent save"
+        progress_run_step "Save firewall rules" "netfilter-persistent save"
     fi
 
-    echo -ne "⏳ ${CYAN}Restoring Network Configuration...${NC} "
-    {
-        # Flush static IP from LAN interface (especially for wireless where we bypassed nmcli)
-        if [ -n "$LAN_IFACE" ]; then
-            echo "Flushing IP addresses from $LAN_IFACE..." >> "$LOG_FILE"
-            ip addr flush dev "$LAN_IFACE" >> "$LOG_FILE" 2>&1 || true
+    # Restore network configuration
+    progress_run_step "Restore network config" "
+        if [ -n '$LAN_IFACE' ]; then
+            ip addr flush dev '$LAN_IFACE' 2>/dev/null || true
         fi
-
-        # NetworkManager Restore
         if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager; then
-             if [ -n "$LAN_IFACE" ]; then
-                 # We know the interface! Try to find the connection we modified.
-                 # Our setup script creates/uses "Wired connection $LAN_IFACE" or similar.
-                 # Let's try to find connection by device name.
-                 CON_NAME=$(nmcli -t -f NAME,DEVICE connection show | grep ":$LAN_IFACE$" | cut -d: -f1 | head -n1)
-                 
-                 if [ -n "$CON_NAME" ]; then
-                     echo "Resetting NetworkManager connection '$CON_NAME' to auto..." >> "$LOG_FILE"
-                     nmcli con modify "$CON_NAME" ipv4.method auto >> "$LOG_FILE" 2>&1
-                     # Re-apply
-                     nmcli con up "$CON_NAME" >> "$LOG_FILE" 2>&1
-                 else
-                     echo "  [WARNING] Could not find NetworkManager connection for interface $LAN_IFACE" >> "$LOG_FILE"
-                 fi
-             else
-                 echo "  [WARNING] LAN Interface unknown (no config file). Cannot automatically revert static IP." >> "$LOG_FILE"
-                 echo "  Please run 'nmcli con modify <conn_name> ipv4.method auto' manually." >> "$LOG_FILE"
-             fi
-             
+            if [ -n '$LAN_IFACE' ]; then
+                CON_NAME=\$(nmcli -t -f NAME,DEVICE connection show | grep ':$LAN_IFACE$' | cut -d: -f1 | head -n1)
+                if [ -n \"\$CON_NAME\" ]; then
+                    nmcli con modify \"\$CON_NAME\" ipv4.method auto 2>/dev/null || true
+                    nmcli con up \"\$CON_NAME\" 2>/dev/null || true
+                fi
+            fi
         elif [ -f /etc/dhcpcd.conf ]; then
             sed -i '/# VPN-GATEWAY-START/,/# VPN-GATEWAY-END/d' /etc/dhcpcd.conf
-            systemctl restart dhcpcd >> "$LOG_FILE" 2>&1
+            systemctl restart dhcpcd 2>/dev/null || true
         fi
-    } && echo -e " [${GREEN}DONE${NC}]" || echo -e " [${RED}FAIL${NC}]"
+        true
+    "
 
     # Restore backup configuration files
-    echo -ne "⏳ ${CYAN}Restoring backup configuration files...${NC} "
-    {
-        # Restore dnsmasq.conf backup
+    progress_run_step "Restore backup files" "
         if [ -f /etc/dnsmasq.conf.bak ]; then
-            echo "Restoring /etc/dnsmasq.conf from backup..." >> "$LOG_FILE"
-            mv /etc/dnsmasq.conf.bak /etc/dnsmasq.conf >> "$LOG_FILE" 2>&1 || true
+            mv /etc/dnsmasq.conf.bak /etc/dnsmasq.conf 2>/dev/null || true
         fi
-
-        # Remove hostapd configuration if wireless was used
-        if [ "${IS_WIRELESS:-false}" = "true" ]; then
-            echo "Removing hostapd configuration..." >> "$LOG_FILE"
-            rm -f /etc/hostapd/hostapd.conf >> "$LOG_FILE" 2>&1 || true
-            # Restore /etc/default/hostapd to default
+        if [ '${IS_WIRELESS:-false}' = 'true' ]; then
+            rm -f /etc/hostapd/hostapd.conf 2>/dev/null || true
             if [ -f /etc/default/hostapd ]; then
-                sed -i 's|DAEMON_CONF="/etc/hostapd/hostapd.conf"|#DAEMON_CONF=""|' /etc/default/hostapd >> "$LOG_FILE" 2>&1 || true
+                sed -i 's|DAEMON_CONF=\"/etc/hostapd/hostapd.conf\"|#DAEMON_CONF=\"\"|' /etc/default/hostapd 2>/dev/null || true
             fi
         fi
-
-        # Remove WireGuard configuration
         if [ -f /etc/wireguard/wg0.conf ]; then
-            echo "Removing /etc/wireguard/wg0.conf..." >> "$LOG_FILE"
-            rm -f /etc/wireguard/wg0.conf >> "$LOG_FILE" 2>&1 || true
+            rm -f /etc/wireguard/wg0.conf 2>/dev/null || true
         fi
-    } && echo -e " [${GREEN}DONE${NC}]" || echo -e " [${RED}FAIL${NC}]"
+        true
+    "
+    
+    # Final redraw
+    progress_draw_box
 
     echo ""
-    echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║               ✔ Restore Complete!                         ║"
-    echo "╚════════════════════════════════════════════════════════════╝"
+    echo -e "${GREEN}${BOLD}╔════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}${BOLD}║               ✔ Restore Complete!                         ║${NC}"
+    echo -e "${GREEN}${BOLD}╚════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "The Pi should now be back to its original state."
     echo -e "See ${YELLOW}$LOG_FILE${NC} for details."
