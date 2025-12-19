@@ -204,27 +204,29 @@ prompt_choice() {
     fi
 
     # Status box
-    local box_w=65
+    local box_w=76
+    local content_w=$((box_w - 2))  # Inside the │ borders
     local border
-    border=$(printf '─%.0s' $(seq 1 $((box_w - 2))))
+    border=$(printf '─%.0s' $(seq 1 $content_w))
     
     echo -e "${CYAN}╭${border}╮${NC}"
-    printf "${CYAN}│${NC} ${BOLD}%-$((box_w - 4))s${NC} ${CYAN}│${NC}\n" "Gateway Status"
+    printf "${CYAN}│${NC} ${BOLD}%-$((content_w - 2))s${NC} ${CYAN}│${NC}\n" "Gateway Status"
     echo -e "${CYAN}├${border}┤${NC}"
     if [ "$configured" = true ]; then
         # Truncate path if too long
         local config_display="$CONFIG_FILE"
-        if [ ${#config_display} -gt 45 ]; then
-            config_display="...${config_display: -42}"
+        local field_w=$((content_w - 18))  # Account for "   ● Config:    " prefix
+        if [ ${#config_display} -gt $field_w ]; then
+            config_display="...${config_display: -$((field_w - 3))}"
         fi
-        printf "${CYAN}│${NC}   ${GREEN}●${NC} Config:    ${DIM}%-44s${NC} ${CYAN}│${NC}\n" "$config_display"
+        printf "${CYAN}│${NC}   ${GREEN}●${NC} Config:    %-${field_w}s ${CYAN}│${NC}\n" "$config_display"
     else
-        printf "${CYAN}│${NC}   ${RED}○${NC} Config:    ${DIM}%-44s${NC} ${CYAN}│${NC}\n" "not found"
+        printf "${CYAN}│${NC}   ${RED}○${NC} Config:    %-$((content_w - 18))s ${CYAN}│${NC}\n" "not found"
     fi
     if [ "$active" = true ]; then
-        printf "${CYAN}│${NC}   ${GREEN}●${NC} WireGuard: ${GREEN}%-44s${NC} ${CYAN}│${NC}\n" "active (wg0)"
+        printf "${CYAN}│${NC}   ${GREEN}●${NC} WireGuard: ${GREEN}%-$((content_w - 18))s${NC} ${CYAN}│${NC}\n" "active (wg0)"
     else
-        printf "${CYAN}│${NC}   ${DIM}○${NC} WireGuard: ${DIM}%-44s${NC} ${CYAN}│${NC}\n" "inactive"
+        printf "${CYAN}│${NC}   ${DIM}○${NC} WireGuard: %-$((content_w - 18))s ${CYAN}│${NC}\n" "inactive"
     fi
     echo -e "${CYAN}╰${border}╯${NC}"
     echo ""
