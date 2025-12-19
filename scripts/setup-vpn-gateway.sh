@@ -36,35 +36,46 @@ has_full_config() {
 }
 
 show_existing_config() {
-    echo ""
-    echo -e "${CYAN}╭─────────────────────────────────────────────────────────────────╮${NC}"
-    echo -e "${CYAN}│${NC} ${BOLD}📄 Loaded Configuration${NC}                                        ${CYAN}│${NC}"
-    echo -e "${CYAN}│${NC}    ${DIM}$CONFIG_FILE${NC}"
-    echo -e "${CYAN}├─────────────────────────────────────────────────────────────────┤${NC}"
-    echo -e "${CYAN}│${NC}   WAN interface:   ${BOLD}${WAN_IFACE:-<unset>}${NC}"
-    echo -e "${CYAN}│${NC}   LAN interface:   ${BOLD}${LAN_IFACE:-<unset>}${NC}"
-    echo -e "${CYAN}│${NC}   LAN CIDR:        ${BOLD}${LAN_CIDR:-<unset>}${NC}"
-    echo -e "${CYAN}│${NC}   WireGuard:       ${DIM}${WG_CONF_PATH:-<unset>}${NC}"
-    if [ "${IS_WIRELESS:-false}" = "true" ]; then
-        echo -e "${CYAN}│${NC}   Wi-Fi SSID:      ${BOLD}${AP_SSID:-<unset>}${NC}"
+    local box_w=65
+    local inner_w=$((box_w - 4))
+    local border
+    border=$(printf '─%.0s' $(seq 1 $((box_w - 2))))
+    
+    # Truncate config path if too long
+    local config_display="$CONFIG_FILE"
+    if [ ${#config_display} -gt $((inner_w - 4)) ]; then
+        config_display="...${config_display: -$((inner_w - 7))}"
     fi
-    echo -e "${CYAN}├─────────────────────────────────────────────────────────────────┤${NC}"
+    
+    echo ""
+    echo -e "${CYAN}╭${border}╮${NC}"
+    printf "${CYAN}│${NC} ${BOLD}📄 %-${inner_w}s${NC}${CYAN}│${NC}\n" "Loaded Configuration"
+    printf "${CYAN}│${NC}    ${DIM}%-$((inner_w - 3))s${NC}${CYAN}│${NC}\n" "$config_display"
+    echo -e "${CYAN}├${border}┤${NC}"
+    printf "${CYAN}│${NC}   WAN interface:   ${BOLD}%-$((inner_w - 19))s${NC}${CYAN}│${NC}\n" "${WAN_IFACE:-<unset>}"
+    printf "${CYAN}│${NC}   LAN interface:   ${BOLD}%-$((inner_w - 19))s${NC}${CYAN}│${NC}\n" "${LAN_IFACE:-<unset>}"
+    printf "${CYAN}│${NC}   LAN CIDR:        ${BOLD}%-$((inner_w - 19))s${NC}${CYAN}│${NC}\n" "${LAN_CIDR:-<unset>}"
+    printf "${CYAN}│${NC}   WireGuard:       ${DIM}%-$((inner_w - 19))s${NC}${CYAN}│${NC}\n" "${WG_CONF_PATH:-<unset>}"
+    if [ "${IS_WIRELESS:-false}" = "true" ]; then
+        printf "${CYAN}│${NC}   Wi-Fi SSID:      ${BOLD}%-$((inner_w - 19))s${NC}${CYAN}│${NC}\n" "${AP_SSID:-<unset>}"
+    fi
+    echo -e "${CYAN}├${border}┤${NC}"
     if [ "${FIREWALL_ENABLED:-true}" = "true" ]; then
-        echo -e "${CYAN}│${NC}   ${GREEN}✔${NC} Firewall enabled"
+        printf "${CYAN}│${NC}   ${GREEN}✔${NC} %-$((inner_w - 5))s${CYAN}│${NC}\n" "Firewall enabled"
     else
-        echo -e "${CYAN}│${NC}   ${DIM}○${NC} Firewall disabled"
+        printf "${CYAN}│${NC}   ${DIM}○${NC} %-$((inner_w - 5))s${CYAN}│${NC}\n" "Firewall disabled"
     fi
     if [ "${AUTO_UPDATES_ENABLED:-false}" = "true" ]; then
-        echo -e "${CYAN}│${NC}   ${GREEN}✔${NC} Auto-updates enabled"
+        printf "${CYAN}│${NC}   ${GREEN}✔${NC} %-$((inner_w - 5))s${CYAN}│${NC}\n" "Auto-updates enabled"
     else
-        echo -e "${CYAN}│${NC}   ${DIM}○${NC} Auto-updates disabled"
+        printf "${CYAN}│${NC}   ${DIM}○${NC} %-$((inner_w - 5))s${CYAN}│${NC}\n" "Auto-updates disabled"
     fi
     if [ "${WATCHDOG_ENABLED:-false}" = "true" ]; then
-        echo -e "${CYAN}│${NC}   ${GREEN}✔${NC} Hardware watchdog enabled"
+        printf "${CYAN}│${NC}   ${GREEN}✔${NC} %-$((inner_w - 5))s${CYAN}│${NC}\n" "Hardware watchdog enabled"
     else
-        echo -e "${CYAN}│${NC}   ${DIM}○${NC} Hardware watchdog disabled"
+        printf "${CYAN}│${NC}   ${DIM}○${NC} %-$((inner_w - 5))s${CYAN}│${NC}\n" "Hardware watchdog disabled"
     fi
-    echo -e "${CYAN}╰─────────────────────────────────────────────────────────────────╯${NC}"
+    echo -e "${CYAN}╰${border}╯${NC}"
     echo ""
 }
 

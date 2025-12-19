@@ -204,20 +204,29 @@ prompt_choice() {
     fi
 
     # Status box
-    echo -e "${CYAN}╭─────────────────────────────────────────────────────────────────╮${NC}"
-    echo -e "${CYAN}│${NC} ${BOLD}Gateway Status${NC}                                                ${CYAN}│${NC}"
-    echo -e "${CYAN}├─────────────────────────────────────────────────────────────────┤${NC}"
+    local box_w=65
+    local border
+    border=$(printf '─%.0s' $(seq 1 $((box_w - 2))))
+    
+    echo -e "${CYAN}╭${border}╮${NC}"
+    printf "${CYAN}│${NC} ${BOLD}%-$((box_w - 4))s${NC} ${CYAN}│${NC}\n" "Gateway Status"
+    echo -e "${CYAN}├${border}┤${NC}"
     if [ "$configured" = true ]; then
-        echo -e "${CYAN}│${NC}   ${GREEN}●${NC} Config:    ${DIM}$CONFIG_FILE${NC}"
+        # Truncate path if too long
+        local config_display="$CONFIG_FILE"
+        if [ ${#config_display} -gt 45 ]; then
+            config_display="...${config_display: -42}"
+        fi
+        printf "${CYAN}│${NC}   ${GREEN}●${NC} Config:    ${DIM}%-44s${NC} ${CYAN}│${NC}\n" "$config_display"
     else
-        echo -e "${CYAN}│${NC}   ${RED}○${NC} Config:    ${DIM}not found${NC}"
+        printf "${CYAN}│${NC}   ${RED}○${NC} Config:    ${DIM}%-44s${NC} ${CYAN}│${NC}\n" "not found"
     fi
     if [ "$active" = true ]; then
-        echo -e "${CYAN}│${NC}   ${GREEN}●${NC} WireGuard: ${GREEN}active${NC} (wg0)"
+        printf "${CYAN}│${NC}   ${GREEN}●${NC} WireGuard: ${GREEN}%-44s${NC} ${CYAN}│${NC}\n" "active (wg0)"
     else
-        echo -e "${CYAN}│${NC}   ${DIM}○${NC} WireGuard: ${DIM}inactive${NC}"
+        printf "${CYAN}│${NC}   ${DIM}○${NC} WireGuard: ${DIM}%-44s${NC} ${CYAN}│${NC}\n" "inactive"
     fi
-    echo -e "${CYAN}╰─────────────────────────────────────────────────────────────────╯${NC}"
+    echo -e "${CYAN}╰${border}╯${NC}"
     echo ""
     
     # Menu
