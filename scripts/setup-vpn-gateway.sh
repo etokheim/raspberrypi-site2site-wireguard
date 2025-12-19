@@ -367,20 +367,24 @@ progress_find_step() {
 
 progress_draw_box() {
     local box_w=95
+    local inner_w=$((box_w - 2))  # Content width (minus borders)
     local border
     border=$(printf '═%.0s' $(seq 1 $box_w))
     
     # Move cursor up to redraw if we've drawn before
     if [ "$PROGRESS_BOX_LINES" -gt 0 ]; then
-        printf "\033[%dA" "$PROGRESS_BOX_LINES"
+        # Move up and clear each line
+        for ((j=0; j<PROGRESS_BOX_LINES; j++)); do
+            printf "\033[A\033[2K"
+        done
     fi
     
     local lines=0
     
     # Header
-    echo -e "${CYAN}╔${border}╗${NC}"
-    printf "${CYAN}║${NC} ${BOLD}${YELLOW}⚡ Setup Progress${NC}%*s${CYAN}║${NC}\n" $((box_w - 18)) ""
-    echo -e "${CYAN}╠${border}╣${NC}"
+    printf "${CYAN}╔%s╗${NC}\n" "$border"
+    printf "${CYAN}║${NC} ${BOLD}${YELLOW}⚡ Setup Progress${NC}%*s${CYAN}║${NC}\n" $((inner_w - 17)) ""
+    printf "${CYAN}╠%s╣${NC}\n" "$border"
     lines=$((lines + 3))
     
     # Steps
@@ -398,37 +402,28 @@ progress_draw_box() {
             skip)    icon="◌"; color="${DIM}" ;;
         esac
         
-        # Build the visible text (without ANSI codes for length calculation)
-        local visible_text
-        if [ -n "$extra" ]; then
-            visible_text="$icon $step $extra"
-        else
-            visible_text="$icon $step"
-        fi
+        # Calculate visible text length (icon=1 + space=1 + step + possible space + extra)
+        local base_text="$icon $step"
+        local base_len=${#base_text}
+        local extra_len=0
+        [ -n "$extra" ] && extra_len=$((${#extra} + 1))  # +1 for space before extra
+        local total_len=$((base_len + extra_len))
         
-        # Calculate padding (box_w - 2 for the spaces inside borders)
-        local content_width=$((box_w - 2))
-        local text_len=${#visible_text}
-        local padding=$((content_width - text_len))
+        # Calculate padding needed
+        local padding=$((inner_w - total_len))
         [ $padding -lt 0 ] && padding=0
         
-        # Truncate if too long
-        if [ $text_len -gt $content_width ]; then
-            visible_text="${visible_text:0:$((content_width - 3))}..."
-            padding=0
-        fi
-        
-        # Print with colors: icon+step in status color, extra in dim
+        # Print the line
         if [ -n "$extra" ]; then
-            echo -e "${CYAN}║${NC} ${color}${icon} ${step}${NC} ${DIM}${extra}${NC}$(printf '%*s' $padding '')${CYAN}║${NC}"
+            printf "${CYAN}║${NC} ${color}%s %s${NC} ${DIM}%s${NC}%*s${CYAN}║${NC}\n" "$icon" "$step" "$extra" "$padding" ""
         else
-            echo -e "${CYAN}║${NC} ${color}${visible_text}${NC}$(printf '%*s' $padding '')${CYAN}║${NC}"
+            printf "${CYAN}║${NC} ${color}%s %s${NC}%*s${CYAN}║${NC}\n" "$icon" "$step" "$padding" ""
         fi
         lines=$((lines + 1))
     done
     
     # Footer
-    echo -e "${CYAN}╚${border}╝${NC}"
+    printf "${CYAN}╚%s╝${NC}\n" "$border"
     lines=$((lines + 1))
     
     PROGRESS_BOX_LINES=$lines
@@ -450,11 +445,26 @@ progress_run_step() {
     progress_set_status "$idx" "running"
     progress_draw_box
     
-    # Run the command
-    {
-        echo "[$step_name] Executing: $cmd" >> "$LOG_FILE"
-        eval "$cmd" >> "$LOG_FILE" 2>&1
-    }
+    # Run the command in background
+    echo "[$step_name] Executing: $cmd" >> "$LOG_FILE"
+    eval "$cmd" >> "$LOG_FILE" 2>&1 &
+    local pid=$!
+    
+    # Animated spinner while waiting
+    local spin_frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local frame=0
+    
+    # Show spinner below the box
+    printf "   "
+    while kill -0 $pid 2>/dev/null; do
+        printf "\r   ${YELLOW}${spin_frames[$frame]}${NC} Running: ${DIM}%s${NC}   " "$step_name"
+        frame=$(( (frame + 1) % ${#spin_frames[@]} ))
+        sleep 0.1
+    done
+    # Clear the spinner line
+    printf "\r\033[K"
+    
+    wait $pid
     local exit_code=$?
     
     if [ $exit_code -eq 0 ]; then
@@ -1159,6 +1169,8 @@ main() {
         APPLYING_CHANGES=true
     fi
     
+    # Reset box line count - the prompt invalidated our cursor position
+    PROGRESS_BOX_LINES=0
     echo ""
     
     # --- Execute Steps ---
