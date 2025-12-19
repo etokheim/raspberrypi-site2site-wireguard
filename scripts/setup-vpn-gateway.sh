@@ -374,14 +374,9 @@ init_log() {
     echo "--- VPN Gateway Setup Log Started: $(date) ---" > "$LOG_FILE"
 }
 
-# Print Header
+# Print Header (banner already shown by gateway-manage-or-setup.sh wrapper)
 print_header() {
-    clear
-    echo -e "${BLUE}${BOLD}"
-    echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║           Raspberry Pi VPN Gateway Setup                   ║"
-    echo "╚════════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
+    echo ""
     echo -e "📄 Log file: ${YELLOW}$LOG_FILE${NC}"
     echo ""
 }
