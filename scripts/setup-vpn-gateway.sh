@@ -734,6 +734,20 @@ main() {
             IS_WIRELESS=true
         fi
         save_config_var "IS_WIRELESS" "${IS_WIRELESS:-false}"
+        
+        # Ensure hostapd is installed for wireless configs
+        if [ "$IS_WIRELESS" = "true" ] || [ "$IS_WIRELESS" = true ]; then
+            if ! is_pkg_installed hostapd; then
+                info "Wireless LAN requires hostapd (not installed)."
+                echo -ne "❓ ${YELLOW}Install hostapd for Access Point? [Y/n]${NC} "
+                read -r ap_install_choice
+                if [[ "$ap_install_choice" =~ ^[Nn]$ ]]; then
+                    error "Cannot proceed with wireless LAN without hostapd. Exiting."
+                    exit 1
+                fi
+                run_step "Installing hostapd" "apt-get install -y hostapd"
+            fi
+        fi
     else
         # Check for Wireless LAN Interface
         IS_WIRELESS=false
