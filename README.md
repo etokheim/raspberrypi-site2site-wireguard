@@ -1,9 +1,8 @@
 # Raspberry Pi Site-to-Site VPN Gateway (WireGuard)
+SEO-friendly terms: *Raspberry Pi site-to-site VPN*, *WireGuard gateway*, *home network extension*, *remote office Wi‑Fi to home network*, *plug-and-play VPN router*.
 
-_TLDR - Example use cases:_
-- _Lets a Raspberry Pi create a Wi-Fi network on which all connected clients think they are on your home network - even though they're off-site!_
-- _Create a safe and private Wi-Fi while traveling_
-- _Create an extension of your home network_
+## Pitch
+Set up a **Raspberry Pi WireGuard site-to-site VPN** in minutes. One Ethernet cable in, optional Pi Wi‑Fi out, and every device on that Wi‑Fi (or LAN) behaves as if it's on your **home network**—no router changes, no port forwarding, fully NAT-friendly. Perfect for remote offices, cabins, and temporary sites.
 
 ---
 
@@ -11,8 +10,6 @@ Build a **plug-and-play site-to-site VPN** with a single **Raspberry Pi** and **
 - A **WireGuard VPN client** that extends your home network to a remote site.
 - A **DHCP router + NAT** for a private subnet.
 - An optional **Wi‑Fi access point** so every device on that Wi‑Fi "pretends" to be on your home network—no router changes needed.
-
-SEO-friendly terms: *Raspberry Pi site-to-site VPN*, *WireGuard gateway*, *home network extension*, *remote office Wi‑Fi to home network*, *plug-and-play VPN router*.
 
 ## Why this is simple
 - Works behind **NAT/CGNAT** (outbound WireGuard only; no port forwarding required).
@@ -140,20 +137,20 @@ Cleanup will:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        Remote Site                               │
+│                        Remote Site                              │
 │  ┌──────────┐      ┌─────────────────────────────────────────┐  │
 │  │  Client  │──────│            Raspberry Pi                 │  │
-│  │ Devices  │ WiFi │  ┌───────┐    ┌─────┐    ┌──────────┐  │  │
-│  │10.10.10.x│ or   │  │dnsmasq│────│ NAT │────│WireGuard │  │  │
-│  └──────────┘ LAN  │  │ DHCP  │    │     │    │   wg0    │  │  │
-│                    │  └───────┘    └─────┘    └────┬─────┘  │  │
-│                    └───────────────────────────────┼────────┘  │
+│  │ Devices  │ WiFi │  ┌───────┐    ┌─────┐    ┌──────────┐   │  │
+│  │10.10.10.x│ or   │  │dnsmasq│────│ NAT │────│WireGuard │   │  │
+│  └──────────┘ LAN  │  │ DHCP  │    │     │    │   wg0    │   │  │
+│                    │  └───────┘    └─────┘    └────┬─────┘   │  │
+│                    └───────────────────────────────┼─────────┘  │
 │                                                    │            │
 └────────────────────────────────────────────────────┼────────────┘
                                                      │ UDP tunnel
                                                      ▼
 ┌────────────────────────────────────────────────────────────────┐
-│                         Home Network                            │
+│                         Home Network                           │
 │                    ┌──────────────────┐                        │
 │                    │ WireGuard Server │                        │
 │                    │   (your router)  │                        │
@@ -161,5 +158,3 @@ Cleanup will:
 └────────────────────────────────────────────────────────────────┘
 ```
 
-## One-line pitch
-Set up a **Raspberry Pi WireGuard site-to-site VPN** in minutes. One Ethernet cable in, optional Pi Wi‑Fi out, and every device on that Wi‑Fi (or LAN) behaves as if it's on your **home network**—no router changes, no port forwarding, fully NAT-friendly. Perfect for remote offices, cabins, and temporary sites.
