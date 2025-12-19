@@ -174,15 +174,6 @@ ensure_software_watchdog() {
     run_step "Configuring software watchdog (service restart policies)" "do_software_watchdog_setup"
 }
 
-disable_unused_services() {
-    local services=("avahi-daemon.service" "avahi-daemon.socket" "cups.service" "cups-browsed.service" "bluetooth.service")
-    for svc in "${services[@]}"; do
-        if systemctl list-unit-files | grep -q "^${svc}"; then
-            systemctl disable --now "$svc" >> "$LOG_FILE" 2>&1 || true
-        fi
-    done
-}
-
 ensure_wg_perms() {
     local path="$1"
     if [ ! -f "$path" ]; then
@@ -225,10 +216,16 @@ ensure_wg_perms() {
 }
 
 is_wg_active() {
-    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet wg-quick@wg0; then
+    # Check if the wg0 interface actually exists (most reliable)
+    if ip link show wg0 >/dev/null 2>&1; then
         return 0
     fi
-    ip link show wg0 >/dev/null 2>&1
+    # Fallback: check systemd service status
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl is-active --quiet wg-quick@wg0
+        return
+    fi
+    return 1
 }
 
 do_configure_wg_firewall_rules() {
@@ -237,8 +234,11 @@ do_configure_wg_firewall_rules() {
         return 1
     fi
     
-    local POST_UP="PostUp = iptables -A FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT; iptables -A FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE; iptables -t nat -A POSTROUTING -o $WAN_IFACE -j MASQUERADE"
-    local POST_DOWN="PostDown = iptables -D FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT; iptables -D FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -D POSTROUTING -o wg0 -j MASQUERADE; iptables -t nat -D POSTROUTING -o $WAN_IFACE -j MASQUERADE"
+    # Use check-before-add (-C || -A) pattern to prevent duplicate rules
+    # This is important because netfilter-persistent may restore saved rules on boot,
+    # and we don't want PostUp to add duplicates
+    local POST_UP="PostUp = iptables -C FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT; iptables -C FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -C POSTROUTING -o wg0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE; iptables -t nat -C POSTROUTING -o $WAN_IFACE -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o $WAN_IFACE -j MASQUERADE"
+    local POST_DOWN="PostDown = iptables -D FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; iptables -t nat -D POSTROUTING -o wg0 -j MASQUERADE 2>/dev/null || true; iptables -t nat -D POSTROUTING -o $WAN_IFACE -j MASQUERADE 2>/dev/null || true"
     
     # Remove existing PostUp/PostDown rules to prevent duplication if re-running
     sed -i '/^PostUp =/d' "$WG_CONF_DEST"
@@ -692,9 +692,19 @@ ensure_wan_firewall_rules() {
     echo "[wan_firewall] Applying hardened INPUT rules for WAN=$WAN_IFACE" >> "$LOG_FILE"
     local ssh_port="${SSH_PORT:-22}"
 
+    # Allow loopback (critical for local services)
+    if ! iptables -C INPUT -i lo -j ACCEPT >/dev/null 2>&1; then
+        iptables -A INPUT -i lo -j ACCEPT >> "$LOG_FILE" 2>&1
+    fi
+
     # Allow LAN management traffic
     if ! iptables -C INPUT -i "$LAN_IFACE" -j ACCEPT >/dev/null 2>&1; then
         iptables -A INPUT -i "$LAN_IFACE" -j ACCEPT >> "$LOG_FILE" 2>&1
+    fi
+
+    # Allow traffic from WireGuard tunnel
+    if ! iptables -C INPUT -i wg0 -j ACCEPT >/dev/null 2>&1; then
+        iptables -A INPUT -i wg0 -j ACCEPT >> "$LOG_FILE" 2>&1
     fi
 
     # Allow established/related on WAN
@@ -1250,7 +1260,28 @@ main() {
         ip addr flush dev '$LAN_IFACE' 2>/dev/null || true
         if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager; then
             if [ '$IS_WIRELESS' = true ]; then
-                ip addr add '$LAN_GATEWAY/24' dev '$LAN_IFACE'
+                # For wireless AP mode, we create a persistent systemd service
+                # since NetworkManager shouldn't manage the AP interface
+                cat > /etc/systemd/system/vpn-gateway-lan.service <<SYSTEMD_EOF
+[Unit]
+Description=VPN Gateway LAN Interface Setup
+Before=dnsmasq.service hostapd.service
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/usr/sbin/rfkill unblock wlan
+ExecStart=/bin/bash -c 'ip addr show dev $LAN_IFACE | grep -q $LAN_GATEWAY || ip addr add $LAN_GATEWAY/24 dev $LAN_IFACE'
+ExecStart=/bin/ip link set $LAN_IFACE up
+
+[Install]
+WantedBy=multi-user.target
+SYSTEMD_EOF
+                systemctl daemon-reload
+                systemctl enable vpn-gateway-lan.service
+                # Also set the IP now for immediate use
+                ip addr add '$LAN_GATEWAY/24' dev '$LAN_IFACE' 2>/dev/null || true
                 ip link set '$LAN_IFACE' up
             else
                 CON_NAME=\$(nmcli -t -f NAME,DEVICE connection show | grep ':$LAN_IFACE$' | cut -d: -f1 | head -n1)

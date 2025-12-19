@@ -214,6 +214,15 @@ remove_software_watchdog() {
     systemctl daemon-reload >> "$LOG_FILE" 2>&1 || true
 }
 
+remove_lan_service() {
+    # Remove the systemd service that sets static IP on wireless LAN interface
+    if [ -f /etc/systemd/system/vpn-gateway-lan.service ]; then
+        systemctl disable --now vpn-gateway-lan.service >> "$LOG_FILE" 2>&1 || true
+        rm -f /etc/systemd/system/vpn-gateway-lan.service >> "$LOG_FILE" 2>&1 || true
+        systemctl daemon-reload >> "$LOG_FILE" 2>&1 || true
+    fi
+}
+
 remove_hardware_watchdog() {
     # Stop and disable hardware watchdog service
     systemctl disable --now watchdog 2>/dev/null >> "$LOG_FILE" 2>&1 || true
@@ -262,8 +271,16 @@ cleanup_wan_firewall_rules() {
     local ssh_port="${SSH_PORT:-22}"
     local wg_port="${WG_LISTEN_PORT:-}"
 
+    # Remove loopback rule (added by setup)
+    if iptables -C INPUT -i lo -j ACCEPT >/dev/null 2>&1; then
+        iptables -D INPUT -i lo -j ACCEPT >> "$LOG_FILE" 2>&1 || true
+    fi
     if [ -n "$lan_iface" ] && iptables -C INPUT -i "$lan_iface" -j ACCEPT >/dev/null 2>&1; then
         iptables -D INPUT -i "$lan_iface" -j ACCEPT >> "$LOG_FILE" 2>&1 || true
+    fi
+    # Remove wg0 INPUT rule
+    if iptables -C INPUT -i wg0 -j ACCEPT >/dev/null 2>&1; then
+        iptables -D INPUT -i wg0 -j ACCEPT >> "$LOG_FILE" 2>&1 || true
     fi
     if [ -n "$wan_iface" ]; then
         if iptables -C INPUT -i "$wan_iface" -m state --state RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1; then
@@ -340,6 +357,7 @@ main() {
     fi
     
     progress_add_step "Remove NAT/forward rules"
+    progress_add_step "Remove LAN service" "(wireless IP persistence)"
     progress_add_step "Disable IP forwarding"
     
     if [ "${AUTO_UPDATES_ENABLED:-false}" = "true" ]; then
@@ -397,6 +415,8 @@ main() {
     fi
 
     progress_run_step "Remove NAT/forward rules" "cleanup_gateway_nat_rules"
+
+    progress_run_step "Remove LAN service" "remove_lan_service"
 
     progress_run_step "Disable IP forwarding" "rm -f /etc/sysctl.d/99-vpn-gateway.conf && sysctl --system >/dev/null 2>&1"
 

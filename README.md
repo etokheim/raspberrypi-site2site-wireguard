@@ -1,8 +1,8 @@
 # Raspberry Pi Site-to-Site VPN Gateway (WireGuard)
 
 _TLDR - Example use cases:_
-- _Let's a Raspberry Pi create a WIFI network on which all connected clients think they are on your home network - even though they are off-site!_
-- _Create a safe and private WIFI while traveling_
+- _Lets a Raspberry Pi create a Wi-Fi network on which all connected clients think they are on your home network - even though they're off-site!_
+- _Create a safe and private Wi-Fi while traveling_
 - _Create an extension of your home network_
 
 ---
@@ -10,14 +10,15 @@ _TLDR - Example use cases:_
 Build a **plug-and-play site-to-site VPN** with a single **Raspberry Pi** and **one Ethernet cable**. The script turns the Pi into:
 - A **WireGuard VPN client** that extends your home network to a remote site.
 - A **DHCP router + NAT** for a private subnet.
-- An optional **Wi‑Fi access point** so every device on that Wi‑Fi “pretends” to be on your home network - no router changes needed.
+- An optional **Wi‑Fi access point** so every device on that Wi‑Fi "pretends" to be on your home network—no router changes needed.
 
 SEO-friendly terms: *Raspberry Pi site-to-site VPN*, *WireGuard gateway*, *home network extension*, *remote office Wi‑Fi to home network*, *plug-and-play VPN router*.
 
 ## Why this is simple
-- Works behind **NAT/CGNAT** (outbound WireGuard only; no port forwarding).
+- Works behind **NAT/CGNAT** (outbound WireGuard only; no port forwarding required).
 - Zero router config at the remote site—plug in WAN Ethernet, run one script.
 - If you enable Wi‑Fi, the Pi broadcasts an SSID that tunnels straight to home.
+- **Survives reboots**: all services and configurations persist automatically.
 
 ## Hardware
 - Raspberry Pi 4 (or similar Pi; Wi‑Fi-capable if you want an AP)
@@ -25,40 +26,63 @@ SEO-friendly terms: *Raspberry Pi site-to-site VPN*, *WireGuard gateway*, *home 
 - Optional: USB Ethernet adapter if you prefer wired LAN plus Wi‑Fi WAN/LAN
 
 ## Software / Files
-- Raspberry Pi OS Lite
+- Raspberry Pi OS Lite (Bookworm or later recommended)
 - WireGuard peer config from your home network (e.g., `wg0.conf`/peer file)
 
 ## Quick start (about 5 minutes)
-1) Prep the Pi  
-   - Flash Raspberry Pi OS Lite, enable SSH, boot, then:  
-     `sudo apt-get update && sudo apt-get upgrade -y`
-2) Get the project  
+1. **Prep the Pi**
+   - Flash Raspberry Pi OS Lite, enable SSH, boot, then:
+     ```bash
+     sudo apt-get update && sudo apt-get upgrade -y
+     ```
+2. **Get the project**
    ```bash
    git clone https://github.com/etokheim/raspberrypi-site2site-wireguard.git
    cd raspberrypi-site2site-wireguard
    ```
-3) Copy your WireGuard peer config to the Pi (e.g., `/home/pi/wg-peer.conf`).
-4) Run the entrypoint (prompts for everything)  
+3. **Copy your WireGuard peer config** to the Pi (e.g., `/home/pi/wg-peer.conf`).
+4. **Run the entrypoint** (prompts for everything)
    ```bash
    sudo ./gateway-manage-or-setup.sh
    ```
-   - Select WAN and LAN (Enter accepts defaults).  
-   - If LAN is Wi‑Fi (e.g., `wlan0`), enter SSID/password; hostapd is auto-configured.  
-   - Provide the WireGuard config path (tab completion enabled).  
-   - Opt into WAN firewall hardening (allow SSH + WireGuard, drop other inbound).  
-   - Opt into automatic updates (all packages nightly at 03:00, logs only; max 20 update logs kept).  
-   - Review the framed “Planned changes” summary, then confirm to apply.
-5) Connect devices  
-   - Wired: plug a switch/AP into the Pi’s LAN.  
+   - Select WAN and LAN interfaces (Enter accepts defaults).
+   - If LAN is Wi‑Fi (e.g., `wlan0`), enter SSID/password; hostapd is auto-configured.
+   - Provide the WireGuard config path (tab completion enabled).
+   - Opt into WAN firewall hardening (allow SSH + WireGuard, drop other inbound).
+   - Opt into automatic security updates (nightly at 03:00).
+   - Opt into hardware watchdog (auto-reboot on system hang).
+   - Review the progress box, then confirm to apply.
+5. **Connect devices**
+   - Wired: plug a switch/AP into the Pi's LAN port.
    - Wi‑Fi: connect to the SSID you set. Clients get `10.10.10.x` and route through WireGuard to your home network.
+
+## Command-line options
+
+```bash
+sudo ./gateway-manage-or-setup.sh [OPTIONS]
+```
+
+| Option | Description |
+|--------|-------------|
+| *(none)* | Interactive menu (setup/cleanup/start/stop) |
+| `--setup` | Run setup wizard |
+| `--cleanup` | Remove gateway configuration |
+| `--start` | Start gateway services (WireGuard + dnsmasq + hostapd) |
+| `--stop` | Stop gateway services |
+| `--yes` | Non-interactive mode (use existing config, no prompts) |
+| `--help` | Show usage |
 
 ## What the script sets up
 - **WireGuard** at `/etc/wireguard/wg0.conf`, `wg-quick@wg0` enabled, PostUp/PostDown iptables rules.
 - **Routing/NAT**: iptables forwarding and MASQUERADE from LAN → `wg0` (WAN MASQUERADE as secondary).
-- **DHCP/DNS**: dnsmasq on the LAN/AP subnet; DNS served by the Pi.
+- **DHCP/DNS**: dnsmasq on the LAN/AP subnet; DNS forwarded via WireGuard tunnel.
 - **Static IP**: gateway `10.10.10.1/24` on the LAN/AP interface.
 - **Access Point (optional)**: hostapd with your SSID/password when LAN is wireless.
-- **Resilience**: enforces NAT rules after bring-up in case PostUp is skipped.
+- **Firewall (optional)**: hardened INPUT rules on WAN (allows SSH, WireGuard; drops other inbound).
+- **Service watchdog**: systemd restart policies for dnsmasq, WireGuard, hostapd (auto-restart on crash).
+- **Hardware watchdog (optional)**: kernel-level auto-reboot if system hangs.
+- **Auto-updates (optional)**: unattended-upgrades for security patches.
+- **Persistence**: all settings survive reboots (systemd services, static IPs, iptables).
 
 ## Default network plan (changeable at prompts)
 - Subnet: `10.10.10.0/24`
@@ -80,26 +104,62 @@ nslookup google.com 10.10.10.1  # DNS via dnsmasq
 ```
 
 ## Logs and artifacts
-- Setup log: `logs/vpn_setup.log`
-- Cleanup log: `logs/vpn_cleanup.log`
-- Update logs (if auto-updates enabled): `logs/Update log YYYY-MM-DD.log` (max 20 kept)
-- Config file: `vpn-gateway.conf` (git-ignored)
+| File | Description |
+|------|-------------|
+| `logs/vpn_setup.log` | Setup script log |
+| `logs/vpn_cleanup.log` | Cleanup script log |
+| `vpn-gateway.conf` | Saved configuration (git-ignored) |
 
 ## Cleanup / revert
-- Via entrypoint: `sudo ./gateway-manage-or-setup.sh --cleanup`
-- Direct script: `sudo ./scripts/cleanup-gateway.sh`
+```bash
+sudo ./gateway-manage-or-setup.sh --cleanup
+# or directly:
+sudo ./scripts/cleanup-gateway.sh
+```
 
-Cleanup shows a planned-changes summary and will:
+Cleanup will:
 - Stop/disable WireGuard, dnsmasq, hostapd (if running)
-- Remove WAN firewall rules (if they were enabled)
-- Flush firewall/NAT rules; reset IP forwarding
+- Remove WAN firewall rules (if enabled)
+- Remove NAT/forward iptables rules; disable IP forwarding
 - Restore NetworkManager/dhcpcd to DHCP
-- Remove unattended-upgrades config/timers if auto updates were enabled
+- Remove watchdog configurations
+- Remove unattended-upgrades config (if auto-updates were enabled)
+- Optionally delete the saved config file
 
 ## Troubleshooting
-- **wg-quick DNS errors**: ensure `resolvconf` is installed (handled by the script) and the endpoint hostname resolves.  
-- **Clients get DHCP but no internet**: check `iptables -t nat -S | grep MASQUERADE` and `iptables -S FORWARD | egrep 'wlan0|wg0'`. The script enforces these rules, but verify after reboots.  
-- **Using a wired AP instead of Pi Wi‑Fi**: choose the Pi’s Wi‑Fi as WAN and plug your wired AP/switch into the Pi’s Ethernet as LAN.
+
+| Symptom | Solution |
+|---------|----------|
+| **wg-quick DNS errors** | Ensure `resolvconf` is installed (handled by setup) and the endpoint hostname resolves. |
+| **Clients get DHCP but no internet** | Check `iptables -t nat -S \| grep MASQUERADE` and `iptables -S FORWARD`. Verify WireGuard handshake with `wg show`. |
+| **Gateway not working after reboot** | Run `sudo ./gateway-manage-or-setup.sh --start` or check `systemctl status wg-quick@wg0 dnsmasq hostapd`. |
+| **Wi-Fi AP not visible** | Check `rfkill list` for blocked wlan. Run `sudo rfkill unblock wlan`. |
+| **Using a wired AP instead of Pi Wi‑Fi** | Choose the Pi's Wi‑Fi as WAN and plug your wired AP/switch into the Pi's Ethernet as LAN. |
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Remote Site                               │
+│  ┌──────────┐      ┌─────────────────────────────────────────┐  │
+│  │  Client  │──────│            Raspberry Pi                 │  │
+│  │ Devices  │ WiFi │  ┌───────┐    ┌─────┐    ┌──────────┐  │  │
+│  │10.10.10.x│ or   │  │dnsmasq│────│ NAT │────│WireGuard │  │  │
+│  └──────────┘ LAN  │  │ DHCP  │    │     │    │   wg0    │  │  │
+│                    │  └───────┘    └─────┘    └────┬─────┘  │  │
+│                    └───────────────────────────────┼────────┘  │
+│                                                    │            │
+└────────────────────────────────────────────────────┼────────────┘
+                                                     │ UDP tunnel
+                                                     ▼
+┌────────────────────────────────────────────────────────────────┐
+│                         Home Network                            │
+│                    ┌──────────────────┐                        │
+│                    │ WireGuard Server │                        │
+│                    │   (your router)  │                        │
+│                    └──────────────────┘                        │
+└────────────────────────────────────────────────────────────────┘
+```
 
 ## One-line pitch
-Set up a **Raspberry Pi WireGuard site-to-site VPN** in minutes. One Ethernet cable in, optional Pi Wi‑Fi out, and every device on that Wi‑Fi (or LAN) behaves as if it’s on your **home network**—no router changes, no port forwarding, fully NAT-friendly. Perfect for remote offices, cabins, and temporary sites.
+Set up a **Raspberry Pi WireGuard site-to-site VPN** in minutes. One Ethernet cable in, optional Pi Wi‑Fi out, and every device on that Wi‑Fi (or LAN) behaves as if it's on your **home network**—no router changes, no port forwarding, fully NAT-friendly. Perfect for remote offices, cabins, and temporary sites.

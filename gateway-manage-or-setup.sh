@@ -65,17 +65,18 @@ ensure_config_migrated() {
 }
 
 is_wg_active() {
+    # Check if the wg0 interface actually exists and is up (most reliable)
+    if ip link show wg0 >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # Fallback: check systemd service status
     if command -v systemctl >/dev/null 2>&1; then
         systemctl is-active --quiet wg-quick@wg0
         return
     fi
 
-    if command -v wg >/dev/null 2>&1; then
-        wg show wg0 >/dev/null 2>&1
-        return
-    fi
-
-    ip link show wg0 >/dev/null 2>&1
+    return 1
 }
 
 is_config_present() {
@@ -104,6 +105,17 @@ run_start() {
         echo "No gateway config found at $CONFIG_FILE. Launching setup..."
         run_setup
         return
+    fi
+
+    # Ensure LAN interface has its static IP (may not be set if systemd service didn't run)
+    if [ -n "${LAN_IFACE:-}" ] && [ -n "${LAN_CIDR:-}" ]; then
+        local lan_gw
+        lan_gw=$(echo "$LAN_CIDR" | sed 's/\.0\/24$/.1/')
+        if ! ip addr show dev "$LAN_IFACE" 2>/dev/null | grep -q "$lan_gw"; then
+            echo "Setting LAN IP ($lan_gw) on $LAN_IFACE..."
+            ip addr add "$lan_gw/24" dev "$LAN_IFACE" 2>/dev/null || true
+            ip link set "$LAN_IFACE" up
+        fi
     fi
 
     # Bring up AP/DHCP if configured for wireless
