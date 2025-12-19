@@ -326,8 +326,155 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
 BOLD='\033[1m'
+DIM='\033[2m'
 NC='\033[0m' # No Color
+
+# --- Progress Box System ---
+# Step statuses: pending, running, done, fail, skip
+declare -a PROGRESS_STEPS=()
+declare -a PROGRESS_STATUS=()
+declare -a PROGRESS_EXTRA=()
+PROGRESS_BOX_LINES=0
+
+progress_add_step() {
+    local name="$1"
+    local extra="${2:-}"
+    PROGRESS_STEPS+=("$name")
+    PROGRESS_STATUS+=("pending")
+    PROGRESS_EXTRA+=("$extra")
+}
+
+progress_set_status() {
+    local index="$1"
+    local status="$2"
+    local extra="${3:-}"
+    PROGRESS_STATUS[$index]="$status"
+    [ -n "$extra" ] && PROGRESS_EXTRA[$index]="$extra"
+}
+
+progress_find_step() {
+    local name="$1"
+    for i in "${!PROGRESS_STEPS[@]}"; do
+        if [[ "${PROGRESS_STEPS[$i]}" == "$name" ]]; then
+            echo "$i"
+            return
+        fi
+    done
+    echo "-1"
+}
+
+progress_draw_box() {
+    local box_w=95
+    local border
+    border=$(printf '═%.0s' $(seq 1 $box_w))
+    
+    # Move cursor up to redraw if we've drawn before
+    if [ "$PROGRESS_BOX_LINES" -gt 0 ]; then
+        printf "\033[%dA" "$PROGRESS_BOX_LINES"
+    fi
+    
+    local lines=0
+    
+    # Header
+    printf "${CYAN}╔%s╗${NC}\n" "$border"
+    printf "${CYAN}║${NC} ${BOLD}${YELLOW}⚡ Setup Progress${NC}%-*s${CYAN}║${NC}\n" $((box_w - 18)) ""
+    printf "${CYAN}╠%s╣${NC}\n" "$border"
+    lines=$((lines + 3))
+    
+    # Steps
+    for i in "${!PROGRESS_STEPS[@]}"; do
+        local step="${PROGRESS_STEPS[$i]}"
+        local status="${PROGRESS_STATUS[$i]}"
+        local extra="${PROGRESS_EXTRA[$i]}"
+        local icon color line
+        
+        case "$status" in
+            pending) icon="○"; color="${DIM}" ;;
+            running) icon="◐"; color="${YELLOW}" ;;
+            done)    icon="✔"; color="${GREEN}" ;;
+            fail)    icon="✖"; color="${RED}" ;;
+            skip)    icon="◌"; color="${DIM}" ;;
+        esac
+        
+        # Build the line content
+        if [ -n "$extra" ]; then
+            line=$(printf "%s %s %s" "$icon" "$step" "$extra")
+        else
+            line=$(printf "%s %s" "$icon" "$step")
+        fi
+        
+        # Truncate if too long
+        if [ ${#line} -gt $((box_w - 2)) ]; then
+            line="${line:0:$((box_w - 5))}..."
+        fi
+        
+        printf "${CYAN}║${NC} ${color}%-*s${NC}${CYAN}║${NC}\n" "$((box_w - 2))" "$line"
+        lines=$((lines + 1))
+    done
+    
+    # Footer
+    printf "${CYAN}╚%s╝${NC}\n" "$border"
+    lines=$((lines + 1))
+    
+    PROGRESS_BOX_LINES=$lines
+}
+
+progress_run_step() {
+    local step_name="$1"
+    shift
+    local cmd="$@"
+    
+    local idx
+    idx=$(progress_find_step "$step_name")
+    if [ "$idx" = "-1" ]; then
+        # Step not in list, just run it
+        eval "$cmd" >> "$LOG_FILE" 2>&1
+        return $?
+    fi
+    
+    progress_set_status "$idx" "running"
+    progress_draw_box
+    
+    # Run the command
+    {
+        echo "[$step_name] Executing: $cmd" >> "$LOG_FILE"
+        eval "$cmd" >> "$LOG_FILE" 2>&1
+    }
+    local exit_code=$?
+    
+    if [ $exit_code -eq 0 ]; then
+        progress_set_status "$idx" "done"
+    else
+        progress_set_status "$idx" "fail"
+    fi
+    progress_draw_box
+    
+    return $exit_code
+}
+
+progress_skip_step() {
+    local step_name="$1"
+    local idx
+    idx=$(progress_find_step "$step_name")
+    [ "$idx" != "-1" ] && progress_set_status "$idx" "skip"
+}
+
+progress_done_step() {
+    local step_name="$1"
+    local extra="${2:-}"
+    local idx
+    idx=$(progress_find_step "$step_name")
+    [ "$idx" != "-1" ] && progress_set_status "$idx" "done" "$extra"
+}
+
+progress_clear() {
+    PROGRESS_STEPS=()
+    PROGRESS_STATUS=()
+    PROGRESS_EXTRA=()
+    PROGRESS_BOX_LINES=0
+}
 
 # --- UI Functions ---
 
@@ -929,58 +1076,54 @@ main() {
     fi
 
     echo ""
-    # Framed summary (fixed width)
-    # Keep border the same as before, but give content one extra column
-    local box_w=95
-    local border_inner=95 # fixed to retain outer width while widening content
-    local border_line
-    border_line=$(printf '═%.0s' $(seq 1 $border_inner))
-
-    printf "╔%s╗\n" "$border_line"
-    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "📝 Planned changes"
-    printf "╠%s╣\n" "$border_line"
+    
+    # --- Build Progress Steps ---
+    progress_clear
+    
     # Build package list for display (include hostapd if needed)
     local display_pkgs="$MISSING_PKGS"
     if [ "${INSTALL_HOSTAPD:-}" = "true" ]; then
         display_pkgs="$display_pkgs hostapd"
+        MISSING_PKGS="$MISSING_PKGS hostapd"
+        INSTALL_DEPENDENCIES="true"
     fi
-    if [ "$INSTALL_DEPENDENCIES" = "true" ] || [ "${INSTALL_HOSTAPD:-}" = "true" ]; then
-        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Install packages:$display_pkgs"
-    else
-        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• System packages: already installed"
+    
+    # Add steps based on configuration
+    if [ "$INSTALL_DEPENDENCIES" = "true" ] && [ -n "$display_pkgs" ]; then
+        progress_add_step "Install packages" "${DIM}($display_pkgs )${NC}"
     fi
-    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Configure WAN: $WAN_IFACE"
-    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Configure LAN: $LAN_IFACE (static $LAN_GATEWAY / $LAN_CIDR)"
-    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• WireGuard config: $WG_CONF_SRC -> $WG_CONF_DEST"
-    if [ -n "${WG_LISTEN_PORT:-}" ]; then
-        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• WireGuard listen UDP port: $WG_LISTEN_PORT (allowed on WAN)"
-    else
-        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• WireGuard listen UDP port: (not detected in config)"
+    
+    progress_add_step "Install WireGuard config" "${DIM}→ $WG_CONF_DEST${NC}"
+    progress_add_step "Enable IP forwarding"
+    progress_add_step "Configure LAN interface" "${DIM}$LAN_IFACE = $LAN_GATEWAY${NC}"
+    progress_add_step "Configure DHCP server" "${DIM}dnsmasq${NC}"
+    
+    if [ "$IS_WIRELESS" = true ]; then
+        progress_add_step "Configure Access Point" "${DIM}hostapd: $AP_SSID${NC}"
     fi
-    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• SSH port allowed on WAN: ${SSH_PORT:-22}"
-    if [ "$FIREWALL_ENABLED" = "true" ]; then
-        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• WAN firewall: ENABLED (allow SSH + WireGuard; drop other inbound; allow LAN management)"
-    else
-        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• WAN firewall: DISABLED (WAN INPUT left unchanged beyond base rules)"
-    fi
+    
+    progress_add_step "Configure firewall & NAT"
+    progress_add_step "Start WireGuard VPN"
+    
     if [ "$AUTO_UPDATES_ENABLED" = "true" ]; then
-        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Auto updates: ENABLED (all packages nightly at 03:00)"
-    else
-        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Auto updates: DISABLED"
+        progress_add_step "Enable auto-updates" "${DIM}nightly @ 03:00${NC}"
     fi
-    printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Software watchdog: ENABLED (systemd auto-restart for services)"
+    
+    progress_add_step "Configure service watchdog"
+    
     if [ "$WATCHDOG_ENABLED" = "true" ]; then
-        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Hardware watchdog: ENABLED (kernel-level reboot on system hang)"
-    else
-        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Hardware watchdog: DISABLED"
+        progress_add_step "Enable hardware watchdog"
     fi
-    printf "╚%s╝\n" "$border_line"
+    
+    # Draw initial progress box
+    progress_draw_box
+    
     echo ""
     if [ "$NONINTERACTIVE" = "true" ] && [ "$USE_EXISTING_CONFIG" = true ]; then
         info "Non-interactive mode: applying changes without confirmation."
         APPLYING_CHANGES=true
     else
-        echo -ne "Proceed with applying these changes? [Y/n]: "
+        echo -ne "${BOLD}Proceed with setup? [Y/n]:${NC} "
         read -r proceed_choice
         if [[ "$proceed_choice" =~ ^[Nn]$ ]]; then
             warn "Aborting setup by user request."
@@ -988,106 +1131,77 @@ main() {
         fi
         APPLYING_CHANGES=true
     fi
-
-    # Install system dependencies if needed (user already confirmed at start)
-    # Add hostapd to package list if wireless AP is needed
-    if [ "${INSTALL_HOSTAPD:-}" = "true" ]; then
-        MISSING_PKGS="$MISSING_PKGS hostapd"
-        INSTALL_DEPENDENCIES="true"
+    
+    echo ""
+    
+    # --- Execute Steps ---
+    
+    # Install dependencies
+    if [ "$INSTALL_DEPENDENCIES" = "true" ] && [ -n "$MISSING_PKGS" ]; then
+        progress_run_step "Install packages" "
+            apt-get update && \
+            echo 'iptables-persistent iptables-persistent/autosave_v4 boolean true' | debconf-set-selections 2>/dev/null || true && \
+            echo 'iptables-persistent iptables-persistent/autosave_v6 boolean true' | debconf-set-selections 2>/dev/null || true && \
+            echo 'watchdog watchdog/run boolean true' | debconf-set-selections 2>/dev/null || true && \
+            echo 'watchdog watchdog/module string bcm2835_wdt' | debconf-set-selections 2>/dev/null || true && \
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::='--force-confold' $MISSING_PKGS
+        "
     fi
     
-    if [ "$INSTALL_DEPENDENCIES" = "true" ] && [ -n "$MISSING_PKGS" ]; then
-        run_step "Updating package list" "apt-get update"
-        # Preseed iptables-persistent to avoid interactive prompts
-        echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections 2>/dev/null || true
-        echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections 2>/dev/null || true
-        # Also preseed watchdog to avoid prompt loop if it's upgraded/reconfigured
-        echo "watchdog watchdog/run boolean true" | debconf-set-selections 2>/dev/null || true
-        echo "watchdog watchdog/module string bcm2835_wdt" | debconf-set-selections 2>/dev/null || true
-        
-        # Use non-interactive frontend for apt operations
-        export DEBIAN_FRONTEND=noninteractive
-        run_step "Installing missing packages" "apt-get install -y $MISSING_PKGS"
-    fi
-
-    echo ""
-    run_step "Installing WireGuard config" "cp \"$WG_CONF_SRC\" \"$WG_CONF_DEST\" && chmod 600 \"$WG_CONF_DEST\""
-
-    run_step "Enabling IP Forwarding" "echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-vpn-gateway.conf && sysctl -p /etc/sysctl.d/99-vpn-gateway.conf"
-
-    # Configure static IP for LAN interface
-    echo -ne "⏳ ${CYAN}Configuring Network Interfaces (Static IP)...${NC} "
-    {
-        echo "[Configuring Network Interfaces]" >> "$LOG_FILE"
-        if [ -n "$PREV_LAN_CIDR" ] && [ "$PREV_LAN_CIDR" != "$LAN_CIDR" ]; then
-            echo "[Reconfig] LAN CIDR change: $PREV_LAN_CIDR -> $LAN_CIDR" >> "$LOG_FILE"
-        fi
-        ip addr flush dev "$LAN_IFACE" >> "$LOG_FILE" 2>&1 || true
-        
-        # Detect Network Manager
+    # Install WireGuard config
+    progress_run_step "Install WireGuard config" "cp \"$WG_CONF_SRC\" \"$WG_CONF_DEST\" && chmod 600 \"$WG_CONF_DEST\""
+    
+    # Enable IP forwarding
+    progress_run_step "Enable IP forwarding" "echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-vpn-gateway.conf && sysctl -p /etc/sysctl.d/99-vpn-gateway.conf"
+    
+    # Configure LAN interface
+    progress_run_step "Configure LAN interface" "
+        ip addr flush dev '$LAN_IFACE' 2>/dev/null || true
         if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager; then
-            echo "Detected NetworkManager." >> "$LOG_FILE"
-
-            if [ "$IS_WIRELESS" = true ]; then
-                # Avoid NM connection type mismatches on wlan when hostapd will manage it.
-                echo "Wireless LAN: assigning static IP directly (bypassing nmcli connection profiles)." >> "$LOG_FILE"
-                ip addr add "$LAN_GATEWAY/24" dev "$LAN_IFACE" >> "$LOG_FILE" 2>&1
-                ip link set "$LAN_IFACE" up >> "$LOG_FILE" 2>&1
+            if [ '$IS_WIRELESS' = true ]; then
+                ip addr add '$LAN_GATEWAY/24' dev '$LAN_IFACE'
+                ip link set '$LAN_IFACE' up
             else
-                echo "Using nmcli for wired LAN." >> "$LOG_FILE"
-                # Create or modify connection for LAN interface
-                CON_NAME=$(nmcli -t -f NAME,DEVICE connection show | grep ":$LAN_IFACE$" | cut -d: -f1 | head -n1)
-                
-                if [ -z "$CON_NAME" ]; then
-                    CON_NAME="Wired connection $LAN_IFACE"
-                    nmcli con add type ethernet ifname "$LAN_IFACE" con-name "$CON_NAME" >> "$LOG_FILE" 2>&1
+                CON_NAME=\$(nmcli -t -f NAME,DEVICE connection show | grep ':$LAN_IFACE$' | cut -d: -f1 | head -n1)
+                if [ -z \"\$CON_NAME\" ]; then
+                    CON_NAME='Wired connection $LAN_IFACE'
+                    nmcli con add type ethernet ifname '$LAN_IFACE' con-name \"\$CON_NAME\"
                 fi
-                
-                # Apply Static IP
-                nmcli con modify "$CON_NAME" ipv4.addresses "$LAN_GATEWAY/24" ipv4.method manual >> "$LOG_FILE" 2>&1
-                nmcli con up "$CON_NAME" >> "$LOG_FILE" 2>&1
+                nmcli con modify \"\$CON_NAME\" ipv4.addresses '$LAN_GATEWAY/24' ipv4.method manual
+                nmcli con up \"\$CON_NAME\"
             fi
-            
         elif [ -f /etc/dhcpcd.conf ]; then
-             echo "Detected dhcpcd..." >> "$LOG_FILE"
-             sed -i '/# VPN-GATEWAY-START/,/# VPN-GATEWAY-END/d' /etc/dhcpcd.conf
-             {
-                echo "# VPN-GATEWAY-START"
-                echo "interface $LAN_IFACE"
-                echo "static ip_address=$LAN_GATEWAY/24"
-                echo "nohook wpa_supplicant"
-                echo "# VPN-GATEWAY-END"
-            } >> /etc/dhcpcd.conf
-            systemctl restart dhcpcd >> "$LOG_FILE" 2>&1
+            sed -i '/# VPN-GATEWAY-START/,/# VPN-GATEWAY-END/d' /etc/dhcpcd.conf
+            echo '# VPN-GATEWAY-START' >> /etc/dhcpcd.conf
+            echo 'interface $LAN_IFACE' >> /etc/dhcpcd.conf
+            echo 'static ip_address=$LAN_GATEWAY/24' >> /etc/dhcpcd.conf
+            echo 'nohook wpa_supplicant' >> /etc/dhcpcd.conf
+            echo '# VPN-GATEWAY-END' >> /etc/dhcpcd.conf
+            systemctl restart dhcpcd
         else
-            echo "No supported network manager found (NetworkManager or dhcpcd). Falling back to 'ip addr'..." >> "$LOG_FILE"
-            ip addr add "$LAN_GATEWAY/24" dev "$LAN_IFACE" >> "$LOG_FILE" 2>&1
+            ip addr add '$LAN_GATEWAY/24' dev '$LAN_IFACE'
         fi
-    } || { echo -e "[${RED}FAIL${NC}]"; exit 1; }
-    echo -e "[${GREEN}DONE${NC}]"
-    echo -e "   ${BLUE}👉 Assigned static IP $LAN_GATEWAY to $LAN_IFACE (LAN)${NC}"
-
+    "
+    
     # Configure dnsmasq
-    echo -ne "⏳ ${CYAN}Configuring DHCP (dnsmasq)...${NC} "
-    {
+    progress_run_step "Configure DHCP server" "
         mv /etc/dnsmasq.conf /etc/dnsmasq.conf.bak 2>/dev/null || true
-        cat > /etc/dnsmasq.conf <<EOF
+        cat > /etc/dnsmasq.conf <<DNSMASQ_EOF
 interface=$LAN_IFACE
 dhcp-range=$DHCP_START,$DHCP_END,255.255.255.0,24h
 dhcp-option=option:dns-server,$LAN_GATEWAY
 dhcp-option=option:router,$LAN_GATEWAY
 bind-interfaces
-EOF
-        systemctl restart dnsmasq >> "$LOG_FILE" 2>&1
-        systemctl enable dnsmasq >> "$LOG_FILE" 2>&1
-    } || { echo -e "[${RED}FAIL${NC}]"; exit 1; }
-    echo -e "[${GREEN}DONE${NC}]"
-
+DNSMASQ_EOF
+        systemctl restart dnsmasq
+        systemctl enable dnsmasq
+    "
+    
     # Configure hostapd if wireless
     if [ "$IS_WIRELESS" = true ]; then
-        echo -ne "⏳ ${CYAN}Configuring Access Point (hostapd)...${NC} "
-        {
-            cat > /etc/hostapd/hostapd.conf <<EOF
+        progress_run_step "Configure Access Point" "
+            mkdir -p /etc/hostapd
+            cat > /etc/hostapd/hostapd.conf <<HOSTAPD_EOF
 interface=$LAN_IFACE
 driver=nl80211
 ssid=$AP_SSID
@@ -1102,27 +1216,22 @@ wpa_passphrase=$AP_PASS
 wpa_key_mgmt=WPA-PSK
 wpa_pairwise=CCMP
 rsn_pairwise=CCMP
-EOF
-            # Point daemon to config
-            # (On some Pi OS versions, modifying /etc/default/hostapd is needed, but modern systemd service often looks at /etc/hostapd/hostapd.conf automatically or needs override)
-            # Standard Pi OS way:
-            sed -i 's|#DAEMON_CONF=""|DAEMON_CONF="/etc/hostapd/hostapd.conf"|' /etc/default/hostapd
-
-            # Unblock wlan
-            rfkill unblock wlan >> "$LOG_FILE" 2>&1
-            
-            systemctl unmask hostapd >> "$LOG_FILE" 2>&1
-            systemctl enable hostapd >> "$LOG_FILE" 2>&1
-            systemctl restart hostapd >> "$LOG_FILE" 2>&1
-        } || { echo -e "[${RED}FAIL${NC}]"; exit 1; }
-        echo -e "[${GREEN}DONE${NC}]"
+HOSTAPD_EOF
+            sed -i 's|#DAEMON_CONF=\"\"|DAEMON_CONF=\"/etc/hostapd/hostapd.conf\"|' /etc/default/hostapd 2>/dev/null || true
+            rfkill unblock wlan 2>/dev/null || true
+            systemctl unmask hostapd
+            systemctl enable hostapd
+            systemctl restart hostapd
+        "
     fi
+    
+    # Configure firewall
+    progress_run_step "Configure firewall & NAT" "do_configure_wg_firewall_rules"
+    
+    # Start WireGuard
+    progress_run_step "Start WireGuard VPN" "do_start_wireguard"
 
-    run_step "Configuring Firewall / NAT Rules" "do_configure_wg_firewall_rules"
-
-    run_step "Ensuring WireGuard VPN is running" "do_start_wireguard"
-
-    # Enforce required NAT/forward rules in case wg-quick skipped PostUp (e.g., interface already up)
+    # Enforce required NAT/forward rules (runs silently as part of firewall step)
     ensure_nat_rules
     if [ "$FIREWALL_ENABLED" = "true" ]; then
         ensure_wan_firewall_rules
@@ -1130,23 +1239,26 @@ EOF
         echo "[wan_firewall] Skipped (user disabled)" >> "$LOG_FILE"
     fi
 
+    # Auto-updates
     if [ "$AUTO_UPDATES_ENABLED" = "true" ]; then
-        run_step "Configuring automatic updates" "do_configure_auto_updates"
+        progress_run_step "Enable auto-updates" "do_configure_auto_updates"
     fi
 
-    # --- Watchdog Configuration (at the end, after all services are set up) ---
-    # Software watchdog: systemd auto-restart for critical services (always enabled)
-    ensure_software_watchdog
+    # Software watchdog (always enabled)
+    progress_run_step "Configure service watchdog" "do_software_watchdog_setup"
 
-    # Hardware watchdog: kernel-level reboot on system hang (optional)
+    # Hardware watchdog (optional)
     if [ "$WATCHDOG_ENABLED" = "true" ]; then
-        ensure_hardware_watchdog
+        progress_run_step "Enable hardware watchdog" "do_hardware_watchdog_setup"
     fi
+    
+    # Final redraw to show all complete
+    progress_draw_box
 
     echo ""
-    echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║                  🎉 Setup Complete! 🎉                     ║"
-    echo "╚════════════════════════════════════════════════════════════╝"
+    echo -e "${GREEN}${BOLD}╔════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}${BOLD}║                  🎉 Setup Complete! 🎉                     ║${NC}"
+    echo -e "${GREEN}${BOLD}╚════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     success "Status:"
     echo -e "   • WAN Interface: ${BOLD}$WAN_IFACE${NC}"
