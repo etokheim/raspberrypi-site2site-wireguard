@@ -425,7 +425,7 @@ progress_draw_box() {
     
     # Header
     echo -e "${CYAN}╭${border}╮${NC}"
-    echo -e "${CYAN}│${NC} ${BOLD}${YELLOW}⚡ Setup Progress${NC}$(printf '%*s' $((content_w - 16)) '') ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC} ${BOLD}${YELLOW}⚡ Setup Progress${NC}$(printf '%*s' $((content_w - 17)) '') ${CYAN}│${NC}"
     echo -e "${CYAN}├${border}┤${NC}"
     lines=$((lines + 3))
     

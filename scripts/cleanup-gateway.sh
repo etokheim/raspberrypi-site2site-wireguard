@@ -76,7 +76,7 @@ progress_draw_box() {
     
     # Header
     echo -e "${RED}╭${border}╮${NC}"
-    echo -e "${RED}│${NC} ${BOLD}${YELLOW}🧹 Cleanup Progress${NC}$(printf '%*s' $((content_w - 18)) '') ${RED}│${NC}"
+    echo -e "${RED}│${NC} ${BOLD}${YELLOW}🧹 Cleanup Progress${NC}$(printf '%*s' $((content_w - 19)) '') ${RED}│${NC}"
     echo -e "${RED}├${border}┤${NC}"
     lines=$((lines + 3))
     
