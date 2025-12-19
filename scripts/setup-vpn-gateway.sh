@@ -378,9 +378,9 @@ progress_draw_box() {
     local lines=0
     
     # Header
-    printf "${CYAN}╔%s╗${NC}\n" "$border"
-    printf "${CYAN}║${NC} ${BOLD}${YELLOW}⚡ Setup Progress${NC}%-*s${CYAN}║${NC}\n" $((box_w - 18)) ""
-    printf "${CYAN}╠%s╣${NC}\n" "$border"
+    echo -e "${CYAN}╔${border}╗${NC}"
+    printf "${CYAN}║${NC} ${BOLD}${YELLOW}⚡ Setup Progress${NC}%*s${CYAN}║${NC}\n" $((box_w - 18)) ""
+    echo -e "${CYAN}╠${border}╣${NC}"
     lines=$((lines + 3))
     
     # Steps
@@ -388,7 +388,7 @@ progress_draw_box() {
         local step="${PROGRESS_STEPS[$i]}"
         local status="${PROGRESS_STATUS[$i]}"
         local extra="${PROGRESS_EXTRA[$i]}"
-        local icon color line
+        local icon color
         
         case "$status" in
             pending) icon="○"; color="${DIM}" ;;
@@ -398,24 +398,37 @@ progress_draw_box() {
             skip)    icon="◌"; color="${DIM}" ;;
         esac
         
-        # Build the line content
+        # Build the visible text (without ANSI codes for length calculation)
+        local visible_text
         if [ -n "$extra" ]; then
-            line=$(printf "%s %s %s" "$icon" "$step" "$extra")
+            visible_text="$icon $step $extra"
         else
-            line=$(printf "%s %s" "$icon" "$step")
+            visible_text="$icon $step"
         fi
+        
+        # Calculate padding (box_w - 2 for the spaces inside borders)
+        local content_width=$((box_w - 2))
+        local text_len=${#visible_text}
+        local padding=$((content_width - text_len))
+        [ $padding -lt 0 ] && padding=0
         
         # Truncate if too long
-        if [ ${#line} -gt $((box_w - 2)) ]; then
-            line="${line:0:$((box_w - 5))}..."
+        if [ $text_len -gt $content_width ]; then
+            visible_text="${visible_text:0:$((content_width - 3))}..."
+            padding=0
         fi
         
-        printf "${CYAN}║${NC} ${color}%-*s${NC}${CYAN}║${NC}\n" "$((box_w - 2))" "$line"
+        # Print with colors: icon+step in status color, extra in dim
+        if [ -n "$extra" ]; then
+            echo -e "${CYAN}║${NC} ${color}${icon} ${step}${NC} ${DIM}${extra}${NC}$(printf '%*s' $padding '')${CYAN}║${NC}"
+        else
+            echo -e "${CYAN}║${NC} ${color}${visible_text}${NC}$(printf '%*s' $padding '')${CYAN}║${NC}"
+        fi
         lines=$((lines + 1))
     done
     
     # Footer
-    printf "${CYAN}╚%s╝${NC}\n" "$border"
+    echo -e "${CYAN}╚${border}╝${NC}"
     lines=$((lines + 1))
     
     PROGRESS_BOX_LINES=$lines
@@ -1090,23 +1103,23 @@ main() {
     
     # Add steps based on configuration
     if [ "$INSTALL_DEPENDENCIES" = "true" ] && [ -n "$display_pkgs" ]; then
-        progress_add_step "Install packages" "${DIM}($display_pkgs )${NC}"
+        progress_add_step "Install packages" "($display_pkgs)"
     fi
     
-    progress_add_step "Install WireGuard config" "${DIM}→ $WG_CONF_DEST${NC}"
+    progress_add_step "Install WireGuard config" "→ $WG_CONF_DEST"
     progress_add_step "Enable IP forwarding"
-    progress_add_step "Configure LAN interface" "${DIM}$LAN_IFACE = $LAN_GATEWAY${NC}"
-    progress_add_step "Configure DHCP server" "${DIM}dnsmasq${NC}"
+    progress_add_step "Configure LAN interface" "$LAN_IFACE = $LAN_GATEWAY"
+    progress_add_step "Configure DHCP server" "(dnsmasq)"
     
     if [ "$IS_WIRELESS" = true ]; then
-        progress_add_step "Configure Access Point" "${DIM}hostapd: $AP_SSID${NC}"
+        progress_add_step "Configure Access Point" "(hostapd: $AP_SSID)"
     fi
     
     progress_add_step "Configure firewall & NAT"
     progress_add_step "Start WireGuard VPN"
     
     if [ "$AUTO_UPDATES_ENABLED" = "true" ]; then
-        progress_add_step "Enable auto-updates" "${DIM}nightly @ 03:00${NC}"
+        progress_add_step "Enable auto-updates" "(nightly @ 03:00)"
     fi
     
     progress_add_step "Configure service watchdog"
