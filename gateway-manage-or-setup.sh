@@ -213,7 +213,7 @@ prompt_choice() {
     border=$(printf '─%.0s' $(seq 1 $((box_w - 2))))
     
     echo -e "${CYAN}╭${border}╮${NC}"
-    printf "${CYAN}│${NC} %-${content_w}s ${CYAN}│${NC}\n" "${BOLD}Gateway Status${NC}"
+    echo -e "${CYAN}│${NC} ${BOLD}Gateway Status${NC}$(printf '%*s' $((content_w - 14)) '') ${CYAN}│${NC}"
     echo -e "${CYAN}├${border}┤${NC}"
     if [ "$configured" = true ]; then
         # Truncate path if too long

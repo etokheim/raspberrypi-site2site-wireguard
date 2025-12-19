@@ -59,7 +59,7 @@ show_existing_config() {
     
     echo ""
     echo -e "${CYAN}╭${border}╮${NC}"
-    printf "${CYAN}│${NC} %-${content_w}s ${CYAN}│${NC}\n" "${BOLD}📄 Loaded Configuration${NC}"
+    echo -e "${CYAN}│${NC} ${BOLD}📄 Loaded Configuration${NC}$(printf '%*s' $((content_w - 23)) '') ${CYAN}│${NC}"
     printf "${CYAN}│${NC}   ${DIM}%-$((content_w - 2))s${NC} ${CYAN}│${NC}\n" "$config_display"
     echo -e "${CYAN}├${border}┤${NC}"
     printf "${CYAN}│${NC}  WAN interface:   ${BOLD}%-${field_w}s${NC} ${CYAN}│${NC}\n" "${WAN_IFACE:-<unset>}"
