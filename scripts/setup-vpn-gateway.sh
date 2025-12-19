@@ -670,6 +670,35 @@ main() {
     check_root
     print_header
 
+    # --- First prompt: System dependencies (required) ---
+    # Check which packages are missing
+    MISSING_PKGS=""
+    if ! dpkg -s wireguard >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS wireguard"; fi
+    if ! dpkg -s dnsmasq >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS dnsmasq"; fi
+    if ! dpkg -s iptables >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS iptables"; fi
+    if ! dpkg -s qrencode >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS qrencode"; fi
+    if ! dpkg -s resolvconf >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS resolvconf"; fi
+    if ! dpkg -s iptables-persistent >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS iptables-persistent"; fi
+
+    if [ -n "$MISSING_PKGS" ]; then
+        info "System Dependencies Check"
+        echo -e "   ${YELLOW}Missing packages:${NC}$MISSING_PKGS"
+        echo -ne "📦 ${YELLOW}Install required system packages?$MISSING_PKGS [Y/n]${NC} "
+        read -r install_choice
+        if [[ "$install_choice" =~ ^[Nn]$ ]]; then
+            error "Package installation is required to proceed. Exiting."
+            exit 1
+        fi
+        INSTALL_DEPENDENCIES="true"
+        save_config_var "INSTALL_DEPENDENCIES" "true"
+        echo ""
+    else
+        INSTALL_DEPENDENCIES="false"
+        save_config_var "INSTALL_DEPENDENCIES" "false"
+        success "All base dependencies are already installed."
+        echo ""
+    fi
+
     if [ "$USE_EXISTING_CONFIG" = true ]; then
         info "Using existing configuration from $CONFIG_FILE"
     else
@@ -895,6 +924,11 @@ main() {
     printf "╔%s╗\n" "$border_line"
     printf "║ %-*.*s ║\n" "$box_w" "$box_w" "📝 Planned changes"
     printf "╠%s╣\n" "$border_line"
+    if [ "$INSTALL_DEPENDENCIES" = "true" ]; then
+        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Install packages:$MISSING_PKGS"
+    else
+        printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• System packages: already installed"
+    fi
     printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Configure WAN: $WAN_IFACE"
     printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Configure LAN: $LAN_IFACE (static $LAN_GATEWAY / $LAN_CIDR)"
     printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• WireGuard config: $WG_CONF_SRC -> $WG_CONF_DEST"
@@ -935,39 +969,19 @@ main() {
         APPLYING_CHANGES=true
     fi
 
-    info "Checking System Dependencies..."
-    
-    # Check which packages are missing
-    MISSING_PKGS=""
-    if ! dpkg -s wireguard >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS wireguard"; fi
-    if ! dpkg -s dnsmasq >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS dnsmasq"; fi
-    if ! dpkg -s iptables >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS iptables"; fi
-    if ! dpkg -s qrencode >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS qrencode"; fi
-    if ! dpkg -s resolvconf >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS resolvconf"; fi
-    if ! dpkg -s iptables-persistent >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS iptables-persistent"; fi
-
-    if [ -n "$MISSING_PKGS" ]; then
-        echo -e "   ${YELLOW}Missing packages:${NC}$MISSING_PKGS"
-        echo -ne "❓ ${YELLOW}Do you want to install necessary packages?$MISSING_PKGS [Y/n]${NC} "
-        read -r install_choice
-        if [[ "$install_choice" =~ ^[Nn]$ ]]; then
-            error "Package installation is required to proceed. Exiting."
-            exit 1
-        else
-            run_step "Updating package list" "apt-get update"
-            # Preseed iptables-persistent to avoid interactive prompts
-            echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections 2>/dev/null || true
-            echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections 2>/dev/null || true
-            # Also preseed watchdog to avoid prompt loop if it's upgraded/reconfigured
-            echo "watchdog watchdog/run boolean true" | debconf-set-selections 2>/dev/null || true
-            echo "watchdog watchdog/module string bcm2835_wdt" | debconf-set-selections 2>/dev/null || true
-            
-            # Use non-interactive frontend for apt operations
-            export DEBIAN_FRONTEND=noninteractive
-            run_step "Installing missing packages" "apt-get install -y $MISSING_PKGS"
-        fi
-    else
-        success "All base dependencies (wireguard, dnsmasq, iptables, qrencode, resolvconf, iptables-persistent) are already installed."
+    # Install system dependencies if needed (user already confirmed at start)
+    if [ "$INSTALL_DEPENDENCIES" = "true" ] && [ -n "$MISSING_PKGS" ]; then
+        run_step "Updating package list" "apt-get update"
+        # Preseed iptables-persistent to avoid interactive prompts
+        echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections 2>/dev/null || true
+        echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections 2>/dev/null || true
+        # Also preseed watchdog to avoid prompt loop if it's upgraded/reconfigured
+        echo "watchdog watchdog/run boolean true" | debconf-set-selections 2>/dev/null || true
+        echo "watchdog watchdog/module string bcm2835_wdt" | debconf-set-selections 2>/dev/null || true
+        
+        # Use non-interactive frontend for apt operations
+        export DEBIAN_FRONTEND=noninteractive
+        run_step "Installing missing packages" "apt-get install -y $MISSING_PKGS"
     fi
 
     echo ""
