@@ -89,7 +89,7 @@ run_start() {
     fi
 
     # Bring up AP/DHCP if configured for wireless
-    if [ "${IS_WIRELESS:-false}" = "true" ] || systemctl list-unit-files | grep -q '^hostapd\.service'; then
+    if [ "${IS_WIRELESS:-false}" = "true" ]; then
         echo "Starting Access Point (hostapd)..."
         rfkill unblock wlan >/dev/null 2>&1 || true
         systemctl start hostapd >/dev/null 2>&1 || true

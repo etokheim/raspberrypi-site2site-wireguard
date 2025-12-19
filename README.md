@@ -64,6 +64,7 @@ SEO-friendly terms: *Raspberry Pi site-to-site VPN*, *WireGuard gateway*, *home 
 - Subnet: `10.10.10.0/24`
 - Gateway: `10.10.10.1`
 - DHCP pool: `10.10.10.10 - 10.10.10.250`
+- Note: the script locks LAN subnets to /24. If you enter another prefix, it will coerce it to a /24 in the same third-octet block (e.g., `192.168.50.0/20` becomes `192.168.50.0/24`).
 
 ## Verify it works
 On the Pi:

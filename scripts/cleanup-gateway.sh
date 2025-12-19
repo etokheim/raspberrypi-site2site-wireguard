@@ -195,7 +195,7 @@ main() {
     run_step "Disabling IP Forwarding" "rm -f /etc/sysctl.d/99-vpn-gateway.conf && sysctl --system"
 
     if [ "${AUTO_UPDATES_ENABLED:-false}" = "true" ]; then
-        run_step "Removing automatic updates configuration" "bash -c 'remove_auto_updates'"
+        run_step "Removing automatic updates configuration" "remove_auto_updates"
     fi
 
     echo -ne "⏳ ${CYAN}Restoring Network Configuration...${NC} "

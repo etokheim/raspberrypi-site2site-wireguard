@@ -26,9 +26,6 @@ load_config() {
         fi
     fi
 
-    if [ "$WATCHDOG_ENABLED" = "true" ]; then
-        ensure_watchdog
-    fi
     if [ -f "$CONFIG_FILE" ]; then
         source "$CONFIG_FILE"
     fi
@@ -143,15 +140,6 @@ ensure_wg_perms() {
     else
         warn "Left WireGuard config permissions unchanged."
     fi
-}
-
-disable_unused_services() {
-    local services=("avahi-daemon.service" "avahi-daemon.socket" "cups.service" "cups-browsed.service" "bluetooth.service")
-    for svc in "${services[@]}"; do
-        if systemctl list-unit-files | grep -q "^${svc}"; then
-            systemctl disable --now "$svc" >> "$LOG_FILE" 2>&1 || true
-        fi
-    done
 }
 
 is_wg_active() {
@@ -520,7 +508,7 @@ get_ip_range() {
     
     # Prompt on stderr so it is visible even when this function is used in a
     # command substitution (stdout is captured for the return value).
-    echo -ne "🌐 Enter LAN IP range (CIDR) [default: ${BOLD}${YELLOW}$default_cidr${NC}]: " >&2
+    echo -ne "🌐 Enter LAN IP range (CIDR, forced to /24) [default: ${BOLD}${YELLOW}$default_cidr${NC}]: " >&2
     
     # Force read from terminal
     read -r input_cidr < /dev/tty
@@ -530,7 +518,19 @@ get_ip_range() {
     if [ -z "$input_cidr" ]; then
         LAN_CIDR="$default_cidr"
     else
-        LAN_CIDR="$input_cidr"
+        # Strip any existing prefix and force /24
+        local ip_only prefix
+        ip_only=$(echo "$input_cidr" | cut -d'/' -f1)
+        prefix=$(echo "$ip_only" | awk -F'.' '{print $1"."$2"."$3}')
+        if echo "$prefix" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            LAN_CIDR="${prefix}.0/24"
+            echo "[DEBUG] Forcing CIDR to /24: $LAN_CIDR" >> "$LOG_FILE"
+            echo -e "   ${YELLOW}ℹ️  Subnets are locked to /24; using ${LAN_CIDR}.${NC}" >&2
+        else
+            LAN_CIDR="$default_cidr"
+            echo "[DEBUG] Invalid subnet input, falling back to default: $LAN_CIDR" >> "$LOG_FILE"
+            echo -e "   ${YELLOW}⚠️  Input not recognized; using default ${LAN_CIDR}.${NC}" >&2
+        fi
     fi
     
     echo -e "   ${BLUE}👉 The private subnet for devices connecting to the AP (LAN side).${NC}" >&2
@@ -799,6 +799,11 @@ main() {
             exit 1
         fi
         APPLYING_CHANGES=true
+    fi
+
+    # Only generate watchdog config after the user has reviewed planned changes
+    if [ "$WATCHDOG_ENABLED" = "true" ]; then
+        ensure_watchdog
     fi
 
     info "Checking System Dependencies..."
