@@ -858,11 +858,6 @@ EOF
     fi
 
     if [ "$AUTO_UPDATES_ENABLED" = "true" ]; then
-        # Create dated update log and prune to max 20
-        mkdir -p "$LOG_DIR"
-        update_log="$LOG_DIR/Update log $(date +%Y-%m-%d).log"
-        find "$LOG_DIR" -maxdepth 1 -type f -name 'Update log *.log' -printf '%T@ %p\n' 2>/dev/null | sort -nr | tail -n +21 | awk '{print $2}' | xargs -r rm -f
-
         run_step "Configuring automatic updates" "bash -c \"
             export DEBIAN_FRONTEND=noninteractive
             apt-get update >> '$LOG_FILE' 2>&1
@@ -898,7 +893,6 @@ EOF
             systemctl enable --now unattended-upgrades apt-daily.timer apt-daily-upgrade.timer >> '$LOG_FILE' 2>&1 || true
         \""
 
-        echo "Automatic updates enabled; logs will reside under $LOG_DIR (dated 'Update log YYYY-MM-DD.log', max 20 kept)." >> "$update_log"
     fi
 
     echo ""
