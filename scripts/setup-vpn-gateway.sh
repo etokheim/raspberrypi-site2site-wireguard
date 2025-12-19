@@ -77,14 +77,19 @@ do_hardware_watchdog_setup() {
     # If the system hangs and stops petting the watchdog, the hardware reboots the Pi
     export DEBIAN_FRONTEND=noninteractive
     apt-get update >> "$LOG_FILE" 2>&1
-    apt-get install -y watchdog >> "$LOG_FILE" 2>&1
+    apt-get install -y -o Dpkg::Options::="--force-confold" watchdog >> "$LOG_FILE" 2>&1
     if [ -f /etc/watchdog.conf ] && [ ! -f /etc/watchdog.conf.bak_gateway ]; then
         cp /etc/watchdog.conf /etc/watchdog.conf.bak_gateway
     fi
     cat > /etc/watchdog.conf <<EOF
+# Hardware watchdog - reboots only on true system hang
 watchdog-device = /dev/watchdog
+watchdog-timeout = 15
+
+# Only reboot if system is completely unresponsive (load > 24 is extreme)
 max-load-1 = 24
-interface = $LAN_IFACE
+
+# Run with realtime priority to ensure watchdog keeps running
 realtime = yes
 priority = 1
 EOF
