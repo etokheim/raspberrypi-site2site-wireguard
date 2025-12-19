@@ -210,23 +210,23 @@ prompt_choice() {
     border=$(printf '─%.0s' $(seq 1 $content_w))
     
     echo -e "${CYAN}╭${border}╮${NC}"
-    printf "${CYAN}│${NC} ${BOLD}%-$((content_w - 2))s${NC} ${CYAN}│${NC}\n" "Gateway Status"
+    printf "${CYAN}│${NC} %-$((content_w - 1))s${CYAN}│${NC}\n" "${BOLD}Gateway Status${NC}"
     echo -e "${CYAN}├${border}┤${NC}"
     if [ "$configured" = true ]; then
         # Truncate path if too long
         local config_display="$CONFIG_FILE"
-        local field_w=$((content_w - 18))  # Account for "   ● Config:    " prefix
+        local field_w=$((content_w - 17))  # Account for "   ● Config:    " prefix
         if [ ${#config_display} -gt $field_w ]; then
             config_display="...${config_display: -$((field_w - 3))}"
         fi
-        printf "${CYAN}│${NC}   ${GREEN}●${NC} Config:    %-${field_w}s ${CYAN}│${NC}\n" "$config_display"
+        printf "${CYAN}│${NC}   ${GREEN}●${NC} Config:    %-${field_w}s${CYAN}│${NC}\n" "$config_display"
     else
-        printf "${CYAN}│${NC}   ${RED}○${NC} Config:    %-$((content_w - 18))s ${CYAN}│${NC}\n" "not found"
+        printf "${CYAN}│${NC}   ${RED}○${NC} Config:    %-$((content_w - 17))s${CYAN}│${NC}\n" "not found"
     fi
     if [ "$active" = true ]; then
-        printf "${CYAN}│${NC}   ${GREEN}●${NC} WireGuard: ${GREEN}%-$((content_w - 18))s${NC} ${CYAN}│${NC}\n" "active (wg0)"
+        printf "${CYAN}│${NC}   ${GREEN}●${NC} WireGuard: ${GREEN}%-$((content_w - 17))s${NC}${CYAN}│${NC}\n" "active (wg0)"
     else
-        printf "${CYAN}│${NC}   ${DIM}○${NC} WireGuard: %-$((content_w - 18))s ${CYAN}│${NC}\n" "inactive"
+        printf "${CYAN}│${NC}   ${DIM}○${NC} WireGuard: %-$((content_w - 17))s${CYAN}│${NC}\n" "inactive"
     fi
     echo -e "${CYAN}╰${border}╯${NC}"
     echo ""
