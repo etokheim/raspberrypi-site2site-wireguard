@@ -30,6 +30,23 @@ load_config() {
     fi
 }
 
+has_full_config() {
+    [ -n "$WAN_IFACE" ] && [ -n "$LAN_IFACE" ] && [ -n "$LAN_CIDR" ] && [ -n "$WG_CONF_PATH" ]
+}
+
+show_existing_config() {
+    echo "📄 Existing configuration loaded from $CONFIG_FILE:"
+    echo "  • WAN interface: ${WAN_IFACE:-<unset>}"
+    echo "  • LAN interface: ${LAN_IFACE:-<unset>}"
+    echo "  • LAN CIDR: ${LAN_CIDR:-<unset>}"
+    echo "  • WireGuard config: ${WG_CONF_PATH:-<unset>}"
+    if [ "${IS_WIRELESS:-false}" = "true" ]; then
+        echo "  • Wi‑Fi SSID: ${AP_SSID:-<unset>}"
+    fi
+    echo "  • Firewall: ${FIREWALL_ENABLED:-true}"
+    echo "  • Auto updates: ${AUTO_UPDATES_ENABLED:-false}"
+}
+
 detect_ssh_port() {
     if [ -n "${SSH_PORT:-}" ]; then
         return
@@ -440,6 +457,21 @@ get_ip_range() {
 main() {
     trap cleanup_on_interrupt SIGINT
     load_config # Load defaults from file if it exists
+    NONINTERACTIVE="${NONINTERACTIVE:-false}"
+    USE_EXISTING_CONFIG=false
+    if has_full_config; then
+        show_existing_config
+        if [ "$NONINTERACTIVE" = "true" ]; then
+            USE_EXISTING_CONFIG=true
+            info "Non-interactive mode: proceeding with existing configuration."
+        else
+            echo -ne "Proceed with existing configuration? [Y/n]: "
+            read -r use_existing
+            if [[ ! "$use_existing" =~ ^[Nn]$ ]]; then
+                USE_EXISTING_CONFIG=true
+            fi
+        fi
+    fi
     PREV_LAN_IFACE="$LAN_IFACE"
     PREV_WAN_IFACE="$WAN_IFACE"
     PREV_LAN_CIDR="$LAN_CIDR"
@@ -448,112 +480,128 @@ main() {
     check_root
     print_header
 
-    info "Network Interface Selection"
-    echo -e "   ${BLUE}👉 Identify which port connects to the Internet (WAN) and which serves the local private network (LAN).${NC}"
-    echo "------------------------------------------------"
-    
-    echo -e "\n${BOLD}Step 1: Select the WAN interface${NC}"
-    echo -e "   ${BLUE}ℹ️  This interface connects to the upstream Internet (e.g., USB adapter or built-in Ethernet connected to the site's router).${NC}"
-    WAN_IFACE=$(select_interface "Available interfaces:" "$WAN_IFACE")
-    save_config_var "WAN_IFACE" "$WAN_IFACE"
-    success "WAN Interface selected: $WAN_IFACE"
-    
-    echo -e "\n${BOLD}Step 2: Select the LAN interface${NC}"
-    echo -e "   ${BLUE}ℹ️  This interface will host the secure private subnet (e.g., built-in Ethernet connected to your Access Point).${NC}"
-    echo -e "   ${YELLOW}👉 If you select a wireless interface (e.g., wlan0), the Pi will be configured as a Wi-Fi Access Point.${NC}"
-    LAN_IFACE=$(select_interface "Available interfaces:" "$LAN_IFACE")
-    save_config_var "LAN_IFACE" "$LAN_IFACE"
-    if [ -n "$PREV_LAN_IFACE" ] && [ "$PREV_LAN_IFACE" != "$LAN_IFACE" ]; then
-        info "Detected LAN change: $PREV_LAN_IFACE -> $LAN_IFACE (cleaning old interface state)"
-        reset_previous_lan_iface "$PREV_LAN_IFACE" "$LAN_IFACE" "$PREV_IS_WIRELESS"
+    if [ "$USE_EXISTING_CONFIG" = true ]; then
+        info "Using existing configuration from $CONFIG_FILE"
+    else
+        info "Network Interface Selection"
+        echo -e "   ${BLUE}👉 Identify which port connects to the Internet (WAN) and which serves the local private network (LAN).${NC}"
+        echo "------------------------------------------------"
+        
+        echo -e "\n${BOLD}Step 1: Select the WAN interface${NC}"
+        echo -e "   ${BLUE}ℹ️  This interface connects to the upstream Internet (e.g., USB adapter or built-in Ethernet connected to the site's router).${NC}"
+        WAN_IFACE=$(select_interface "Available interfaces:" "$WAN_IFACE")
+        save_config_var "WAN_IFACE" "$WAN_IFACE"
+        success "WAN Interface selected: $WAN_IFACE"
+        
+        echo -e "\n${BOLD}Step 2: Select the LAN interface${NC}"
+        echo -e "   ${BLUE}ℹ️  This interface will host the secure private subnet (e.g., built-in Ethernet connected to your Access Point).${NC}"
+        echo -e "   ${YELLOW}👉 If you select a wireless interface (e.g., wlan0), the Pi will be configured as a Wi-Fi Access Point.${NC}"
+        LAN_IFACE=$(select_interface "Available interfaces:" "$LAN_IFACE")
+        save_config_var "LAN_IFACE" "$LAN_IFACE"
+        if [ -n "$PREV_LAN_IFACE" ] && [ "$PREV_LAN_IFACE" != "$LAN_IFACE" ]; then
+            info "Detected LAN change: $PREV_LAN_IFACE -> $LAN_IFACE (cleaning old interface state)"
+            reset_previous_lan_iface "$PREV_LAN_IFACE" "$LAN_IFACE" "$PREV_IS_WIRELESS"
+        fi
+        success "LAN Interface selected: $LAN_IFACE"
+        echo ""
     fi
-    success "LAN Interface selected: $LAN_IFACE"
-    echo ""
 
     if [ "$WAN_IFACE" == "$LAN_IFACE" ]; then
         error "WAN and LAN interfaces cannot be the same."
         exit 1
     fi
 
-    # Check for Wireless LAN Interface
-    IS_WIRELESS=false
-    # More robust check: simple string matching
-    if echo "$LAN_IFACE" | grep -q "wlan"; then
-        IS_WIRELESS=true
-        save_config_var "IS_WIRELESS" "true"
-        info "Wireless LAN interface detected ($LAN_IFACE)."
-        echo -e "   ${BLUE}ℹ️  To use this interface for the private subnet, the Pi must act as a Wi-Fi Access Point.${NC}"
-        echo -e "   ${BLUE}ℹ️  This requires installing 'hostapd' (Host Access Point Daemon).${NC}"
-        
-        if dpkg -s hostapd >/dev/null 2>&1; then
-             success "'hostapd' is already installed."
-        else
-            echo -ne "❓ ${YELLOW}Do you want to proceed with installing hostapd? [Y/n]${NC} "
-            read -r ap_install_choice
-            if [[ "$ap_install_choice" =~ ^[Nn]$ ]]; then
-                error "Cannot proceed with wireless LAN without hostapd. Exiting."
-                exit 1
-            fi
-            run_step "Installing hostapd" "apt-get install -y hostapd"
+    if [ "$USE_EXISTING_CONFIG" = true ]; then
+        # Derive IS_WIRELESS if missing when using existing config
+        if [ -z "${IS_WIRELESS:-}" ] && echo "$LAN_IFACE" | grep -q "wlan"; then
+            IS_WIRELESS=true
         fi
-
-        # Pre-fill SSID from config
-        default_ssid="${AP_SSID:-}"
-        prompt_ssid="📡 Enter SSID (Network Name) for the AP"
-        if [ -n "$default_ssid" ]; then
-             prompt_ssid="$prompt_ssid [default: ${BOLD}${YELLOW}$default_ssid${NC}]"
-        fi
-        echo -ne "$prompt_ssid: "
-        read -r input_ssid
-        if [ -z "$input_ssid" ] && [ -n "$default_ssid" ]; then
-            AP_SSID="$default_ssid"
-        else
-            AP_SSID="$input_ssid"
-        fi
-        save_config_var "AP_SSID" "$AP_SSID"
-        
-        # Pre-fill Password from config (warn user)
-        default_pass="${AP_PASS:-}"
-        prompt_pass="🔑 Enter Password for the AP (min 8 chars)"
-        if [ -n "$default_pass" ]; then
-             prompt_pass="$prompt_pass [default: ${BOLD}${YELLOW}********${NC}]"
-        fi
-        
-        while true; do
-            echo -ne "$prompt_pass: "
-            read -r -s input_pass
-            echo ""
-            
-            # Logging input length only, not the password itself
-            echo "[DEBUG] Password input received. Length: ${#input_pass}" >> "$LOG_FILE"
-            
-            if [ -z "$input_pass" ] && [ -n "$default_pass" ]; then
-                AP_PASS="$default_pass"
-                break
-            elif [ ${#input_pass} -ge 8 ]; then
-                AP_PASS="$input_pass"
-                break
-            else
-                warn "Password must be at least 8 characters."
-                echo "[DEBUG] Password too short." >> "$LOG_FILE"
-            fi
-        done
-        # Explicit log to confirm loop exit
-        echo "[DEBUG] Password accepted." >> "$LOG_FILE"
-        save_config_var "AP_PASS" "$AP_PASS"
+        save_config_var "IS_WIRELESS" "${IS_WIRELESS:-false}"
     else
-        save_config_var "IS_WIRELESS" "false"
+        # Check for Wireless LAN Interface
+        IS_WIRELESS=false
+        # More robust check: simple string matching
+        if echo "$LAN_IFACE" | grep -q "wlan"; then
+            IS_WIRELESS=true
+            save_config_var "IS_WIRELESS" "true"
+            info "Wireless LAN interface detected ($LAN_IFACE)."
+            echo -e "   ${BLUE}ℹ️  To use this interface for the private subnet, the Pi must act as a Wi-Fi Access Point.${NC}"
+            echo -e "   ${BLUE}ℹ️  This requires installing 'hostapd' (Host Access Point Daemon).${NC}"
+            
+            if dpkg -s hostapd >/dev/null 2>&1; then
+                 success "'hostapd' is already installed."
+            else
+                echo -ne "❓ ${YELLOW}Do you want to proceed with installing hostapd? [Y/n]${NC} "
+                read -r ap_install_choice
+                if [[ "$ap_install_choice" =~ ^[Nn]$ ]]; then
+                    error "Cannot proceed with wireless LAN without hostapd. Exiting."
+                    exit 1
+                fi
+                run_step "Installing hostapd" "apt-get install -y hostapd"
+            fi
+
+            # Pre-fill SSID from config
+            default_ssid="${AP_SSID:-}"
+            prompt_ssid="📡 Enter SSID (Network Name) for the AP"
+            if [ -n "$default_ssid" ]; then
+                 prompt_ssid="$prompt_ssid [default: ${BOLD}${YELLOW}$default_ssid${NC}]"
+            fi
+            echo -ne "$prompt_ssid: "
+            read -r input_ssid
+            if [ -z "$input_ssid" ] && [ -n "$default_ssid" ]; then
+                AP_SSID="$default_ssid"
+            else
+                AP_SSID="$input_ssid"
+            fi
+            save_config_var "AP_SSID" "$AP_SSID"
+            
+            # Pre-fill Password from config (warn user)
+            default_pass="${AP_PASS:-}"
+            prompt_pass="🔑 Enter Password for the AP (min 8 chars)"
+            if [ -n "$default_pass" ]; then
+                 prompt_pass="$prompt_pass [default: ${BOLD}${YELLOW}********${NC}]"
+            fi
+            
+            while true; do
+                echo -ne "$prompt_pass: "
+                read -r -s input_pass
+                echo ""
+                
+                # Logging input length only, not the password itself
+                echo "[DEBUG] Password input received. Length: ${#input_pass}" >> "$LOG_FILE"
+                
+                if [ -z "$input_pass" ] && [ -n "$default_pass" ]; then
+                    AP_PASS="$default_pass"
+                    break
+                elif [ ${#input_pass} -ge 8 ]; then
+                    AP_PASS="$input_pass"
+                    break
+                else
+                    warn "Password must be at least 8 characters."
+                    echo "[DEBUG] Password too short." >> "$LOG_FILE"
+                fi
+            done
+            # Explicit log to confirm loop exit
+            echo "[DEBUG] Password accepted." >> "$LOG_FILE"
+            save_config_var "AP_PASS" "$AP_PASS"
+        else
+            save_config_var "IS_WIRELESS" "false"
+        fi
     fi
 
     echo "" # Add newline for clarity
     echo "[DEBUG] Starting IP Range prompt..." >> "$LOG_FILE"
     
-    LAN_CIDR=$(get_ip_range)
-    # The output of get_ip_range is captured into LAN_CIDR. 
-    # If get_ip_range has user prompts (read), they might be hidden/swallowed if not redirected to stderr!
-    # Just like with select_interface, we need to fix get_ip_range to print prompts to stderr.
-    
-    save_config_var "LAN_CIDR" "$LAN_CIDR"
+    if [ "$USE_EXISTING_CONFIG" = true ] && [ -n "$LAN_CIDR" ]; then
+        info "Using existing LAN CIDR: $LAN_CIDR"
+    else
+        LAN_CIDR=$(get_ip_range)
+        # The output of get_ip_range is captured into LAN_CIDR. 
+        # If get_ip_range has user prompts (read), they might be hidden/swallowed if not redirected to stderr!
+        # Just like with select_interface, we need to fix get_ip_range to print prompts to stderr.
+        
+        save_config_var "LAN_CIDR" "$LAN_CIDR"
+    fi
     LAN_IP=$(echo "$LAN_CIDR" | sed 's/\.0\/24$/.1/')
     
     SUBNET_BASE=$(echo "$LAN_CIDR" | cut -d'/' -f1)
@@ -568,34 +616,45 @@ main() {
     echo -e "   • DHCP:    ${CYAN}$DHCP_START - $DHCP_END${NC}"
     echo ""
 
-    WG_CONF_SRC=$(get_wg_config)
-    save_config_var "WG_CONF_PATH" "$WG_CONF_SRC"
+    if [ "$USE_EXISTING_CONFIG" = true ] && [ -n "$WG_CONF_PATH" ] && [ -f "$WG_CONF_PATH" ]; then
+        WG_CONF_SRC="$WG_CONF_PATH"
+        info "Using existing WireGuard config: $WG_CONF_SRC"
+    else
+        WG_CONF_SRC=$(get_wg_config)
+        save_config_var "WG_CONF_PATH" "$WG_CONF_SRC"
+    fi
     parse_wg_listen_port "$WG_CONF_SRC"
     detect_ssh_port
     WG_CONF_DEST="/etc/wireguard/wg0.conf"
 
-    # Ask whether to configure firewall (WAN hardening)
-    local default_fw="${FIREWALL_ENABLED:-true}"
-    echo ""
-    echo -ne "🛡️  Configure WAN firewall (allow SSH + WireGuard, drop other inbound)? [Y/n]: "
-    read -r fw_choice
-    if [[ "$fw_choice" =~ ^[Nn]$ ]]; then
-        FIREWALL_ENABLED="false"
+    if [ "$USE_EXISTING_CONFIG" = true ]; then
+        info "Using existing firewall and auto-update preferences from config."
+        FIREWALL_ENABLED="${FIREWALL_ENABLED:-true}"
+        AUTO_UPDATES_ENABLED="${AUTO_UPDATES_ENABLED:-false}"
     else
-        FIREWALL_ENABLED="true"
-    fi
-    save_config_var "FIREWALL_ENABLED" "$FIREWALL_ENABLED"
+        # Ask whether to configure firewall (WAN hardening)
+        local default_fw="${FIREWALL_ENABLED:-true}"
+        echo ""
+        echo -ne "🛡️  Configure WAN firewall (allow SSH + WireGuard, drop other inbound)? [Y/n]: "
+        read -r fw_choice
+        if [[ "$fw_choice" =~ ^[Nn]$ ]]; then
+            FIREWALL_ENABLED="false"
+        else
+            FIREWALL_ENABLED="true"
+        fi
+        save_config_var "FIREWALL_ENABLED" "$FIREWALL_ENABLED"
 
-    # Ask about automatic updates (logs only, no email)
-    echo ""
-    echo -ne "🔄 Enable automatic updates (all packages) nightly at 03:00? [Y/n]: "
-    read -r auto_updates_choice
-    if [[ "$auto_updates_choice" =~ ^[Nn]$ ]]; then
-        AUTO_UPDATES_ENABLED="false"
-    else
-        AUTO_UPDATES_ENABLED="true"
+        # Ask about automatic updates (logs only, no email)
+        echo ""
+        echo -ne "🔄 Enable automatic updates (all packages) nightly at 03:00? [Y/n]: "
+        read -r auto_updates_choice
+        if [[ "$auto_updates_choice" =~ ^[Nn]$ ]]; then
+            AUTO_UPDATES_ENABLED="false"
+        else
+            AUTO_UPDATES_ENABLED="true"
+        fi
+        save_config_var "AUTO_UPDATES_ENABLED" "$AUTO_UPDATES_ENABLED"
     fi
-    save_config_var "AUTO_UPDATES_ENABLED" "$AUTO_UPDATES_ENABLED"
 
     echo ""
     # Framed summary (fixed width)
@@ -629,14 +688,18 @@ main() {
     fi
     printf "╚%s╝\n" "$border_line"
     echo ""
-    echo -ne "Proceed with applying these changes? [Y/n]: "
-    read -r proceed_choice
-    if [[ "$proceed_choice" =~ ^[Nn]$ ]]; then
-        warn "Aborting setup by user request."
-        exit 1
+    if [ "$NONINTERACTIVE" = "true" ] && [ "$USE_EXISTING_CONFIG" = true ]; then
+        info "Non-interactive mode: applying changes without confirmation."
+        APPLYING_CHANGES=true
+    else
+        echo -ne "Proceed with applying these changes? [Y/n]: "
+        read -r proceed_choice
+        if [[ "$proceed_choice" =~ ^[Nn]$ ]]; then
+            warn "Aborting setup by user request."
+            exit 1
+        fi
+        APPLYING_CHANGES=true
     fi
-
-    APPLYING_CHANGES=true
 
     info "Checking System Dependencies..."
     

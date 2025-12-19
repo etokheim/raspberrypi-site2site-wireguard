@@ -12,11 +12,15 @@ LEGACY_CONFIG_2="$ROOT_DIR/vpn_gateway.conf"
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--setup|--cleanup|--start|--stop|--help]
+Usage: $(basename "$0") [--setup|--cleanup|--start|--stop|--yes|--help]
 
 Runs the gateway setup or cleanup flows by dispatching to the scripts under $SCRIPTS_DIR.
 Also supports starting/stopping the WireGuard gateway service. If no flag is provided,
 an interactive prompt is shown.
+
+Flags:
+  --yes / --non-interactive   Run without prompts when possible (uses existing config; prompts only for missing values)
+  --setup / --cleanup / --start / --stop
 EOF
 }
 
@@ -69,11 +73,11 @@ load_config_if_present() {
 }
 
 run_setup() {
-    cd "$ROOT_DIR" && bash "$SETUP_SCRIPT"
+    cd "$ROOT_DIR" && NONINTERACTIVE="$NONINTERACTIVE" bash "$SETUP_SCRIPT"
 }
 
 run_cleanup() {
-    cd "$ROOT_DIR" && bash "$CLEANUP_SCRIPT"
+    cd "$ROOT_DIR" && NONINTERACTIVE="$NONINTERACTIVE" bash "$CLEANUP_SCRIPT"
 }
 
 run_start() {
@@ -182,6 +186,17 @@ fi
 
 print_banner
 ensure_config_migrated
+
+NONINTERACTIVE=false
+ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --yes|--non-interactive|-y) NONINTERACTIVE=true ;;
+        *) ARGS+=("$arg") ;;
+    esac
+done
+
+set -- "${ARGS[@]}"
 
 case "$1" in
     --setup|-s)

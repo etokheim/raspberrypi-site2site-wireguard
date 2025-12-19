@@ -34,8 +34,8 @@ SEO-friendly terms: *Raspberry Pi site-to-site VPN*, *WireGuard gateway*, *home 
      `sudo apt-get update && sudo apt-get upgrade -y`
 2) Get the project  
    ```bash
-   git clone https://github.com/your/repo.git vpn-project
-   cd vpn-project
+   git clone https://github.com/etokheim/raspberrypi-site2site-wireguard.git
+   cd raspberrypi-site2site-wireguard
    ```
 3) Copy your WireGuard peer config to the Pi (e.g., `/home/pi/wg-peer.conf`).
 4) Run the entrypoint (prompts for everything)  

@@ -160,11 +160,15 @@ main() {
     printf "║ %-*.*s ║\n" "$box_w" "$box_w" "• Restore network manager settings (nmcli/dhcpcd) to DHCP"
     echo "╚${border_line}╝"
     echo ""
-    echo -ne "Proceed with cleanup/restore? [Y/n]: "
-    read -r proceed_choice
-    if [[ "$proceed_choice" =~ ^[Nn]$ ]]; then
-        echo "Aborting cleanup by user request."
-        exit 1
+    if [ "${NONINTERACTIVE:-false}" = "true" ]; then
+        echo "Non-interactive mode: proceeding with cleanup."
+    else
+        echo -ne "Proceed with cleanup/restore? [Y/n]: "
+        read -r proceed_choice
+        if [[ "$proceed_choice" =~ ^[Nn]$ ]]; then
+            echo "Aborting cleanup by user request."
+            exit 1
+        fi
     fi
 
     run_step "Stopping WireGuard Service" "systemctl stop wg-quick@wg0; systemctl disable wg-quick@wg0"
@@ -232,13 +236,17 @@ main() {
     
     if [ -f "$CONFIG_FILE" ]; then
         echo ""
-        echo -ne "❓ ${CYAN}Do you want to delete the configuration file ($CONFIG_FILE)? [y/N]${NC} "
-        read -r delete_conf
-        if [[ "$delete_conf" =~ ^[Yy]$ ]]; then
-            rm "$CONFIG_FILE"
-            echo -e "   [${GREEN}Deleted${NC}] $CONFIG_FILE"
+        if [ "${NONINTERACTIVE:-false}" = "true" ]; then
+            echo -e "   [${YELLOW}Kept${NC}] $CONFIG_FILE (non-interactive mode; not deleting)"
         else
-            echo -e "   [${YELLOW}Kept${NC}] $CONFIG_FILE (Useful for re-running setup)"
+            echo -ne "❓ ${CYAN}Do you want to delete the configuration file ($CONFIG_FILE)? [y/N]${NC} "
+            read -r delete_conf
+            if [[ "$delete_conf" =~ ^[Yy]$ ]]; then
+                rm "$CONFIG_FILE"
+                echo -e "   [${GREEN}Deleted${NC}] $CONFIG_FILE"
+            else
+                echo -e "   [${YELLOW}Kept${NC}] $CONFIG_FILE (Useful for re-running setup)"
+            fi
         fi
     fi
 }
