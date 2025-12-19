@@ -745,7 +745,7 @@ main() {
             echo -e "   ${BLUE}ℹ️  To use this interface for the private subnet, the Pi must act as a Wi-Fi Access Point.${NC}"
             echo -e "   ${BLUE}ℹ️  This requires installing 'hostapd' (Host Access Point Daemon).${NC}"
             
-            if dpkg -s hostapd >/dev/null 2>&1; then
+            if is_pkg_installed hostapd; then
                  success "'hostapd' is already installed."
             else
                 echo -ne "❓ ${YELLOW}Do you want to proceed with installing hostapd? [Y/n]${NC} "
