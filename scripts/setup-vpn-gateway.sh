@@ -671,14 +671,17 @@ main() {
     print_header
 
     # --- First prompt: System dependencies (required) ---
-    # Check which packages are missing
+    # Check which packages are missing (must check for "install ok installed" status, not just dpkg -s exit code)
+    is_pkg_installed() {
+        dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"
+    }
     MISSING_PKGS=""
-    if ! dpkg -s wireguard >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS wireguard"; fi
-    if ! dpkg -s dnsmasq >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS dnsmasq"; fi
-    if ! dpkg -s iptables >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS iptables"; fi
-    if ! dpkg -s qrencode >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS qrencode"; fi
-    if ! dpkg -s resolvconf >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS resolvconf"; fi
-    if ! dpkg -s iptables-persistent >/dev/null 2>&1; then MISSING_PKGS="$MISSING_PKGS iptables-persistent"; fi
+    if ! is_pkg_installed wireguard; then MISSING_PKGS="$MISSING_PKGS wireguard"; fi
+    if ! is_pkg_installed dnsmasq; then MISSING_PKGS="$MISSING_PKGS dnsmasq"; fi
+    if ! is_pkg_installed iptables; then MISSING_PKGS="$MISSING_PKGS iptables"; fi
+    if ! is_pkg_installed qrencode; then MISSING_PKGS="$MISSING_PKGS qrencode"; fi
+    if ! is_pkg_installed resolvconf; then MISSING_PKGS="$MISSING_PKGS resolvconf"; fi
+    if ! is_pkg_installed iptables-persistent; then MISSING_PKGS="$MISSING_PKGS iptables-persistent"; fi
 
     if [ -n "$MISSING_PKGS" ]; then
         info "System Dependencies Check"
