@@ -953,6 +953,12 @@ main() {
             # Preseed iptables-persistent to avoid interactive prompts
             echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections 2>/dev/null || true
             echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections 2>/dev/null || true
+            # Also preseed watchdog to avoid prompt loop if it's upgraded/reconfigured
+            echo "watchdog watchdog/run boolean true" | debconf-set-selections 2>/dev/null || true
+            echo "watchdog watchdog/module string bcm2835_wdt" | debconf-set-selections 2>/dev/null || true
+            
+            # Use non-interactive frontend for apt operations
+            export DEBIAN_FRONTEND=noninteractive
             run_step "Installing missing packages" "apt-get install -y $MISSING_PKGS"
         fi
     else
