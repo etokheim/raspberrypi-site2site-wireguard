@@ -839,16 +839,21 @@ main() {
     if ! is_pkg_installed iptables-persistent; then MISSING_PKGS="$MISSING_PKGS iptables-persistent"; fi
 
     if [ -n "$MISSING_PKGS" ]; then
-        info "System Dependencies Check"
-        echo -e "   ${YELLOW}Missing packages:${NC}$MISSING_PKGS"
-        echo -ne "📦 ${YELLOW}Install required system packages?$MISSING_PKGS [Y/n]${NC} "
-        read -r install_choice
-        if [[ "$install_choice" =~ ^[Nn]$ ]]; then
-            error "Package installation is required to proceed. Exiting."
-            exit 1
+        # If using existing config with INSTALL_DEPENDENCIES already set, skip prompt
+        if [ "$USE_EXISTING_CONFIG" = true ] && [ "${INSTALL_DEPENDENCIES:-}" = "true" ]; then
+            info "Will install missing packages:$MISSING_PKGS"
+        else
+            info "System Dependencies Check"
+            echo -e "   ${YELLOW}Missing packages:${NC}$MISSING_PKGS"
+            echo -ne "📦 ${YELLOW}Install required system packages?$MISSING_PKGS [Y/n]${NC} "
+            read -r install_choice
+            if [[ "$install_choice" =~ ^[Nn]$ ]]; then
+                error "Package installation is required to proceed. Exiting."
+                exit 1
+            fi
+            INSTALL_DEPENDENCIES="true"
+            save_config_var "INSTALL_DEPENDENCIES" "true"
         fi
-        INSTALL_DEPENDENCIES="true"
-        save_config_var "INSTALL_DEPENDENCIES" "true"
         echo ""
     else
         INSTALL_DEPENDENCIES="false"
@@ -898,16 +903,23 @@ main() {
         # Check if hostapd is needed for wireless configs (will install later with other deps)
         if [ "$IS_WIRELESS" = "true" ] || [ "$IS_WIRELESS" = true ]; then
             if ! is_pkg_installed hostapd; then
-                info "Wireless LAN requires hostapd (not installed)."
-                echo -ne "❓ ${YELLOW}Install hostapd for Access Point? [Y/n]${NC} "
-                read -r ap_install_choice
-                if [[ "$ap_install_choice" =~ ^[Nn]$ ]]; then
-                    error "Cannot proceed with wireless LAN without hostapd. Exiting."
-                    exit 1
+                # If already confirmed in config, skip prompt
+                if [ "${INSTALL_HOSTAPD:-}" = "true" ]; then
+                    info "Will install hostapd for Access Point."
+                else
+                    info "Wireless LAN requires hostapd (not installed)."
+                    echo -ne "❓ ${YELLOW}Install hostapd for Access Point? [Y/n]${NC} "
+                    read -r ap_install_choice
+                    if [[ "$ap_install_choice" =~ ^[Nn]$ ]]; then
+                        error "Cannot proceed with wireless LAN without hostapd. Exiting."
+                        exit 1
+                    fi
+                    INSTALL_HOSTAPD="true"
+                    save_config_var "INSTALL_HOSTAPD" "true"
                 fi
-                INSTALL_HOSTAPD="true"
             else
                 INSTALL_HOSTAPD="false"
+                save_config_var "INSTALL_HOSTAPD" "false"
             fi
         fi
     else
@@ -924,6 +936,7 @@ main() {
             if is_pkg_installed hostapd; then
                  success "'hostapd' is already installed."
                  INSTALL_HOSTAPD="false"
+                 save_config_var "INSTALL_HOSTAPD" "false"
             else
                 echo -ne "❓ ${YELLOW}Do you want to proceed with installing hostapd? [Y/n]${NC} "
                 read -r ap_install_choice
@@ -932,6 +945,7 @@ main() {
                     exit 1
                 fi
                 INSTALL_HOSTAPD="true"
+                save_config_var "INSTALL_HOSTAPD" "true"
             fi
 
             # Pre-fill SSID from config
