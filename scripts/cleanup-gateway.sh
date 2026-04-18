@@ -265,6 +265,34 @@ cleanup_gateway_nat_rules() {
     fi
 }
 
+restore_wan_dhcp() {
+    local iface="$WAN_IFACE"
+    if [ -z "$iface" ]; then
+        echo "[wan_dhcp] No WAN interface recorded; skipping." >> "$LOG_FILE"
+        return 0
+    fi
+
+    echo "[wan_dhcp] Restoring DHCP on $iface" >> "$LOG_FILE"
+
+    if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager; then
+        local con_name
+        con_name=$(nmcli -t -f NAME,DEVICE connection show | grep ":$iface$" | cut -d: -f1 | head -n1)
+        if [ -n "$con_name" ]; then
+            nmcli con modify "$con_name" \
+                ipv4.addresses "" \
+                ipv4.gateway "" \
+                ipv4.dns "" \
+                ipv4.method auto >> "$LOG_FILE" 2>&1 || true
+            nmcli con up "$con_name" >> "$LOG_FILE" 2>&1 || true
+        fi
+    fi
+
+    if [ -f /etc/dhcpcd.conf ] && grep -q '# VPN-GATEWAY-WAN-START' /etc/dhcpcd.conf; then
+        sed -i '/# VPN-GATEWAY-WAN-START/,/# VPN-GATEWAY-WAN-END/d' /etc/dhcpcd.conf
+        systemctl restart dhcpcd >> "$LOG_FILE" 2>&1 || true
+    fi
+}
+
 cleanup_wan_firewall_rules() {
     local wan_iface="$WAN_IFACE"
     local lan_iface="$LAN_IFACE"
@@ -358,6 +386,9 @@ main() {
     
     progress_add_step "Remove NAT/forward rules"
     progress_add_step "Remove LAN service" "(wireless IP persistence)"
+    if [ "${WAN_STATIC_IP_ENABLED:-false}" = "true" ]; then
+        progress_add_step "Restore WAN DHCP" "($WAN_IFACE)"
+    fi
     progress_add_step "Disable IP forwarding"
     
     if [ "${AUTO_UPDATES_ENABLED:-false}" = "true" ]; then
@@ -417,6 +448,10 @@ main() {
     progress_run_step "Remove NAT/forward rules" "cleanup_gateway_nat_rules"
 
     progress_run_step "Remove LAN service" "remove_lan_service"
+
+    if [ "${WAN_STATIC_IP_ENABLED:-false}" = "true" ]; then
+        progress_run_step "Restore WAN DHCP" "restore_wan_dhcp"
+    fi
 
     progress_run_step "Disable IP forwarding" "rm -f /etc/sysctl.d/99-vpn-gateway.conf && sysctl --system >/dev/null 2>&1"
 

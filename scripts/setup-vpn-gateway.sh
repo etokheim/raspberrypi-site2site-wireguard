@@ -63,6 +63,11 @@ show_existing_config() {
     printf "${CYAN}│${NC}   ${DIM}%-$((content_w - 2))s${NC} ${CYAN}│${NC}\n" "$config_display"
     echo -e "${CYAN}├${border}┤${NC}"
     printf "${CYAN}│${NC}  WAN interface:   ${BOLD}%-${field_w}s${NC} ${CYAN}│${NC}\n" "${WAN_IFACE:-<unset>}"
+    if [ "${WAN_STATIC_IP_ENABLED:-false}" = "true" ]; then
+        local wan_static_display="${WAN_STATIC_IP:-<unset>}/${WAN_STATIC_PREFIX:-24}"
+        [ -n "${WAN_STATIC_GATEWAY:-}" ] && wan_static_display="$wan_static_display via ${WAN_STATIC_GATEWAY}"
+        printf "${CYAN}│${NC}  WAN static IP:   ${BOLD}%-${field_w}s${NC} ${CYAN}│${NC}\n" "$wan_static_display"
+    fi
     printf "${CYAN}│${NC}  LAN interface:   ${BOLD}%-${field_w}s${NC} ${CYAN}│${NC}\n" "${LAN_IFACE:-<unset>}"
     printf "${CYAN}│${NC}  LAN CIDR:        ${BOLD}%-${field_w}s${NC} ${CYAN}│${NC}\n" "${LAN_CIDR:-<unset>}"
     printf "${CYAN}│${NC}  WireGuard:       ${DIM}%-${field_w}s${NC} ${CYAN}│${NC}\n" "$wg_display"
@@ -688,6 +693,244 @@ ensure_nat_rules() {
     fi
 }
 
+# --- WAN Static IP helpers ---
+
+# Populate WAN_CURRENT_IP / WAN_CURRENT_PREFIX / WAN_GATEWAY for the given iface
+detect_wan_network() {
+    local iface="$1"
+    WAN_CURRENT_IP=""
+    WAN_CURRENT_PREFIX=""
+    WAN_GATEWAY=""
+
+    local ip_line
+    ip_line=$(ip -o -4 addr show dev "$iface" 2>/dev/null | awk '{print $4}' | head -n1)
+    if [ -n "$ip_line" ]; then
+        WAN_CURRENT_IP="${ip_line%/*}"
+        WAN_CURRENT_PREFIX="${ip_line#*/}"
+    fi
+
+    WAN_GATEWAY=$(ip -o -4 route show default dev "$iface" 2>/dev/null | awk '{print $3}' | head -n1)
+    if [ -z "$WAN_GATEWAY" ]; then
+        WAN_GATEWAY=$(ip -o -4 route show default 2>/dev/null | awk '{print $3}' | head -n1)
+    fi
+}
+
+# Suggest the second IP in the network range (e.g. router .1 -> suggest .2)
+# Falls back to .3 if the router already occupies .2.
+suggest_wan_static_ip() {
+    local gateway="$1"
+    local fallback_ip="$2"
+    local anchor="$gateway"
+    [ -z "$anchor" ] && anchor="$fallback_ip"
+    if [ -z "$anchor" ]; then
+        echo ""
+        return
+    fi
+
+    local prefix last
+    prefix=$(echo "$anchor" | awk -F'.' '{print $1"."$2"."$3}')
+    last=$(echo "$anchor" | awk -F'.' '{print $4}')
+    if ! echo "$prefix" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+        echo ""
+        return
+    fi
+
+    local suggestion="${prefix}.2"
+    if [ "$last" = "2" ]; then
+        suggestion="${prefix}.3"
+    fi
+    echo "$suggestion"
+}
+
+# Basic dotted-quad validation
+is_valid_ipv4() {
+    echo "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || return 1
+    local oct
+    for oct in $(echo "$1" | tr '.' ' '); do
+        [ "$oct" -le 255 ] || return 1
+    done
+    return 0
+}
+
+# Does the WAN interface already have a manually-configured static address?
+wan_has_static_ip() {
+    local iface="$1"
+    if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager; then
+        local con_name method
+        con_name=$(nmcli -t -f NAME,DEVICE connection show | grep ":$iface$" | cut -d: -f1 | head -n1)
+        if [ -n "$con_name" ]; then
+            method=$(nmcli -t -f ipv4.method connection show "$con_name" 2>/dev/null | cut -d: -f2)
+            [ "$method" = "manual" ] && return 0
+        fi
+    fi
+    if [ -f /etc/dhcpcd.conf ] && \
+       awk -v iface="$iface" '
+           $1=="interface" && $2==iface {found=1; next}
+           /^interface[[:space:]]/ && found {found=0}
+           found && /static[[:space:]]+ip_address/ {print; exit}
+       ' /etc/dhcpcd.conf | grep -q .; then
+        return 0
+    fi
+    return 1
+}
+
+do_configure_wan_static_ip() {
+    local iface="$WAN_IFACE"
+    local ip="$WAN_STATIC_IP"
+    local prefix="$WAN_STATIC_PREFIX"
+    local gw="$WAN_STATIC_GATEWAY"
+    local dns="$WAN_STATIC_DNS"
+
+    if [ -z "$iface" ] || [ -z "$ip" ] || [ -z "$prefix" ]; then
+        echo "[wan_static] Missing iface/ip/prefix; skipping" >> "$LOG_FILE"
+        return 0
+    fi
+
+    if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager; then
+        local con_name
+        con_name=$(nmcli -t -f NAME,DEVICE connection show | grep ":$iface$" | cut -d: -f1 | head -n1)
+        if [ -z "$con_name" ]; then
+            con_name="Wired connection $iface"
+            nmcli con add type ethernet ifname "$iface" con-name "$con_name" >> "$LOG_FILE" 2>&1 || true
+        fi
+        local dns_csv="${dns// /,}"
+        nmcli con modify "$con_name" \
+            ipv4.addresses "$ip/$prefix" \
+            ipv4.gateway "${gw:-}" \
+            ipv4.dns "$dns_csv" \
+            ipv4.method manual >> "$LOG_FILE" 2>&1
+        nmcli con up "$con_name" >> "$LOG_FILE" 2>&1 || true
+    elif [ -f /etc/dhcpcd.conf ]; then
+        sed -i '/# VPN-GATEWAY-WAN-START/,/# VPN-GATEWAY-WAN-END/d' /etc/dhcpcd.conf
+        {
+            echo '# VPN-GATEWAY-WAN-START'
+            echo "interface $iface"
+            echo "static ip_address=$ip/$prefix"
+            [ -n "$gw" ] && echo "static routers=$gw"
+            [ -n "$dns" ] && echo "static domain_name_servers=$dns"
+            echo '# VPN-GATEWAY-WAN-END'
+        } >> /etc/dhcpcd.conf
+        systemctl restart dhcpcd >> "$LOG_FILE" 2>&1 || true
+    else
+        ip addr flush dev "$iface" >> "$LOG_FILE" 2>&1 || true
+        ip addr add "$ip/$prefix" dev "$iface" >> "$LOG_FILE" 2>&1 || true
+        ip link set "$iface" up >> "$LOG_FILE" 2>&1 || true
+        [ -n "$gw" ] && ip route add default via "$gw" >> "$LOG_FILE" 2>&1 || true
+    fi
+}
+
+# Interactive prompt: asks whether to configure a static WAN IP and collects fields.
+# Sets WAN_STATIC_IP_ENABLED and (if enabled) WAN_STATIC_IP/PREFIX/GATEWAY/DNS.
+prompt_wan_static_ip() {
+    detect_wan_network "$WAN_IFACE"
+
+    local already_static=false
+    if wan_has_static_ip "$WAN_IFACE"; then
+        already_static=true
+    fi
+
+    echo ""
+    info "WAN Static IP (optional, recommended)"
+    echo -e "   ${BLUE}👉 A static WAN IP ensures the Pi is always reachable at a predictable${NC}"
+    echo -e "   ${BLUE}   address from the upstream network (SSH, diagnostics, port forwards).${NC}"
+    if [ -n "$WAN_CURRENT_IP" ]; then
+        echo -e "   ${DIM}Current IP on $WAN_IFACE: ${WAN_CURRENT_IP}/${WAN_CURRENT_PREFIX}${NC}"
+    fi
+    if [ -n "$WAN_GATEWAY" ]; then
+        echo -e "   ${DIM}Detected gateway:        ${WAN_GATEWAY}${NC}"
+    fi
+    if [ "$already_static" = true ]; then
+        echo -e "   ${GREEN}✔ $WAN_IFACE already appears to have a static configuration.${NC}"
+    fi
+
+    local default_yes=true
+    [ "$already_static" = true ] && default_yes=false
+
+    local prompt
+    if [ "$default_yes" = true ]; then
+        prompt="🔒 Configure a static IP on $WAN_IFACE? [Y/n]"
+    else
+        prompt="🔒 Reconfigure static IP on $WAN_IFACE? [y/N]"
+    fi
+    echo -ne "   $prompt: "
+    read -r answer < /dev/tty
+
+    local enabled="false"
+    if [ "$default_yes" = true ]; then
+        [[ "$answer" =~ ^[Nn]$ ]] || enabled="true"
+    else
+        [[ "$answer" =~ ^[Yy]$ ]] && enabled="true"
+    fi
+
+    WAN_STATIC_IP_ENABLED="$enabled"
+    save_config_var "WAN_STATIC_IP_ENABLED" "$enabled"
+
+    if [ "$enabled" != "true" ]; then
+        info "Skipping WAN static IP configuration (will leave as-is)."
+        return
+    fi
+
+    local suggestion
+    suggestion=$(suggest_wan_static_ip "$WAN_GATEWAY" "$WAN_CURRENT_IP")
+
+    local default_ip="${WAN_STATIC_IP:-$suggestion}"
+    while true; do
+        if [ -n "$default_ip" ]; then
+            echo -ne "   📌 Static IP [default: ${BOLD}${YELLOW}${default_ip}${NC}]: "
+        else
+            echo -ne "   📌 Static IP: "
+        fi
+        read -r user_ip < /dev/tty
+        [ -z "$user_ip" ] && user_ip="$default_ip"
+        if is_valid_ipv4 "$user_ip"; then
+            WAN_STATIC_IP="$user_ip"
+            break
+        fi
+        warn "Not a valid IPv4 address: $user_ip"
+    done
+
+    local default_prefix="${WAN_STATIC_PREFIX:-${WAN_CURRENT_PREFIX:-24}}"
+    while true; do
+        echo -ne "   📐 Prefix length [default: ${BOLD}${YELLOW}${default_prefix}${NC}]: "
+        read -r user_prefix < /dev/tty
+        [ -z "$user_prefix" ] && user_prefix="$default_prefix"
+        if echo "$user_prefix" | grep -Eq '^[0-9]+$' && [ "$user_prefix" -ge 8 ] && [ "$user_prefix" -le 32 ]; then
+            WAN_STATIC_PREFIX="$user_prefix"
+            break
+        fi
+        warn "Prefix must be an integer between 8 and 32."
+    done
+
+    local default_gateway="${WAN_STATIC_GATEWAY:-${WAN_GATEWAY}}"
+    while true; do
+        if [ -n "$default_gateway" ]; then
+            echo -ne "   🧭 Gateway [default: ${BOLD}${YELLOW}${default_gateway}${NC}]: "
+        else
+            echo -ne "   🧭 Gateway: "
+        fi
+        read -r user_gateway < /dev/tty
+        [ -z "$user_gateway" ] && user_gateway="$default_gateway"
+        if [ -z "$user_gateway" ] || is_valid_ipv4 "$user_gateway"; then
+            WAN_STATIC_GATEWAY="$user_gateway"
+            break
+        fi
+        warn "Not a valid IPv4 address: $user_gateway"
+    done
+
+    local default_dns="${WAN_STATIC_DNS:-1.1.1.1 8.8.8.8}"
+    echo -ne "   🌐 DNS servers (space-separated) [default: ${BOLD}${YELLOW}${default_dns}${NC}]: "
+    read -r user_dns < /dev/tty
+    [ -z "$user_dns" ] && user_dns="$default_dns"
+    WAN_STATIC_DNS="$user_dns"
+
+    save_config_var "WAN_STATIC_IP" "$WAN_STATIC_IP"
+    save_config_var "WAN_STATIC_PREFIX" "$WAN_STATIC_PREFIX"
+    save_config_var "WAN_STATIC_GATEWAY" "$WAN_STATIC_GATEWAY"
+    save_config_var "WAN_STATIC_DNS" "$WAN_STATIC_DNS"
+
+    success "Static WAN IP: $WAN_STATIC_IP/$WAN_STATIC_PREFIX via ${WAN_STATIC_GATEWAY:-<none>}"
+}
+
 ensure_wan_firewall_rules() {
     echo "[wan_firewall] Applying hardened INPUT rules for WAN=$WAN_IFACE" >> "$LOG_FILE"
     local ssh_port="${SSH_PORT:-22}"
@@ -1140,7 +1383,16 @@ main() {
         FIREWALL_ENABLED="${FIREWALL_ENABLED:-true}"
         AUTO_UPDATES_ENABLED="${AUTO_UPDATES_ENABLED:-false}"
         WATCHDOG_ENABLED="${WATCHDOG_ENABLED:-false}"
+        WAN_STATIC_IP_ENABLED="${WAN_STATIC_IP_ENABLED:-false}"
     else
+        # Optional: configure a static IP on the WAN interface (recommended)
+        if [ "$NONINTERACTIVE" = "true" ]; then
+            WAN_STATIC_IP_ENABLED="${WAN_STATIC_IP_ENABLED:-false}"
+            save_config_var "WAN_STATIC_IP_ENABLED" "$WAN_STATIC_IP_ENABLED"
+        else
+            prompt_wan_static_ip
+        fi
+
         # Ask whether to configure firewall (WAN hardening)
         echo ""
         echo -ne "🛡️  Configure WAN firewall (allow SSH + WireGuard, drop other inbound)? [Y/n]: "
@@ -1194,6 +1446,9 @@ main() {
     
     progress_add_step "Install WireGuard config" "→ $WG_CONF_DEST"
     progress_add_step "Enable IP forwarding"
+    if [ "${WAN_STATIC_IP_ENABLED:-false}" = "true" ]; then
+        progress_add_step "Configure WAN static IP" "$WAN_IFACE = ${WAN_STATIC_IP}/${WAN_STATIC_PREFIX}"
+    fi
     progress_add_step "Configure LAN interface" "$LAN_IFACE = $LAN_GATEWAY"
     progress_add_step "Configure DHCP server" "(dnsmasq)"
     
@@ -1254,7 +1509,12 @@ main() {
     
     # Enable IP forwarding
     progress_run_step "Enable IP forwarding" "echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-vpn-gateway.conf && sysctl -p /etc/sysctl.d/99-vpn-gateway.conf"
-    
+
+    # Configure WAN static IP (optional)
+    if [ "${WAN_STATIC_IP_ENABLED:-false}" = "true" ]; then
+        progress_run_step "Configure WAN static IP" "do_configure_wan_static_ip"
+    fi
+
     # Configure LAN interface
     progress_run_step "Configure LAN interface" "
         ip addr flush dev '$LAN_IFACE' 2>/dev/null || true

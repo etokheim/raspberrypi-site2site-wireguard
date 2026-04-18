@@ -45,6 +45,7 @@ Build a **plug-and-play site-to-site VPN** with a single **Raspberry Pi** and **
    - Select WAN and LAN interfaces (Enter accepts defaults).
    - If LAN is Wi‑Fi (e.g., `wlan0`), enter SSID/password; hostapd is auto-configured.
    - Provide the WireGuard config path (tab completion enabled).
+   - Opt into a **static WAN IP** (recommended): the script detects the upstream router and suggests the second IP in the subnet (e.g. router `192.168.1.1` → `192.168.1.2`). You can override IP, prefix, gateway and DNS.
    - Opt into WAN firewall hardening (allow SSH + WireGuard, drop other inbound).
    - Opt into automatic security updates (nightly at 03:00).
    - Opt into hardware watchdog (auto-reboot on system hang).
@@ -73,7 +74,8 @@ sudo ./gateway-manage-or-setup.sh [OPTIONS]
 - **WireGuard** at `/etc/wireguard/wg0.conf`, `wg-quick@wg0` enabled, PostUp/PostDown iptables rules.
 - **Routing/NAT**: iptables forwarding and MASQUERADE from LAN → `wg0` (WAN MASQUERADE as secondary).
 - **DHCP/DNS**: dnsmasq on the LAN/AP subnet; DNS forwarded via WireGuard tunnel.
-- **Static IP**: gateway `10.10.10.1/24` on the LAN/AP interface.
+- **Static IP (LAN)**: gateway `10.10.10.1/24` on the LAN/AP interface.
+- **Static IP (WAN, optional)**: fixed address on the upstream interface (suggested as the second IP in the router's subnet, e.g. `192.168.1.2` if the router is `192.168.1.1`).
 - **Access Point (optional)**: hostapd with your SSID/password when LAN is wireless.
 - **Firewall (optional)**: hardened INPUT rules on WAN (allows SSH, WireGuard; drops other inbound).
 - **Service watchdog**: systemd restart policies for dnsmasq, WireGuard, hostapd (auto-restart on crash).
@@ -118,7 +120,7 @@ Cleanup will:
 - Stop/disable WireGuard, dnsmasq, hostapd (if running)
 - Remove WAN firewall rules (if enabled)
 - Remove NAT/forward iptables rules; disable IP forwarding
-- Restore NetworkManager/dhcpcd to DHCP
+- Restore NetworkManager/dhcpcd to DHCP (on both LAN and WAN, if a static WAN IP was configured)
 - Remove watchdog configurations
 - Remove unattended-upgrades config (if auto-updates were enabled)
 - Optionally delete the saved config file
