@@ -155,6 +155,40 @@ detect_pi_connect_active() {
     return 1
 }
 
+# Extract every AllowedIPs entry from the WireGuard config that is NOT a
+# default-route catch-all. These are the "home" subnets that must be
+# explicitly routable via wg0 in BOTH the main table (so the Pi itself can
+# reach them) and the wgvpn table (so LAN clients also reach them).
+#
+# Echoes one CIDR per line. Empty output is valid (no specific subnets).
+extract_home_subnets() {
+    local cfg="$1"
+    [ -f "$cfg" ] || return 0
+    awk '
+        /^[[:space:]]*AllowedIPs[[:space:]]*=/ {
+            sub(/^[^=]*=[[:space:]]*/, "", $0)
+            n = split($0, parts, ",")
+            for (i = 1; i <= n; i++) {
+                gsub(/[[:space:]]/, "", parts[i])
+                if (parts[i] == "" \
+                    || parts[i] == "0.0.0.0/0" \
+                    || parts[i] == "::/0" \
+                    || parts[i] == "0.0.0.0/1" \
+                    || parts[i] == "128.0.0.0/1") continue
+                print parts[i]
+            }
+        }
+    ' "$cfg" | sort -u
+}
+
+# Decide if a CIDR is IPv6 (contains ":") or IPv4. Echoes "6" or "4".
+cidr_family() {
+    case "$1" in
+        *:*) echo 6 ;;
+        *)   echo 4 ;;
+    esac
+}
+
 # Detect default-route AllowedIPs in the user's WireGuard config.
 # Returns 0 (and echoes a short reason) if the config will redirect the Pi's
 # entire outbound traffic into the tunnel, which is the single most common
@@ -405,23 +439,137 @@ is_wg_active() {
     return 1
 }
 
+# Numeric routing table + ip rule priority used by Pi-bypass mode.
+# Kept as constants here AND referenced from cleanup-gateway.sh - keep in sync.
+WG_BYPASS_TABLE_ID=200
+WG_BYPASS_RULE_PRIO=100
+
+# Build the iptables FORWARD/MASQUERADE Up/Down commands shared by both modes.
+# Echoes one command per line.
+_wg_iptables_up_cmds() {
+    cat <<EOF
+iptables -C FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT
+iptables -C FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -t nat -C POSTROUTING -o wg0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE
+EOF
+}
+
+_wg_iptables_down_cmds() {
+    cat <<EOF
+iptables -D FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+iptables -t nat -D POSTROUTING -o wg0 -j MASQUERADE 2>/dev/null || true
+EOF
+}
+
+# Build PostUp/PostDown commands for Pi-bypass routing. Each command runs
+# under wg-quick's `set -e` semantics, so anything that may legitimately
+# already exist must be guarded with `|| true` or a `-C` precheck.
+#
+# Routing model:
+#   - main table: default via WAN gw (untouched), $home_subnets dev wg0
+#     (so the Pi itself can reach the home network via the tunnel)
+#   - table $WG_BYPASS_TABLE_ID: default dev wg0, $home_subnets dev wg0
+#   - ip rule: forwarded packets (iif=$LAN_IFACE) -> table $WG_BYPASS_TABLE_ID
+_wg_pi_bypass_up_cmds() {
+    local v4="$1" v6="$2"
+    local tbl="$WG_BYPASS_TABLE_ID" prio="$WG_BYPASS_RULE_PRIO"
+    local s
+    echo "ip route replace default dev %i table $tbl"
+    for s in $v4; do
+        echo "ip route replace $s dev %i"
+        echo "ip route replace $s dev %i table $tbl"
+    done
+    echo "(ip rule list | grep -q 'iif $LAN_IFACE lookup $tbl') || ip rule add iif $LAN_IFACE lookup $tbl priority $prio"
+    if [ -n "$v6" ]; then
+        echo "ip -6 route replace ::/0 dev %i table $tbl"
+        for s in $v6; do
+            echo "ip -6 route replace $s dev %i"
+            echo "ip -6 route replace $s dev %i table $tbl"
+        done
+        echo "(ip -6 rule list | grep -q 'iif $LAN_IFACE lookup $tbl') || ip -6 rule add iif $LAN_IFACE lookup $tbl priority $prio"
+    fi
+}
+
+_wg_pi_bypass_down_cmds() {
+    local v4="$1" v6="$2"
+    local tbl="$WG_BYPASS_TABLE_ID" prio="$WG_BYPASS_RULE_PRIO"
+    local s
+    if [ -n "$v6" ]; then
+        echo "ip -6 rule del iif $LAN_IFACE lookup $tbl priority $prio 2>/dev/null || true"
+        for s in $v6; do
+            echo "ip -6 route del $s dev %i 2>/dev/null || true"
+        done
+        echo "ip -6 route flush table $tbl 2>/dev/null || true"
+    fi
+    echo "ip rule del iif $LAN_IFACE lookup $tbl priority $prio 2>/dev/null || true"
+    for s in $v4; do
+        echo "ip route del $s dev %i 2>/dev/null || true"
+    done
+    echo "ip route flush table $tbl 2>/dev/null || true"
+}
+
+# Inject PostUp/PostDown lines (and Table = off when Pi-bypass is on) into the
+# user's wg0.conf. Always strips any prior PostUp / PostDown / Table lines we
+# may have written in a previous run, so re-runs converge on the chosen mode.
 do_configure_wg_firewall_rules() {
     if ! grep -q '\[Interface\]' "$WG_CONF_DEST"; then
         echo "ERROR: No [Interface] section found in $WG_CONF_DEST" >> "$LOG_FILE"
         return 1
     fi
 
-    # WireGuard PostUp/PostDown handle ONLY rules that depend on the wg0 interface
-    # existing. WAN MASQUERADE must NOT be tied to wg0 lifecycle - if wg0 flaps,
-    # LAN clients still need NAT to reach the upstream network. WAN MASQUERADE is
-    # persisted independently via ensure_nat_rules() + netfilter-persistent.
-    local POST_UP="PostUp = iptables -C FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT; iptables -C FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -C POSTROUTING -o wg0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE"
-    local POST_DOWN="PostDown = iptables -D FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; iptables -t nat -D POSTROUTING -o wg0 -j MASQUERADE 2>/dev/null || true"
+    # Always strip previously-injected lines first (idempotent re-run).
+    sed -i '/^PostUp = /d' "$WG_CONF_DEST"
+    sed -i '/^PostDown = /d' "$WG_CONF_DEST"
+    sed -i '/^Table = /d'   "$WG_CONF_DEST"
 
-    sed -i '/^PostUp =/d' "$WG_CONF_DEST"
-    sed -i '/^PostDown =/d' "$WG_CONF_DEST"
+    local pi_bypass="false"
+    local up_block down_block
+    if [ "${PI_BYPASS_ROUTING:-false}" = "true" ]; then
+        pi_bypass="true"
+        # Split AllowedIPs home subnets into IPv4 / IPv6 buckets.
+        local home_v4="" home_v6=""
+        while IFS= read -r cidr; do
+            [ -z "$cidr" ] && continue
+            if [ "$(cidr_family "$cidr")" = "6" ]; then
+                home_v6="${home_v6}${home_v6:+ }$cidr"
+            else
+                home_v4="${home_v4}${home_v4:+ }$cidr"
+            fi
+        done < <(extract_home_subnets "$WG_CONF_DEST")
 
-    awk -v up="$POST_UP" -v down="$POST_DOWN" '/\[Interface\]/ { print; print up; print down; next } 1' "$WG_CONF_DEST" > "${WG_CONF_DEST}.tmp" && mv "${WG_CONF_DEST}.tmp" "$WG_CONF_DEST"
+        echo "[wg] Pi-bypass routing enabled (table=$WG_BYPASS_TABLE_ID prio=$WG_BYPASS_RULE_PRIO v4='$home_v4' v6='$home_v6')" >> "$LOG_FILE"
+
+        up_block=$( { _wg_pi_bypass_up_cmds   "$home_v4" "$home_v6"; _wg_iptables_up_cmds;   } )
+        down_block=$( { _wg_iptables_down_cmds; _wg_pi_bypass_down_cmds "$home_v4" "$home_v6"; } )
+    else
+        echo "[wg] Pi-bypass routing disabled (legacy mode); wg-quick manages routes" >> "$LOG_FILE"
+        up_block=$(_wg_iptables_up_cmds)
+        down_block=$(_wg_iptables_down_cmds)
+    fi
+
+    # Prefix each non-empty command line with "PostUp = " / "PostDown = ".
+    local up_lines down_lines
+    up_lines=$(printf '%s\n'   "$up_block"   | sed -e '/^[[:space:]]*$/d' -e 's|^|PostUp = |')
+    down_lines=$(printf '%s\n' "$down_block" | sed -e '/^[[:space:]]*$/d' -e 's|^|PostDown = |')
+
+    # Rewrite wg0.conf: copy lines through, and right after the [Interface]
+    # header insert (a) Table = off when Pi-bypass is on, (b) all PostUp lines,
+    # (c) all PostDown lines. Done in plain bash to avoid awk's -v newline limit.
+    local tmp_file="${WG_CONF_DEST}.tmp" inserted="false"
+    {
+        while IFS= read -r line || [ -n "$line" ]; do
+            printf '%s\n' "$line"
+            if [ "$inserted" = "false" ] && [[ "$line" =~ ^\[Interface\][[:space:]]*$ ]]; then
+                if [ "$pi_bypass" = "true" ]; then
+                    printf 'Table = off\n'
+                fi
+                printf '%s\n' "$up_lines"
+                printf '%s\n' "$down_lines"
+                inserted="true"
+            fi
+        done < "$WG_CONF_DEST"
+    } > "$tmp_file" && mv "$tmp_file" "$WG_CONF_DEST"
 }
 
 do_start_wireguard() {
@@ -1027,6 +1175,97 @@ do_configure_wan_static_ip() {
 
 # Interactive prompt: asks whether to configure a static WAN IP and collects fields.
 # Sets WAN_STATIC_IP_ENABLED and (if enabled) WAN_STATIC_IP/PREFIX/GATEWAY/DNS.
+# Ask the operator whether to enable Pi-bypass routing (forwarded LAN traffic
+# uses wg0; the Pi's own outbound stays on WAN). Persists PI_BYPASS_ROUTING.
+#
+# This is the recommended mode and the only one that keeps remote management
+# (SSH-over-Internet, Pi Connect, apt updates) working when the user's
+# wg0.conf has AllowedIPs = 0.0.0.0/0. We only enable it after explicit
+# consent because doing so rewrites /etc/wireguard/wg0.conf to set
+# `Table = off` and adds policy-routing PostUp/PostDown lines.
+prompt_pi_bypass_routing() {
+    local has_default_route=""
+    if [ -n "${WG_CONF_SRC:-}" ]; then
+        has_default_route=$(detect_wg_default_route "$WG_CONF_SRC" 2>/dev/null || true)
+    fi
+
+    echo ""
+    info "Pi-bypass routing (RECOMMENDED)"
+    echo -e "   ${BLUE}This routes forwarded LAN client traffic through the VPN tunnel,${NC}"
+    echo -e "   ${BLUE}while keeping the Pi's OWN outbound traffic on the WAN:${NC}"
+    echo -e "     ${DIM}LAN clients      -> wg0 (full-tunnel, kill-switch when wg0 is down)${NC}"
+    echo -e "     ${DIM}Pi (apt, Pi Connect, NTP, DNS, WG handshake)  -> WAN (always)${NC}"
+    echo ""
+    if [ -n "$has_default_route" ]; then
+        echo -e "   ${YELLOW}Your wg0.conf has $has_default_route in AllowedIPs.${NC}"
+        echo -e "   ${YELLOW}Without Pi-bypass, starting wg0 will route ALL the Pi's outbound${NC}"
+        echo -e "   ${YELLOW}traffic into the tunnel. If your home peer does not NAT the Pi to${NC}"
+        echo -e "   ${YELLOW}the Internet, the Pi will instantly lose Pi Connect, apt, and any${NC}"
+        echo -e "   ${YELLOW}SSH session that comes in via its public IP. This is exactly the${NC}"
+        echo -e "   ${YELLOW}lockout class of issue that prompted this option.${NC}"
+        echo ""
+    fi
+    echo -e "   ${DIM}Enabling rewrites /etc/wireguard/wg0.conf to set Table=off and adds${NC}"
+    echo -e "   ${DIM}policy-routing PostUp/PostDown. Disabling leaves wg0.conf alone.${NC}"
+
+    # Default behaviour:
+    #   - Saved value present  -> keep it (interactive AND non-interactive).
+    #   - Interactive + no value -> default Y (recommended), but always ask.
+    #   - Non-interactive + no value (--yes on a legacy install) -> default
+    #     OFF. We do not rewrite an existing wg0.conf without explicit consent.
+    local default
+    if [ -n "${PI_BYPASS_ROUTING:-}" ]; then
+        default="$PI_BYPASS_ROUTING"
+    elif [ "$NONINTERACTIVE" = "true" ]; then
+        default="false"
+    else
+        default="true"
+    fi
+
+    local prompt_label
+    if [ "$default" = "true" ]; then
+        prompt_label="🛡️  Enable Pi-bypass routing? [Y/n]"
+    else
+        prompt_label="🛡️  Enable Pi-bypass routing? [y/N]"
+    fi
+
+    if [ "$NONINTERACTIVE" = "true" ]; then
+        if [ -n "${PI_BYPASS_ROUTING:-}" ]; then
+            info "Non-interactive: Pi-bypass routing = $default (from saved config)."
+        else
+            warn "Non-interactive on a legacy install: Pi-bypass routing left OFF."
+            warn "Re-run setup interactively to enable it (recommended)."
+        fi
+        PI_BYPASS_ROUTING="$default"
+        save_config_var "PI_BYPASS_ROUTING" "$PI_BYPASS_ROUTING"
+        return
+    fi
+
+    echo ""
+    echo -ne "   $prompt_label: "
+    local answer
+    read -r answer < /dev/tty
+
+    local enabled="$default"
+    if [ "$default" = "true" ]; then
+        [[ "$answer" =~ ^[Nn]$ ]] && enabled="false"
+    else
+        [[ "$answer" =~ ^[Yy]$ ]] && enabled="true"
+    fi
+
+    PI_BYPASS_ROUTING="$enabled"
+    save_config_var "PI_BYPASS_ROUTING" "$PI_BYPASS_ROUTING"
+
+    if [ "$enabled" = "true" ]; then
+        success "Pi-bypass routing will be enabled."
+    else
+        warn "Pi-bypass routing DISABLED. wg0.conf will not be modified for routing."
+        if [ -n "$has_default_route" ]; then
+            warn "Default-route AllowedIPs will hijack the Pi's outbound traffic when wg0 comes up."
+        fi
+    fi
+}
+
 prompt_wan_static_ip() {
     detect_wan_network "$WAN_IFACE"
 
@@ -1488,7 +1727,7 @@ prompt_ssh_safety_warnings() {
         fi
     fi
 
-    if [ -n "$wg_default_route" ]; then
+    if [ -n "$wg_default_route" ] && [ "${PI_BYPASS_ROUTING:-false}" != "true" ]; then
         risk=true
         risk_lines+=("• WireGuard config has $wg_default_route in AllowedIPs.")
         risk_lines+=("  Starting wg0 will route ALL the Pi's outbound traffic through the tunnel.")
@@ -1500,9 +1739,16 @@ prompt_ssh_safety_warnings() {
             risk_lines+=("  the public IP, Pi Connect, ngrok, etc.) WILL be dropped unless your peer")
             risk_lines+=("  NATs the Pi's traffic out to the Internet.")
         fi
+        risk_lines+=("  Tip: enable Pi-bypass routing on the previous prompt to eliminate this risk.")
         if [ -z "$SSH_IFACE" ] && [ -z "$pi_connect_active" ]; then
             risk_lines+=("  (You appear to be on a local console - no immediate action needed.)")
         fi
+    elif [ -n "$wg_default_route" ] && [ "${PI_BYPASS_ROUTING:-false}" = "true" ]; then
+        # Default-route AllowedIPs is fine when Pi-bypass routing keeps the
+        # Pi's own traffic on WAN. Surface it as informational, not a risk.
+        echo ""
+        info "WireGuard config has $wg_default_route in AllowedIPs, but Pi-bypass"
+        info "routing is enabled - the Pi's own traffic stays on WAN. Safe."
     fi
 
     # Pi Connect on its own - no WG default route, no SSH session - is not a
@@ -1874,6 +2120,13 @@ main() {
         AUTO_UPDATES_ENABLED="${AUTO_UPDATES_ENABLED:-false}"
         WATCHDOG_ENABLED="${WATCHDOG_ENABLED:-false}"
         WAN_STATIC_IP_ENABLED="${WAN_STATIC_IP_ENABLED:-false}"
+        # PI_BYPASS_ROUTING may be unset on legacy installs; ask explicitly the
+        # first time so we never rewrite an existing wg0.conf without consent.
+        if [ -z "${PI_BYPASS_ROUTING:-}" ]; then
+            prompt_pi_bypass_routing
+        else
+            info "Pi-bypass routing: ${PI_BYPASS_ROUTING} (from saved config)."
+        fi
     else
         # Optional: configure a static IP on the WAN interface (recommended)
         if [ "$NONINTERACTIVE" = "true" ]; then
@@ -1914,6 +2167,10 @@ main() {
             WATCHDOG_ENABLED="true"
         fi
         save_config_var "WATCHDOG_ENABLED" "$WATCHDOG_ENABLED"
+
+        # Pi-bypass routing: forwarded LAN -> wg0, Pi-local -> WAN.
+        # Default Yes (strongly recommended); persisted so re-runs reuse it.
+        prompt_pi_bypass_routing
     fi
 
     # SSH-safety check is the LAST input-phase step. After this, no prompts

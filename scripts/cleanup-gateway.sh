@@ -245,7 +245,27 @@ cleanup_dns_resolvconf() {
 cleanup_gateway_nat_rules() {
     local lan_iface="$LAN_IFACE"
     local wan_iface="$WAN_IFACE"
-    
+
+    # Pi-bypass routing artifacts (best-effort; harmless if already removed).
+    # Must mirror the constants in scripts/setup-vpn-gateway.sh.
+    local bypass_table="${WG_BYPASS_TABLE_ID:-200}"
+    local bypass_prio="${WG_BYPASS_RULE_PRIO:-100}"
+
+    if [ -n "$lan_iface" ]; then
+        # Loop until no matching ip rule remains (handles accidental duplicates).
+        local i
+        for i in 1 2 3 4 5; do
+            ip rule del iif "$lan_iface" lookup "$bypass_table" priority "$bypass_prio" \
+                >> "$LOG_FILE" 2>&1 || break
+        done
+        for i in 1 2 3 4 5; do
+            ip -6 rule del iif "$lan_iface" lookup "$bypass_table" priority "$bypass_prio" \
+                >> "$LOG_FILE" 2>&1 || break
+        done
+    fi
+    ip route flush table "$bypass_table" >> "$LOG_FILE" 2>&1 || true
+    ip -6 route flush table "$bypass_table" >> "$LOG_FILE" 2>&1 || true
+
     # Remove specific forward rules (LAN -> wg0)
     if [ -n "$lan_iface" ]; then
         if iptables -C FORWARD -i "$lan_iface" -o wg0 -j ACCEPT >/dev/null 2>&1; then

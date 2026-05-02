@@ -73,6 +73,7 @@ sudo ./gateway-manage-or-setup.sh [OPTIONS]
 ## What the script sets up
 - **WireGuard** at `/etc/wireguard/wg0.conf`, `wg-quick@wg0` enabled, PostUp/PostDown iptables rules.
 - **Routing/NAT**: iptables forwarding and MASQUERADE from LAN → `wg0` (WAN MASQUERADE as secondary).
+- **Pi-bypass routing (recommended)**: forwarded LAN traffic goes through `wg0`; the Pi's *own* outbound (apt, Pi Connect, NTP, DNS, the WireGuard handshake itself) stays on WAN. See [How traffic is routed](#how-traffic-is-routed) below.
 - **DHCP/DNS**: dnsmasq on the LAN/AP subnet; DNS forwarded via WireGuard tunnel.
 - **Static IP (LAN)**: gateway `10.10.10.1/24` on the LAN/AP interface.
 - **Static IP (WAN, optional)**: fixed address on the upstream interface (suggested as the second IP in the router's subnet, e.g. `192.168.1.2` if the router is `192.168.1.1`).
@@ -83,6 +84,47 @@ sudo ./gateway-manage-or-setup.sh [OPTIONS]
 - **Hardware watchdog (optional)**: kernel-level auto-reboot if system hangs.
 - **Auto-updates (optional)**: unattended-upgrades for security patches.
 - **Persistence**: all settings survive reboots (systemd services, static IPs, iptables).
+
+## How traffic is routed
+
+The setup wizard asks once whether to enable **Pi-bypass routing** (recommended). The two modes differ only in routing; the WireGuard config and firewall are otherwise identical.
+
+### Pi-bypass routing (recommended)
+
+```
+                    ┌───────────────────┐
+   LAN client  ────►│  Pi (gateway)     │
+   10.10.10.x       │                   │
+   (forwarded,      │  iif=LAN_IFACE    │
+    iif=LAN_IFACE)  │      │            │     ┌─ encrypted ─┐
+                    │      ▼            ├────►│   wg0       │──► home WG peer
+                    │  table 200:       │     │             │
+                    │  default dev wg0  │     └─────────────┘
+                    │                   │
+                    │  Pi-local         │
+                    │  (apt, Pi Connect,│     ┌─ direct ────┐
+   Pi process  ─────│   NTP, DNS, WG    ├────►│ WAN gateway │──► Internet
+   (no iif)         │   handshake) →    │     │             │
+                    │  main: default    │     └─────────────┘
+                    │  via WAN gw       │
+                    └───────────────────┘
+```
+
+- **LAN client traffic** is forwarded through the Pi. The kernel sees `iif=$LAN_IFACE`, matches an `ip rule` at priority 100, and looks up routing in table 200, where the default route is `dev wg0`. Encrypted packets go to the home peer.
+- **Pi-local traffic** (anything originating on the Pi itself) has no `iif` set. It skips the priority-100 rule and falls through to the **main** table, where the default route is the WAN gateway. The Pi can still reach the home subnet via `wg0` because each non-default `AllowedIPs` entry (e.g. `10.33.33.0/24`) is also added as an explicit route in the main table.
+- **WireGuard's own UDP handshake** is Pi-local traffic; it goes via WAN like any other Pi process. There is no chicken-and-egg problem when the tunnel restarts.
+
+#### Kill-switch semantics (intentional)
+- If `wg0` is down, packets routed through table 200 hit a route whose `dev wg0` no longer exists - the kernel drops them. **LAN clients lose Internet** rather than silently leaking via the Pi's WAN.
+- The Pi itself stays online because its traffic uses the main table, which is untouched. Remote management via Pi Connect, SSH-over-Internet, and apt continue to work.
+- This means an outage of the home WG peer disconnects LAN clients but never disconnects you from the Pi.
+
+#### DNS caveat
+LAN clients query the Pi's `dnsmasq`. dnsmasq forwards those queries upstream from the Pi (using the Pi's `resolv.conf`) - that upstream lookup is Pi-local traffic and therefore goes via WAN. So **LAN client DNS resolution keeps working even when the tunnel is down**. This is intentional; if you want DNS to also go via the tunnel, point dnsmasq at a DNS server in the home subnet (e.g. `server=10.33.33.53` in `/etc/dnsmasq.conf`) - that query then originates on the Pi to a home-subnet IP, which the main table routes via `wg0`.
+
+### Legacy / full-tunnel-including-Pi mode
+
+If you say *No* to Pi-bypass at the prompt, `wg-quick` manages routes the standard way: when your `AllowedIPs` contains `0.0.0.0/0`, the Pi's *own* outbound traffic also flows through the tunnel. This is appropriate only if your home WireGuard peer NATs the Pi's traffic out to the Internet. Without that NAT, the Pi loses Pi Connect, apt, and any SSH session that comes in via its public IP the moment `wg0` comes up. The setup wizard warns about this on the SSH-safety check.
 
 ## Default network plan (changeable at prompts)
 - Subnet: `10.10.10.0/24`
@@ -121,6 +163,7 @@ Cleanup will:
 - Stop/disable WireGuard, dnsmasq, hostapd (if running)
 - Remove WAN firewall rules (if enabled)
 - Remove NAT/forward iptables rules; disable IP forwarding
+- Tear down Pi-bypass routing (the `iif=LAN` `ip rule`, the table-200 routes, IPv6 mirrors)
 - Restore NetworkManager/dhcpcd to DHCP (on both LAN and WAN, if a static WAN IP was configured)
 - Remove watchdog configurations
 - Remove unattended-upgrades config (if auto-updates were enabled)

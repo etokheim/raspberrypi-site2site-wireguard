@@ -56,6 +56,28 @@ Re-running setup on a configured Pi must reconfigure cleanly and fix prior reboo
 - Avoid destructive restarts (e.g., `wg-quick down`) when nothing changed.
 - The `--start` recovery path should also create/update missing systemd units, not just start them.
 
+### Network Architecture: Forwarding Gateway, Not Full-Tunnel Client
+
+This project configures the Pi as a site-to-site forwarding gateway. The
+gateway's own outbound traffic must NEVER go through the VPN by default.
+Pi-bypass routing (`Table = off` in `wg0.conf` + an `iif=$LAN_IFACE`
+policy rule that points forwarded traffic at routing table 200) is the
+recommended mode and the only mode that keeps remote management (SSH
+over Internet, Pi Connect, apt) working when the user's `wg0.conf` has
+`AllowedIPs = 0.0.0.0/0`.
+
+- Forwarded packets (`iif=$LAN_IFACE`) -> table 200 -> default `dev wg0`.
+- Locally-generated packets (no `iif`) -> main table -> WAN.
+- Per-peer subnets (non-default `AllowedIPs` entries) get explicit
+  `dev wg0` routes in BOTH the main table (so the Pi reaches them) and
+  table 200 (so LAN clients reach them via the tunnel).
+- When `wg0` is down, table-200 packets drop (kill-switch). Pi-local
+  traffic continues via WAN, preserving remote management.
+
+Any change that re-introduces a default route via `wg0` in the main
+routing table - or that ties non-tunnel-related rules to `wg-quick`
+PostUp/PostDown - is a regression.
+
 ### Disconnect-Safe Execution
 
 The execution phase must finish on its own even if the operator's terminal goes away (SSH drop, Pi Connect WebRTC failure, serial hang-up, laptop closed). Half-applied state on a remote Pi can be unrecoverable.

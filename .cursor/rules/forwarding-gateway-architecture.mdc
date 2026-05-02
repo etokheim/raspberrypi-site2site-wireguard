@@ -1,0 +1,23 @@
+---
+description: Pi must forward LAN traffic via VPN, but keep its own traffic on WAN
+alwaysApply: true
+---
+
+# Forwarding Gateway, Not Full-Tunnel Client
+
+This repository configures the Raspberry Pi as a site-to-site forwarding gateway. The gateway's own outbound traffic must NEVER go through the VPN by default. Locally-generated traffic from the Pi (apt, Pi Connect, NTP, DNS, the WireGuard handshake itself) must always egress via WAN, even when the user's `AllowedIPs` includes `0.0.0.0/0`.
+
+The mechanism is **Pi-bypass routing**, controlled by `PI_BYPASS_ROUTING` in `vpn-gateway.conf`:
+
+- `Table = off` is injected into `[Interface]` of `wg0.conf` so `wg-quick` installs no routes itself.
+- A `PostUp` block populates routing table 200: `default dev wg0`, plus each non-default `AllowedIPs` entry as `dev wg0` (in both the main table and table 200).
+- A `PostUp` `ip rule add iif $LAN_IFACE lookup 200 priority 100` selects table 200 for forwarded traffic only.
+- `PostDown` reverses everything in the opposite order.
+
+Rules:
+
+- Do not add a default route via `wg0` to the main routing table.
+- Do not couple WAN MASQUERADE or other non-tunnel rules to `wg-quick` PostUp/PostDown - they belong in `ensure_nat_rules` and persist independently.
+- The `iif=$LAN_IFACE` rule is the single source of truth for "forwarded LAN packet". Source-IP-based rules (`from <CIDR>`) are weaker - they can match Pi-local traffic that happens to use the LAN gateway address as a source.
+- Kill-switch is intentional: when `wg0` is down, LAN clients lose Internet but the Pi stays online so remote management still works. Do not "fix" this by adding fallback routes via WAN for LAN traffic.
+- The constants `WG_BYPASS_TABLE_ID=200` and `WG_BYPASS_RULE_PRIO=100` are duplicated between `scripts/setup-vpn-gateway.sh` and `scripts/cleanup-gateway.sh`. Keep them in sync.
