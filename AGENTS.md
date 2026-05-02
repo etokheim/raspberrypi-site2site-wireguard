@@ -82,19 +82,31 @@ PostUp/PostDown - is a regression.
 
 When Pi-bypass routing is on, locally-generated DNS lookups from the Pi
 no longer ride through the tunnel by default - they go via WAN like any
-other Pi-local traffic. That means without explicit DNS configuration,
-both the Pi *and* (via dnsmasq's upstream lookups) the LAN clients leak
-DNS to the WAN ISP, defeating GeoDNS / CDN routing.
+other Pi-local traffic. Without explicit DNS configuration, both the Pi
+*and* (via dnsmasq's upstream lookups) the LAN clients leak DNS to the
+WAN ISP, defeating GeoDNS / CDN routing.
 
-The fix is two distinct DNS planes, controlled by two `vpn-gateway.conf`
-variables:
+The fix is two distinct DNS planes, controlled by three
+`vpn-gateway.conf` variables:
 
-- `HOME_DNS_SERVERS` (LAN client plane): if non-empty, dnsmasq is
-  configured with `no-resolv` + one `server=<ip>` per entry. Those
-  upstream lookups come from the Pi's own user space, but their
-  destination IP is inside an `AllowedIPs` subnet, so the main table
-  routes them via `wg0`. LAN clients see geo-correct, home-anchored
-  DNS resolution. Empty value = legacy behaviour (LAN DNS leaks).
+- `HOME_DNS_MODE` (LAN client plane) - `tunnel` (default) | `custom` |
+  `skip`.
+  - **`tunnel`**: dnsmasq config gets `no-resolv` plus
+    `server=<ip>@wg0` for each entry in `HOME_DNS_TUNNEL_DEFAULTS`
+    (currently `1.1.1.1 8.8.8.8`). The `@wg0` source-interface binding
+    forces dnsmasq to send the upstream lookup out via wg0; the home
+    peer NATs the lookup. Works without any DNS server inside the home
+    network. Requires `AllowedIPs` to cover the chosen public DNS IPs
+    (typically via `0.0.0.0/0`).
+  - **`custom`**: dnsmasq config gets `no-resolv` plus
+    `server=<ip>` for each entry in `HOME_DNS_SERVERS`. Routes via wg0
+    implicitly because the destination is inside an `AllowedIPs`
+    subnet. Use this if you run a real home DNS server (Pi-hole,
+    AdGuard Home, your home router's resolver) and want LAN clients
+    to pick up local hostname resolution.
+  - **`skip`**: no `no-resolv`, no `server=`. dnsmasq uses the Pi's
+    `/etc/resolv.conf` upstream -> public DNS via WAN -> geo-leak.
+- `HOME_DNS_SERVERS` (custom-mode IPs only) - space-separated.
 - `PI_DNS_SERVERS` (Pi plane): public resolvers (default
   `1.1.1.1 8.8.8.8`) installed via NetworkManager `ipv4.dns` +
   `ipv4.ignore-auto-dns yes`, dhcpcd `static domain_name_servers` block,
@@ -107,9 +119,21 @@ Rules:
 - Both planes are only meaningful when `PI_BYPASS_ROUTING=true`. In
   legacy mode the Pi's own traffic goes through the tunnel anyway, so
   the tunnel-side already provides DNS.
-- `HOME_DNS_SERVERS` entries must be covered by an `AllowedIPs` CIDR;
-  the input prompt validates this and warns loudly. Otherwise WireGuard
+- The default mode is `tunnel`. It is the simplest UX (no need to know
+  any home DNS IP), and only `custom` mode requires AllowedIPs
+  validation by the input prompt.
+- For `tunnel` mode every `server=<ip>@wg0` MUST use the `@wg0`
+  source-interface binding. Without it, dnsmasq's outbound query
+  follows the main table and goes via WAN (defeating the purpose);
+  with it, dnsmasq sets `SO_BINDTODEVICE` so the kernel routes via
+  wg0 unconditionally.
+- `custom` mode entries must be covered by an `AllowedIPs` CIDR; the
+  input prompt validates this and warns loudly. Otherwise WireGuard
   drops the egress packets and LAN DNS silently fails.
+- Legacy compat: a saved `HOME_DNS_SERVERS` without `HOME_DNS_MODE`
+  (from before this redesign) is translated by
+  `infer_home_dns_mode_legacy` to `MODE=custom` if non-empty, else
+  `MODE=skip`. Never silently switch a legacy install to `tunnel`.
 - Backups: `/etc/dnsmasq.conf.bak` is created the first time setup
   rewrites it; `/etc/resolv.conf.bak_gateway` is created the first time
   `do_configure_pi_dns` runs. Cleanup must restore both.

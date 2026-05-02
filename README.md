@@ -119,30 +119,37 @@ The setup wizard asks once whether to enable **Pi-bypass routing** (recommended)
 - The Pi itself stays online because its traffic uses the main table, which is untouched. Remote management via Pi Connect, SSH-over-Internet, and apt continue to work.
 - This means an outage of the home WG peer disconnects LAN clients but never disconnects you from the Pi.
 
-#### DNS plane separation (dual-DNS, optional but recommended)
+#### DNS plane separation (dual-DNS, recommended)
 
-LAN clients query the Pi's `dnsmasq`. dnsmasq itself runs on the Pi, so where its *upstream* lookups go depends on how it is configured:
+LAN clients query the Pi's `dnsmasq`. dnsmasq itself runs on the Pi, so where its *upstream* lookups go depends on which **mode** the operator picked at the prompt (`HOME_DNS_MODE` in `vpn-gateway.conf`):
 
-- **`HOME_DNS_SERVERS` set** (recommended): dnsmasq is configured with `no-resolv` + `server=<home-dns-ip>`, so LAN client queries are forwarded to a DNS server inside the home network. Because that destination IP is covered by an `AllowedIPs` entry, the lookup goes via `wg0`. **GeoDNS / CDN responses match the home location**, even though the Pi sits abroad. Kill-switch: if `wg0` is down, LAN DNS stops working.
-- **`HOME_DNS_SERVERS` empty** (legacy / opt-out): dnsmasq falls back to the Pi's `/etc/resolv.conf`, which points at `PI_DNS_SERVERS` (public DNS via WAN). LAN DNS keeps working when the tunnel is down, but resolution geo-leaks to the WAN ISP's location.
+- **`tunnel` (default)** - dnsmasq forwards to public DNS bound to `wg0`: `server=1.1.1.1@wg0`, `server=8.8.8.8@wg0`. Each query exits via the tunnel; the home peer NATs it out from the home location, so DNS responses are geo-anchored at home. Works without any DNS server on the home network. Requires `AllowedIPs` to cover the chosen public DNS IPs (typically via `0.0.0.0/0`).
+- **`custom`** - dnsmasq forwards to a specific home-network DNS server you specify (e.g. Pi-hole or AdGuard Home at `10.33.33.1`). Use this if you want LAN clients to also pick up local hostname resolution from your home DNS. The destination IP must be covered by an `AllowedIPs` entry; the input prompt validates this.
+- **`skip`** - dnsmasq falls back to the Pi's `/etc/resolv.conf` (which points at `PI_DNS_SERVERS` over WAN). LAN DNS keeps working when the tunnel is down, but resolution geo-leaks to the WAN ISP's location.
 
-Either way, the **Pi's own** DNS is configured separately via `PI_DNS_SERVERS` (default `1.1.1.1 8.8.8.8`) and goes via WAN. apt, NTP, Pi Connect, and the WireGuard endpoint hostname keep resolving even when the tunnel is down, so remote management never breaks because of DNS.
+In all three modes, the **Pi's own** DNS is configured separately via `PI_DNS_SERVERS` (default `1.1.1.1 8.8.8.8`) and goes via WAN. apt, NTP, Pi Connect, and the WireGuard endpoint hostname keep resolving even when the tunnel is down, so remote management never breaks because of DNS.
 
 ```
 LAN client ──DHCP-supplied DNS──> Pi (10.10.10.1)
                                        │
                                        │ dnsmasq
                                        ▼
-                  ┌───── HOME_DNS_SERVERS set ─────┐
-                  │  no-resolv + server=10.33.33.1 │ ─► wg0 ─► home DNS (geo-correct)
+                  ┌───── HOME_DNS_MODE=tunnel ─────┐
+                  │  server=1.1.1.1@wg0            │ ─► wg0 ─► home peer NATs ─► public DNS
+                  │  (default; geo-correct)        │           (response geo-anchored at home)
                   └────────────────────────────────┘
-                  ┌───── HOME_DNS_SERVERS empty ───┐
+                  ┌───── HOME_DNS_MODE=custom ─────┐
+                  │  server=<your home DNS IP>     │ ─► wg0 ─► home DNS server (Pi-hole etc.)
+                  └────────────────────────────────┘
+                  ┌───── HOME_DNS_MODE=skip ───────┐
                   │  uses Pi's /etc/resolv.conf    │ ─► WAN ─► public DNS (geo-leaks)
                   └────────────────────────────────┘
 
 Pi-local lookups (apt, NTP, Pi Connect, wg endpoint) ─► /etc/resolv.conf
                                                        (PI_DNS_SERVERS) ─► WAN ─► always works
 ```
+
+Kill-switch: in `tunnel` and `custom` modes, when `wg0` is down LAN DNS stops resolving (the upstream packet has no route). The Pi itself keeps resolving via `PI_DNS_SERVERS` over WAN, so remote management is unaffected.
 
 ### Legacy / full-tunnel-including-Pi mode
 
