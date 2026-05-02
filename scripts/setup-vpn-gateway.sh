@@ -1097,12 +1097,21 @@ get_interface_details() {
         driver="unknown"
     fi
 
-    if [ -L "/sys/class/net/$iface/device" ]; then
-        devpath=$(readlink "/sys/class/net/$iface/device")
+    # Wireless NICs expose /sys/class/net/<iface>/wireless or phy80211.
+    # Detect this first so we can label them as Wi-Fi regardless of bus.
+    if [ -d "/sys/class/net/$iface/wireless" ] || [ -L "/sys/class/net/$iface/phy80211" ]; then
+        bus_type="wifi"
+    elif [ -L "/sys/class/net/$iface/device" ]; then
+        # Resolve to the absolute device path so the parent USB controller is
+        # visible. `readlink` (without -f) only returns the relative target
+        # which on a Pi 4 is something like ../../../1-1.3:1.0 and does NOT
+        # contain the substring "usb", causing USB NICs to be mis-detected
+        # as onboard. Use `readlink -f` to get the real path under /sys/devices.
+        devpath=$(readlink -f "/sys/class/net/$iface/device" 2>/dev/null)
         case "$devpath" in
-            *"/usb"/*|*"usb"* ) bus_type="usb" ;;
-            *"/pci"* ) bus_type="pci" ;;
-            * ) bus_type="onboard" ;;
+            *"/usb"*) bus_type="usb" ;;
+            *"/pci"*) bus_type="pci" ;;
+            *)        bus_type="onboard" ;;
         esac
     else
         bus_type="virtual"
@@ -1127,10 +1136,26 @@ select_interface() {
     local idx=1
     local iface_list=()
     for iface in $interfaces; do
-        local detail_line1 detail_line2
-        detail_line1=$(get_interface_details "$iface" | sed -n '1p')
-        detail_line2=$(get_interface_details "$iface" | sed -n '2p')
-        printf "   %2d) %s\n" "$idx" "$iface" >&2
+        local details detail_line1 detail_line2 bus badge
+        details=$(get_interface_details "$iface")
+        detail_line1=$(echo "$details" | sed -n '1p')
+        detail_line2=$(echo "$details" | sed -n '2p')
+        bus=$(echo "$detail_line2" | sed -n 's/.*bus=\([^ ]*\).*/\1/p')
+
+        # Render a prominent badge so the operator can tell at a glance
+        # which interface is the Pi's built-in port versus a USB adapter
+        # or wireless radio. The built-in port is the most common LAN
+        # candidate on a Pi 4 (USB ports are typically used for the WAN
+        # uplink), so we highlight it distinctly.
+        case "$bus" in
+            onboard|pci) badge="${GREEN}${BOLD}[ Pi built-in ]${NC}" ;;
+            usb)         badge="${YELLOW}${BOLD}[ USB adapter ]${NC}" ;;
+            wifi)        badge="${MAGENTA}${BOLD}[ Wi-Fi ]${NC}" ;;
+            virtual)     badge="${DIM}[ virtual ]${NC}" ;;
+            *)           badge="${DIM}[ ${bus:-unknown} ]${NC}" ;;
+        esac
+
+        printf "   %2d) ${BOLD}%-7s${NC} %b\n" "$idx" "$iface" "$badge" >&2
         printf "       ${DIM}%s${NC}\n" "$detail_line1" >&2
         printf "       ${DIM}%s${NC}\n" "$detail_line2" >&2
         iface_list+=("$iface")
