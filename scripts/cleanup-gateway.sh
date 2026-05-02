@@ -298,15 +298,30 @@ cleanup_wan_firewall_rules() {
     local lan_iface="$LAN_IFACE"
     local ssh_port="${SSH_PORT:-22}"
     local wg_port="${WG_LISTEN_PORT:-}"
+    local tag="vpn-gateway"
 
-    # Remove loopback rule (added by setup)
+    # Preferred path: remove every INPUT rule tagged by setup. Handles SSH_PORT
+    # / WG_LISTEN_PORT / WAN_IFACE having changed since the rule was installed.
+    local saved
+    saved=$(iptables-save 2>/dev/null) || saved=""
+    if [ -n "$saved" ]; then
+        echo "$saved" | awk -v tag="$tag" '
+            /^-A INPUT/ && index($0, "--comment \"" tag "\"") {
+                sub(/^-A /, "-D ")
+                print
+            }' | while read -r rule; do
+            # shellcheck disable=SC2086
+            iptables $rule >> "$LOG_FILE" 2>&1 || true
+        done
+    fi
+
+    # Legacy fallback: remove un-tagged rules from older installs.
     if iptables -C INPUT -i lo -j ACCEPT >/dev/null 2>&1; then
         iptables -D INPUT -i lo -j ACCEPT >> "$LOG_FILE" 2>&1 || true
     fi
     if [ -n "$lan_iface" ] && iptables -C INPUT -i "$lan_iface" -j ACCEPT >/dev/null 2>&1; then
         iptables -D INPUT -i "$lan_iface" -j ACCEPT >> "$LOG_FILE" 2>&1 || true
     fi
-    # Remove wg0 INPUT rule
     if iptables -C INPUT -i wg0 -j ACCEPT >/dev/null 2>&1; then
         iptables -D INPUT -i wg0 -j ACCEPT >> "$LOG_FILE" 2>&1 || true
     fi
@@ -469,9 +484,19 @@ main() {
         progress_run_step "Save firewall rules" "netfilter-persistent save"
     fi
 
-    # Restore network configuration
+    # Restore network configuration.
+    # SSH-safety: if the operator is currently SSHed via the LAN interface we
+    # are about to flush, skip the flush (NetworkManager / dhcpcd will move it
+    # back to DHCP on its own and any later reboot will pick that up).
+    SSH_LOCAL_IP=$(echo "${SSH_CONNECTION:-}" | awk '{print $3}')
+    SSH_IFACE=""
+    if [ -n "$SSH_LOCAL_IP" ]; then
+        SSH_IFACE=$(ip -o -4 addr show 2>/dev/null \
+            | awk -v ip="$SSH_LOCAL_IP" '{ split($4, p, "/"); if (p[1]==ip){print $2; exit} }')
+    fi
+
     progress_run_step "Restore network config" "
-        if [ -n '$LAN_IFACE' ]; then
+        if [ -n '$LAN_IFACE' ] && [ '$SSH_IFACE' != '$LAN_IFACE' ]; then
             ip addr flush dev '$LAN_IFACE' 2>/dev/null || true
         fi
         if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager; then

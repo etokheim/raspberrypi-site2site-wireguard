@@ -118,6 +118,22 @@ run_start() {
         fi
     fi
 
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl list-unit-files 2>/dev/null | grep -q '^vpn-gateway-lan\.service'; then
+            echo "Starting LAN readiness service (vpn-gateway-lan)..."
+            # --wait blocks until the oneshot unit reports active (or fails).
+            # Falls back to plain start if --wait is unsupported on this systemd.
+            if ! systemctl start --wait vpn-gateway-lan.service >/dev/null 2>&1; then
+                systemctl start vpn-gateway-lan.service >/dev/null 2>&1 || true
+            fi
+            if ! systemctl is-active --quiet vpn-gateway-lan.service; then
+                echo "Warning: vpn-gateway-lan.service did not become active. Continuing." >&2
+            fi
+        else
+            echo "Note: vpn-gateway-lan.service not installed yet. Run --setup to install boot-ordering units." >&2
+        fi
+    fi
+
     # Bring up AP/DHCP if configured for wireless
     if [ "${IS_WIRELESS:-false}" = "true" ]; then
         echo "Starting Access Point (hostapd)..."

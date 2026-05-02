@@ -98,14 +98,39 @@ detect_ssh_port() {
     if [ -n "${SSH_PORT:-}" ]; then
         return
     fi
-    local detected
-    detected=$(grep -iE '^Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null | tail -n1 | awk '{print $2}')
+    local detected=""
+    # Authoritative: sshd -T resolves /etc/ssh/sshd_config + sshd_config.d/*
+    if command -v sshd >/dev/null 2>&1; then
+        detected=$(sshd -T 2>/dev/null | awk '$1=="port"{print $2; exit}')
+    fi
+    if [ -z "$detected" ]; then
+        detected=$(grep -ihE '^Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null \
+                   | tail -n1 | awk '{print $2}')
+    fi
     if echo "$detected" | grep -qE '^[0-9]+$'; then
         SSH_PORT="$detected"
     else
         SSH_PORT="22"
     fi
     save_config_var "SSH_PORT" "$SSH_PORT"
+}
+
+# Detect which interface the current SSH session is bound to.
+# Echoes the iface name (e.g. eth0) or empty string if not in SSH or undetectable.
+detect_ssh_iface() {
+    local ssh_local=""
+    if [ -n "${SSH_CONNECTION:-}" ]; then
+        # SSH_CONNECTION = "client_ip client_port server_ip server_port"
+        ssh_local=$(echo "$SSH_CONNECTION" | awk '{print $3}')
+    fi
+    if [ -z "$ssh_local" ]; then
+        return 0
+    fi
+    ip -o -4 addr show 2>/dev/null | awk -v ip="$ssh_local" '
+        {
+            split($4, parts, "/")
+            if (parts[1] == ip) { print $2; exit }
+        }'
 }
 
 parse_wg_listen_port() {
@@ -147,31 +172,49 @@ ensure_hardware_watchdog() {
 }
 
 do_software_watchdog_setup() {
-    # Software watchdog: systemd restart policies for critical services
-    # If a service crashes, systemd automatically restarts it after 5 seconds
-    local services=("dnsmasq" "wg-quick@wg0")
-    
-    for svc in "${services[@]}"; do
+    # Software watchdog: systemd restart policies for critical services.
+    # If a service crashes, systemd automatically restarts it after 5 seconds.
+    # Also enforce startup ordering so services wait for LAN readiness.
+    local lan_device_unit
+    lan_device_unit=$(get_lan_device_unit)
+
+    # Use BindsTo only for USB-backed NICs (which can transiently disappear).
+    # For onboard/PCI/virtual NICs, prefer the looser Wants+After ordering.
+    local lan_bus_type=""
+    if [ -n "${LAN_IFACE:-}" ]; then
+        lan_bus_type=$(get_interface_details "$LAN_IFACE" 2>/dev/null \
+                       | sed -n '2p' | sed -n 's/.*bus=\([^ ]*\).*/\1/p')
+    fi
+    local binds_line=""
+    if [ "$lan_bus_type" = "usb" ]; then
+        binds_line="BindsTo=${lan_device_unit}"
+    fi
+
+    write_dropin() {
+        local svc="$1"
+        local extra_unit="$2"
         local dropin_dir="/etc/systemd/system/${svc}.d"
         mkdir -p "$dropin_dir"
-        cat > "${dropin_dir}/override.conf" <<EOF
-[Service]
-Restart=on-failure
-RestartSec=5
-EOF
-    done
-    
-    # hostapd only if wireless mode
+        {
+            printf '[Unit]\n'
+            printf 'Wants=vpn-gateway-lan.service %s\n' "$lan_device_unit"
+            printf 'After=vpn-gateway-lan.service %s\n' "$lan_device_unit"
+            [ -n "$binds_line" ] && printf '%s\n' "$binds_line"
+            [ -n "$extra_unit" ] && printf '%s\n' "$extra_unit"
+            printf '\n[Service]\n'
+            printf 'Restart=on-failure\n'
+            printf 'RestartSec=5\n'
+        } > "${dropin_dir}/override.conf"
+    }
+
+    write_dropin "dnsmasq" "$(printf 'StartLimitIntervalSec=60\nStartLimitBurst=12')"
+    write_dropin "wg-quick@wg0" "Wants=network-online.target
+After=network-online.target"
+
     if [ "${IS_WIRELESS:-false}" = "true" ]; then
-        local dropin_dir="/etc/systemd/system/hostapd.d"
-        mkdir -p "$dropin_dir"
-        cat > "${dropin_dir}/override.conf" <<EOF
-[Service]
-Restart=on-failure
-RestartSec=5
-EOF
+        write_dropin "hostapd" ""
     fi
-    
+
     systemctl daemon-reload >> "$LOG_FILE" 2>&1 || true
 }
 
@@ -238,14 +281,14 @@ do_configure_wg_firewall_rules() {
         echo "ERROR: No [Interface] section found in $WG_CONF_DEST" >> "$LOG_FILE"
         return 1
     fi
-    
-    # Use check-before-add (-C || -A) pattern to prevent duplicate rules
-    # This is important because netfilter-persistent may restore saved rules on boot,
-    # and we don't want PostUp to add duplicates
-    local POST_UP="PostUp = iptables -C FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT; iptables -C FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -C POSTROUTING -o wg0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE; iptables -t nat -C POSTROUTING -o $WAN_IFACE -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o $WAN_IFACE -j MASQUERADE"
-    local POST_DOWN="PostDown = iptables -D FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; iptables -t nat -D POSTROUTING -o wg0 -j MASQUERADE 2>/dev/null || true; iptables -t nat -D POSTROUTING -o $WAN_IFACE -j MASQUERADE 2>/dev/null || true"
-    
-    # Remove existing PostUp/PostDown rules to prevent duplication if re-running
+
+    # WireGuard PostUp/PostDown handle ONLY rules that depend on the wg0 interface
+    # existing. WAN MASQUERADE must NOT be tied to wg0 lifecycle - if wg0 flaps,
+    # LAN clients still need NAT to reach the upstream network. WAN MASQUERADE is
+    # persisted independently via ensure_nat_rules() + netfilter-persistent.
+    local POST_UP="PostUp = iptables -C FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT; iptables -C FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -C POSTROUTING -o wg0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE"
+    local POST_DOWN="PostDown = iptables -D FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; iptables -t nat -D POSTROUTING -o wg0 -j MASQUERADE 2>/dev/null || true"
+
     sed -i '/^PostUp =/d' "$WG_CONF_DEST"
     sed -i '/^PostDown =/d' "$WG_CONF_DEST"
 
@@ -253,6 +296,19 @@ do_configure_wg_firewall_rules() {
 }
 
 do_start_wireguard() {
+    # Skip restart if wg0 is already up and the installed config has not changed
+    # since the previous run (avoids gratuitous tunnel + LAN-traffic blip).
+    local installed_hash="" prev_hash="${WG_PREV_HASH:-}"
+    if [ -f "$WG_CONF_DEST" ]; then
+        installed_hash=$(sha256sum "$WG_CONF_DEST" | awk '{print $1}')
+    fi
+    if ip link show wg0 >/dev/null 2>&1 \
+       && systemctl is-active --quiet wg-quick@wg0 \
+       && [ -n "$installed_hash" ] && [ "$installed_hash" = "$prev_hash" ]; then
+        echo "[wg] wg0 already active with matching config; skipping restart" >> "$LOG_FILE"
+        systemctl enable wg-quick@wg0 >> "$LOG_FILE" 2>&1 || true
+        return 0
+    fi
     if ip link show wg0 >/dev/null 2>&1; then
         wg-quick down wg0 || true
     fi
@@ -319,6 +375,17 @@ reset_previous_lan_iface() {
 
     # Flush any static addresses on the old LAN interface
     ip addr flush dev "$old_iface" >> "$LOG_FILE" 2>&1 || true
+
+    # Remove FORWARD and NAT rules tied to the OLD LAN iface so re-runs don't
+    # accumulate stale forwarding rules each time the interface is changed.
+    if iptables -C FORWARD -i "$old_iface" -o wg0 -j ACCEPT >/dev/null 2>&1; then
+        iptables -D FORWARD -i "$old_iface" -o wg0 -j ACCEPT >> "$LOG_FILE" 2>&1 || true
+    fi
+    if iptables -C FORWARD -i wg0 -o "$old_iface" -m state --state RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1; then
+        iptables -D FORWARD -i wg0 -o "$old_iface" -m state --state RELATED,ESTABLISHED -j ACCEPT >> "$LOG_FILE" 2>&1 || true
+    fi
+    # Tagged INPUT rule on the old LAN (added by ensure_wan_firewall_rules) is
+    # cleaned up by remove_tagged_input_rules() on the next firewall apply.
 
     # If we previously configured hostapd on that interface but are no longer wireless, stop it
     if [ "$old_wireless" = "true" ] && ! echo "$new_iface" | grep -q "wlan"; then
@@ -672,24 +739,34 @@ run_step() {
     fi
 }
 
-# Ensure iptables forwarding/NAT rules exist for LAN -> wg0
+# Ensure iptables forwarding/NAT rules exist for LAN -> wg0 and LAN -> WAN.
+# These rules are persisted to disk regardless of WAN firewall opt-in, so they
+# survive reboots even if wg0 fails to come up at boot.
 ensure_nat_rules() {
-    echo "[ensure_nat_rules] Verifying iptables rules for $LAN_IFACE -> wg0" >> "$LOG_FILE"
-    # Forward LAN to wg0
+    echo "[ensure_nat_rules] Verifying iptables rules for $LAN_IFACE -> wg0/$WAN_IFACE" >> "$LOG_FILE"
     if ! iptables -C FORWARD -i "$LAN_IFACE" -o wg0 -j ACCEPT >/dev/null 2>&1; then
         iptables -A FORWARD -i "$LAN_IFACE" -o wg0 -j ACCEPT >> "$LOG_FILE" 2>&1
     fi
-    # Allow return traffic from wg0 to LAN
     if ! iptables -C FORWARD -i wg0 -o "$LAN_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1; then
         iptables -A FORWARD -i wg0 -o "$LAN_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT >> "$LOG_FILE" 2>&1
     fi
-    # NAT out wg0
     if ! iptables -t nat -C POSTROUTING -o wg0 -j MASQUERADE >/dev/null 2>&1; then
         iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE >> "$LOG_FILE" 2>&1
     fi
-    # NAT out WAN as secondary path (if desired)
     if [ -n "$WAN_IFACE" ] && ! iptables -t nat -C POSTROUTING -o "$WAN_IFACE" -j MASQUERADE >/dev/null 2>&1; then
         iptables -t nat -A POSTROUTING -o "$WAN_IFACE" -j MASQUERADE >> "$LOG_FILE" 2>&1
+    fi
+}
+
+# Persist iptables/NAT rules to disk so they survive reboot regardless of any
+# optional firewall feature toggles.
+persist_iptables_rules() {
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        echo "[persist] Saving iptables rules via netfilter-persistent..." >> "$LOG_FILE"
+        netfilter-persistent save >> "$LOG_FILE" 2>&1 || true
+    elif command -v iptables-save >/dev/null 2>&1 && [ -d /etc/iptables ]; then
+        echo "[persist] Saving iptables rules to /etc/iptables/rules.v4..." >> "$LOG_FILE"
+        iptables-save > /etc/iptables/rules.v4 2>>"$LOG_FILE" || true
     fi
 }
 
@@ -931,52 +1008,52 @@ prompt_wan_static_ip() {
     success "Static WAN IP: $WAN_STATIC_IP/$WAN_STATIC_PREFIX via ${WAN_STATIC_GATEWAY:-<none>}"
 }
 
+# Marker used on every iptables INPUT rule installed by ensure_wan_firewall_rules
+# so we can find/remove them safely on re-run (handles SSH_PORT / WG_LISTEN_PORT
+# or WAN_IFACE changes without leaving stale or wrongly-ordered rules behind).
+FW_RULE_TAG="vpn-gateway"
+
+# Remove any previously-tagged INPUT rules. Safe to call before re-applying.
+remove_tagged_input_rules() {
+    local tag="$FW_RULE_TAG"
+    # iptables-save preserves rule order; keep deleting matched lines until none.
+    local saved
+    saved=$(iptables-save 2>/dev/null) || return 0
+    echo "$saved" | awk -v tag="$tag" '
+        /^-A INPUT/ && index($0, "--comment \"" tag "\"") {
+            sub(/^-A /, "-D ")
+            print
+        }' | while read -r rule; do
+        # shellcheck disable=SC2086
+        iptables $rule >> "$LOG_FILE" 2>&1 || true
+    done
+}
+
 ensure_wan_firewall_rules() {
-    echo "[wan_firewall] Applying hardened INPUT rules for WAN=$WAN_IFACE" >> "$LOG_FILE"
+    echo "[wan_firewall] Applying hardened INPUT rules for WAN=$WAN_IFACE (tag=$FW_RULE_TAG)" >> "$LOG_FILE"
     local ssh_port="${SSH_PORT:-22}"
+    local tag="$FW_RULE_TAG"
 
-    # Allow loopback (critical for local services)
-    if ! iptables -C INPUT -i lo -j ACCEPT >/dev/null 2>&1; then
-        iptables -A INPUT -i lo -j ACCEPT >> "$LOG_FILE" 2>&1
-    fi
+    # Wipe previous tagged rules first, so SSH_PORT/WG_LISTEN_PORT/WAN_IFACE
+    # changes from a re-run don't leave stale ACCEPTs or a stranded DROP.
+    remove_tagged_input_rules
 
-    # Allow LAN management traffic
-    if ! iptables -C INPUT -i "$LAN_IFACE" -j ACCEPT >/dev/null 2>&1; then
-        iptables -A INPUT -i "$LAN_IFACE" -j ACCEPT >> "$LOG_FILE" 2>&1
-    fi
-
-    # Allow traffic from WireGuard tunnel
-    if ! iptables -C INPUT -i wg0 -j ACCEPT >/dev/null 2>&1; then
-        iptables -A INPUT -i wg0 -j ACCEPT >> "$LOG_FILE" 2>&1
-    fi
-
-    # Allow established/related on WAN
-    if ! iptables -C INPUT -i "$WAN_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1; then
-        iptables -A INPUT -i "$WAN_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT >> "$LOG_FILE" 2>&1
-    fi
-
-    # Allow SSH on WAN
-    if ! iptables -C INPUT -i "$WAN_IFACE" -p tcp --dport "$ssh_port" -j ACCEPT >/dev/null 2>&1; then
-        iptables -A INPUT -i "$WAN_IFACE" -p tcp --dport "$ssh_port" -j ACCEPT >> "$LOG_FILE" 2>&1
-    fi
-
-    # Allow WireGuard listen port if present
+    # Order matters: ACCEPT rules MUST be installed before the final DROP.
+    iptables -A INPUT -i lo -m comment --comment "$tag" -j ACCEPT >> "$LOG_FILE" 2>&1
+    iptables -A INPUT -i "$LAN_IFACE" -m comment --comment "$tag" -j ACCEPT >> "$LOG_FILE" 2>&1
+    iptables -A INPUT -i wg0 -m comment --comment "$tag" -j ACCEPT >> "$LOG_FILE" 2>&1
+    iptables -A INPUT -i "$WAN_IFACE" -m state --state RELATED,ESTABLISHED \
+        -m comment --comment "$tag" -j ACCEPT >> "$LOG_FILE" 2>&1
+    iptables -A INPUT -i "$WAN_IFACE" -p tcp --dport "$ssh_port" \
+        -m comment --comment "$tag" -j ACCEPT >> "$LOG_FILE" 2>&1
     if [ -n "${WG_LISTEN_PORT:-}" ]; then
-        if ! iptables -C INPUT -i "$WAN_IFACE" -p udp --dport "$WG_LISTEN_PORT" -j ACCEPT >/dev/null 2>&1; then
-            iptables -A INPUT -i "$WAN_IFACE" -p udp --dport "$WG_LISTEN_PORT" -j ACCEPT >> "$LOG_FILE" 2>&1
-        fi
+        iptables -A INPUT -i "$WAN_IFACE" -p udp --dport "$WG_LISTEN_PORT" \
+            -m comment --comment "$tag" -j ACCEPT >> "$LOG_FILE" 2>&1
     fi
+    # Final drop on WAN INPUT - always installed last so SSH ACCEPT precedes it.
+    iptables -A INPUT -i "$WAN_IFACE" -m comment --comment "$tag" -j DROP >> "$LOG_FILE" 2>&1
 
-    # Drop everything else on WAN INPUT
-    if ! iptables -C INPUT -i "$WAN_IFACE" -j DROP >/dev/null 2>&1; then
-        iptables -A INPUT -i "$WAN_IFACE" -j DROP >> "$LOG_FILE" 2>&1
-    fi
-
-    # Save rules to persistence
-    if command -v netfilter-persistent >/dev/null 2>&1; then
-        echo "[wan_firewall] Saving rules via netfilter-persistent..." >> "$LOG_FILE"
-        netfilter-persistent save >> "$LOG_FILE" 2>&1
-    fi
+    persist_iptables_rules
 }
 
 # --- Main Logic ---
@@ -991,6 +1068,48 @@ check_root() {
 # Function to list network interfaces
 get_interfaces() {
     ip -o link show | awk -F': ' '{print $2}' | grep -v "lo"
+}
+
+get_lan_device_unit() {
+    local iface="${1:-$LAN_IFACE}"
+    if command -v systemd-escape >/dev/null 2>&1; then
+        systemd-escape --path --suffix=device "/sys/subsystem/net/devices/$iface"
+    else
+        echo "sys-subsystem-net-devices-${iface}.device"
+    fi
+}
+
+get_interface_details() {
+    local iface="$1"
+    local state mac ipv4 driver devpath bus_type
+    state=$(ip -br link show dev "$iface" 2>/dev/null | awk '{print $2}')
+    [ -z "$state" ] && state="UNKNOWN"
+
+    ipv4=$(ip -o -4 addr show dev "$iface" 2>/dev/null | awk '{print $4}' | paste -sd, -)
+    [ -z "$ipv4" ] && ipv4="none"
+
+    mac=$(cat "/sys/class/net/$iface/address" 2>/dev/null)
+    [ -z "$mac" ] && mac="unknown"
+
+    if [ -L "/sys/class/net/$iface/device/driver" ]; then
+        driver=$(basename "$(readlink "/sys/class/net/$iface/device/driver")")
+    else
+        driver="unknown"
+    fi
+
+    if [ -L "/sys/class/net/$iface/device" ]; then
+        devpath=$(readlink "/sys/class/net/$iface/device")
+        case "$devpath" in
+            *"/usb"/*|*"usb"* ) bus_type="usb" ;;
+            *"/pci"* ) bus_type="pci" ;;
+            * ) bus_type="onboard" ;;
+        esac
+    else
+        bus_type="virtual"
+    fi
+
+    echo "state=$state  ipv4=$ipv4"
+    echo "mac=$mac  driver=$driver  bus=$bus_type"
 }
 
 # Function to prompt for interface selection
@@ -1008,7 +1127,12 @@ select_interface() {
     local idx=1
     local iface_list=()
     for iface in $interfaces; do
+        local detail_line1 detail_line2
+        detail_line1=$(get_interface_details "$iface" | sed -n '1p')
+        detail_line2=$(get_interface_details "$iface" | sed -n '2p')
         printf "   %2d) %s\n" "$idx" "$iface" >&2
+        printf "       ${DIM}%s${NC}\n" "$detail_line1" >&2
+        printf "       ${DIM}%s${NC}\n" "$detail_line2" >&2
         iface_list+=("$iface")
         idx=$((idx + 1))
     done
@@ -1112,6 +1236,173 @@ get_ip_range() {
     
     echo -e "   ${BLUE}👉 The private subnet for devices connecting to the AP (LAN side).${NC}" >&2
     echo "$LAN_CIDR"
+}
+
+do_configure_lan_ready_service() {
+    local lan_device_unit
+    lan_device_unit=$(get_lan_device_unit "$LAN_IFACE")
+
+    # BindsTo only for USB NICs (transient disappearance) - same policy as drop-ins.
+    local lan_bus_type=""
+    lan_bus_type=$(get_interface_details "$LAN_IFACE" 2>/dev/null \
+                   | sed -n '2p' | sed -n 's/.*bus=\([^ ]*\).*/\1/p')
+    local binds_line=""
+    if [ "$lan_bus_type" = "usb" ]; then
+        binds_line="BindsTo=${lan_device_unit}"
+    fi
+
+    local before_services="dnsmasq.service wg-quick@wg0.service"
+    local pre_cmd=""
+    if [ "${IS_WIRELESS:-false}" = "true" ]; then
+        before_services="dnsmasq.service hostapd.service wg-quick@wg0.service"
+        pre_cmd="ExecStartPre=/bin/bash -c '/usr/sbin/rfkill unblock wlan || true'"
+    fi
+
+    {
+        printf '[Unit]\n'
+        printf 'Description=VPN Gateway LAN Interface Setup\n'
+        printf 'Wants=%s\n' "$lan_device_unit"
+        printf 'After=%s\n' "$lan_device_unit"
+        [ -n "$binds_line" ] && printf '%s\n' "$binds_line"
+        printf 'Before=%s\n' "$before_services"
+        printf '\n[Service]\n'
+        printf 'Type=oneshot\n'
+        printf 'RemainAfterExit=yes\n'
+        [ -n "$pre_cmd" ] && printf '%s\n' "$pre_cmd"
+        # Robust IP existence check: exact /24 match, not substring.
+        printf "ExecStart=/bin/bash -c 'ip -4 -o addr show dev %s scope global 2>/dev/null | awk \"{print \\\$4}\" | grep -qx %s/24 || ip addr add %s/24 dev %s'\n" \
+            "$LAN_IFACE" "$LAN_GATEWAY" "$LAN_GATEWAY" "$LAN_IFACE"
+        printf 'ExecStart=/bin/ip link set %s up\n' "$LAN_IFACE"
+        printf '\n[Install]\n'
+        printf 'WantedBy=multi-user.target\n'
+    } > /etc/systemd/system/vpn-gateway-lan.service
+
+    systemctl daemon-reload >> "$LOG_FILE" 2>&1 || true
+    systemctl enable vpn-gateway-lan.service >> "$LOG_FILE" 2>&1 || true
+    systemctl restart vpn-gateway-lan.service >> "$LOG_FILE" 2>&1 || true
+}
+
+lan_iface_has_gateway_ip() {
+    # Exact /24 match - not substring.
+    ip -4 -o addr show dev "$LAN_IFACE" scope global 2>/dev/null \
+        | awk '{print $4}' | grep -qx "$LAN_GATEWAY/24"
+}
+
+# Collect any user confirmations needed because of SSH-disconnect risk during
+# install. MUST be called during the input-collection phase only - never during
+# execution - so the run can proceed unattended once started.
+prompt_ssh_safety_warnings() {
+    SSH_DISCONNECT_ACK="false"
+    SSH_IFACE="$(detect_ssh_iface)"
+
+    if [ -z "$SSH_IFACE" ]; then
+        return 0
+    fi
+
+    local wan_static_planned="${WAN_STATIC_IP_ENABLED:-false}"
+    local lan_will_change=true
+    if lan_iface_has_gateway_ip; then
+        lan_will_change=false
+    fi
+
+    local risk=false risk_lines=()
+    if [ "$SSH_IFACE" = "$LAN_IFACE" ] && [ "$lan_will_change" = true ]; then
+        risk=true
+        risk_lines+=("• Your SSH session is on the planned LAN interface ($SSH_IFACE).")
+        risk_lines+=("  The LAN interface will be reconfigured to $LAN_GATEWAY/24 - this WILL drop your SSH session.")
+    fi
+    if [ "$SSH_IFACE" = "$WAN_IFACE" ] && [ "$wan_static_planned" = "true" ]; then
+        risk=true
+        risk_lines+=("• Your SSH session is on the WAN interface ($SSH_IFACE).")
+        risk_lines+=("  WAN static IP reassignment to $WAN_STATIC_IP/$WAN_STATIC_PREFIX WILL drop your SSH session.")
+        risk_lines+=("  Reconnect after install at: ssh <user>@$WAN_STATIC_IP")
+    fi
+
+    if [ "$risk" = false ]; then
+        SSH_DISCONNECT_ACK="true"
+        return 0
+    fi
+
+    echo ""
+    warn "SSH disconnect risk detected:"
+    local line
+    for line in "${risk_lines[@]}"; do
+        echo -e "   ${YELLOW}${line}${NC}"
+    done
+    echo ""
+    if [ "$NONINTERACTIVE" = "true" ]; then
+        info "Non-interactive: proceeding (the operator must reconnect manually if SSH drops)."
+        SSH_DISCONNECT_ACK="true"
+        return 0
+    fi
+    echo -ne "❓ ${YELLOW}Acknowledge and continue? Setup will run unattended. [y/N]:${NC} "
+    read -r ack < /dev/tty
+    if [[ "$ack" =~ ^[Yy]$ ]]; then
+        SSH_DISCONNECT_ACK="true"
+    else
+        error "Aborted by user (SSH disconnect risk not acknowledged)."
+        exit 1
+    fi
+}
+
+do_configure_lan_interface() {
+    # Idempotent: if the LAN already has the correct gateway IP, do not flush.
+    # This preserves any in-flight SSH session over the LAN interface on re-runs.
+    local already_configured=false
+    if lan_iface_has_gateway_ip; then
+        already_configured=true
+        echo "[lan] $LAN_IFACE already has $LAN_GATEWAY/24; skipping flush" >> "$LOG_FILE"
+    fi
+
+    if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager; then
+        if [ "$IS_WIRELESS" = true ]; then
+            if [ "$already_configured" != true ]; then
+                ip addr flush dev "$LAN_IFACE" 2>/dev/null || true
+                ip addr add "$LAN_GATEWAY/24" dev "$LAN_IFACE" 2>/dev/null || true
+            fi
+            ip link set "$LAN_IFACE" up
+        else
+            local con_name
+            con_name=$(nmcli -t -f NAME,DEVICE connection show | grep ":$LAN_IFACE$" | cut -d: -f1 | head -n1)
+            if [ -z "$con_name" ]; then
+                con_name="Wired connection $LAN_IFACE"
+                nmcli con add type ethernet ifname "$LAN_IFACE" con-name "$con_name" >> "$LOG_FILE" 2>&1 || true
+            fi
+            local current_method current_addr
+            current_method=$(nmcli -t -f ipv4.method connection show "$con_name" 2>/dev/null | cut -d: -f2)
+            current_addr=$(nmcli -t -f ipv4.addresses connection show "$con_name" 2>/dev/null | cut -d: -f2)
+            if [ "$current_method" != "manual" ] || [ "$current_addr" != "$LAN_GATEWAY/24" ]; then
+                nmcli con modify "$con_name" ipv4.addresses "$LAN_GATEWAY/24" ipv4.method manual >> "$LOG_FILE" 2>&1
+                nmcli con up "$con_name" >> "$LOG_FILE" 2>&1 || true
+            else
+                echo "[lan] NM connection '$con_name' already configured; skipping" >> "$LOG_FILE"
+            fi
+        fi
+    elif [ -f /etc/dhcpcd.conf ]; then
+        if grep -q '# VPN-GATEWAY-START' /etc/dhcpcd.conf \
+           && grep -A2 '# VPN-GATEWAY-START' /etc/dhcpcd.conf | grep -q "interface $LAN_IFACE" \
+           && grep -A3 '# VPN-GATEWAY-START' /etc/dhcpcd.conf | grep -q "static ip_address=$LAN_GATEWAY/24"; then
+            echo "[lan] dhcpcd stanza already correct; skipping" >> "$LOG_FILE"
+        else
+            sed -i '/# VPN-GATEWAY-START/,/# VPN-GATEWAY-END/d' /etc/dhcpcd.conf
+            {
+                echo '# VPN-GATEWAY-START'
+                echo "interface $LAN_IFACE"
+                echo "static ip_address=$LAN_GATEWAY/24"
+                echo 'nohook wpa_supplicant'
+                echo '# VPN-GATEWAY-END'
+            } >> /etc/dhcpcd.conf
+            systemctl restart dhcpcd >> "$LOG_FILE" 2>&1 || true
+        fi
+    else
+        if [ "$already_configured" != true ]; then
+            ip addr flush dev "$LAN_IFACE" 2>/dev/null || true
+            ip addr add "$LAN_GATEWAY/24" dev "$LAN_IFACE"
+        fi
+        ip link set "$LAN_IFACE" up
+    fi
+
+    do_configure_lan_ready_service
 }
 
 main() {
@@ -1426,6 +1717,11 @@ main() {
         save_config_var "WATCHDOG_ENABLED" "$WATCHDOG_ENABLED"
     fi
 
+    # SSH-safety check is the LAST input-phase step. After this, no prompts
+    # may appear until "Setup Complete". The script must run unattended so the
+    # operator can leave the session even if SSH is about to drop.
+    prompt_ssh_safety_warnings
+
     echo ""
     
     # --- Build Progress Steps ---
@@ -1504,6 +1800,13 @@ main() {
         "
     fi
     
+    # Capture hash of currently-installed wg config (used by do_start_wireguard
+    # to decide whether wg0 needs a restart at all).
+    WG_PREV_HASH=""
+    if [ -f "$WG_CONF_DEST" ]; then
+        WG_PREV_HASH=$(sha256sum "$WG_CONF_DEST" | awk '{print $1}')
+    fi
+
     # Install WireGuard config
     progress_run_step "Install WireGuard config" "cp \"$WG_CONF_SRC\" \"$WG_CONF_DEST\" && chmod 600 \"$WG_CONF_DEST\""
     
@@ -1516,64 +1819,24 @@ main() {
     fi
 
     # Configure LAN interface
-    progress_run_step "Configure LAN interface" "
-        ip addr flush dev '$LAN_IFACE' 2>/dev/null || true
-        if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager; then
-            if [ '$IS_WIRELESS' = true ]; then
-                # For wireless AP mode, we create a persistent systemd service
-                # since NetworkManager shouldn't manage the AP interface
-                cat > /etc/systemd/system/vpn-gateway-lan.service <<SYSTEMD_EOF
-[Unit]
-Description=VPN Gateway LAN Interface Setup
-Before=dnsmasq.service hostapd.service
-After=network.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStartPre=/usr/sbin/rfkill unblock wlan
-ExecStart=/bin/bash -c 'ip addr show dev $LAN_IFACE | grep -q $LAN_GATEWAY || ip addr add $LAN_GATEWAY/24 dev $LAN_IFACE'
-ExecStart=/bin/ip link set $LAN_IFACE up
-
-[Install]
-WantedBy=multi-user.target
-SYSTEMD_EOF
-                systemctl daemon-reload
-                systemctl enable vpn-gateway-lan.service
-                # Also set the IP now for immediate use
-                ip addr add '$LAN_GATEWAY/24' dev '$LAN_IFACE' 2>/dev/null || true
-                ip link set '$LAN_IFACE' up
-            else
-                CON_NAME=\$(nmcli -t -f NAME,DEVICE connection show | grep ':$LAN_IFACE$' | cut -d: -f1 | head -n1)
-                if [ -z \"\$CON_NAME\" ]; then
-                    CON_NAME='Wired connection $LAN_IFACE'
-                    nmcli con add type ethernet ifname '$LAN_IFACE' con-name \"\$CON_NAME\"
-                fi
-                nmcli con modify \"\$CON_NAME\" ipv4.addresses '$LAN_GATEWAY/24' ipv4.method manual
-                nmcli con up \"\$CON_NAME\"
-            fi
-        elif [ -f /etc/dhcpcd.conf ]; then
-            sed -i '/# VPN-GATEWAY-START/,/# VPN-GATEWAY-END/d' /etc/dhcpcd.conf
-            echo '# VPN-GATEWAY-START' >> /etc/dhcpcd.conf
-            echo 'interface $LAN_IFACE' >> /etc/dhcpcd.conf
-            echo 'static ip_address=$LAN_GATEWAY/24' >> /etc/dhcpcd.conf
-            echo 'nohook wpa_supplicant' >> /etc/dhcpcd.conf
-            echo '# VPN-GATEWAY-END' >> /etc/dhcpcd.conf
-            systemctl restart dhcpcd
-        else
-            ip addr add '$LAN_GATEWAY/24' dev '$LAN_IFACE'
-        fi
-    "
+    progress_run_step "Configure LAN interface" "do_configure_lan_interface"
     
     # Configure dnsmasq
+    # Backup original /etc/dnsmasq.conf only the first time so re-runs do not
+    # overwrite the genuine original (cleanup relies on this to restore state).
     progress_run_step "Configure DHCP server" "
-        mv /etc/dnsmasq.conf /etc/dnsmasq.conf.bak 2>/dev/null || true
+        if [ ! -f /etc/dnsmasq.conf.bak ] && [ -f /etc/dnsmasq.conf ]; then
+            cp /etc/dnsmasq.conf /etc/dnsmasq.conf.bak
+        fi
         cat > /etc/dnsmasq.conf <<DNSMASQ_EOF
+# Managed by raspberrypi-site2site-wireguard setup-vpn-gateway.sh
 interface=$LAN_IFACE
+except-interface=lo
+except-interface=$WAN_IFACE
+bind-dynamic
 dhcp-range=$DHCP_START,$DHCP_END,255.255.255.0,24h
 dhcp-option=option:dns-server,$LAN_GATEWAY
 dhcp-option=option:router,$LAN_GATEWAY
-bind-interfaces
 DNSMASQ_EOF
         systemctl restart dnsmasq
         systemctl enable dnsmasq
@@ -1620,6 +1883,9 @@ HOSTAPD_EOF
     else
         echo "[wan_firewall] Skipped (user disabled)" >> "$LOG_FILE"
     fi
+    # Always persist iptables/NAT to disk regardless of WAN firewall toggle so
+    # forwarding/MASQUERADE survives reboot even if wg0 fails to come up.
+    persist_iptables_rules
 
     # Auto-updates
     if [ "$AUTO_UPDATES_ENABLED" = "true" ]; then

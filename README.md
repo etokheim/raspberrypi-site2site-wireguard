@@ -42,7 +42,7 @@ Build a **plug-and-play site-to-site VPN** with a single **Raspberry Pi** and **
    ```bash
    sudo ./gateway-manage-or-setup.sh
    ```
-   - Select WAN and LAN interfaces (Enter accepts defaults).
+  - Select WAN and LAN interfaces (Enter accepts defaults). The picker now shows state/IP/MAC/driver and whether the NIC appears USB-backed.
    - If LAN is Wi‑Fi (e.g., `wlan0`), enter SSID/password; hostapd is auto-configured.
    - Provide the WireGuard config path (tab completion enabled).
    - Opt into a **static WAN IP** (recommended): the script detects the upstream router and suggests the second IP in the subnet (e.g. router `192.168.1.1` → `192.168.1.2`). You can override IP, prefix, gateway and DNS.
@@ -79,6 +79,7 @@ sudo ./gateway-manage-or-setup.sh [OPTIONS]
 - **Access Point (optional)**: hostapd with your SSID/password when LAN is wireless.
 - **Firewall (optional)**: hardened INPUT rules on WAN (allows SSH, WireGuard; drops other inbound).
 - **Service watchdog**: systemd restart policies for dnsmasq, WireGuard, hostapd (auto-restart on crash).
+- **Boot ordering hardening**: a persistent `vpn-gateway-lan.service` plus systemd drop-ins so LAN comes up before dnsmasq/hostapd/WireGuard.
 - **Hardware watchdog (optional)**: kernel-level auto-reboot if system hangs.
 - **Auto-updates (optional)**: unattended-upgrades for security patches.
 - **Persistence**: all settings survive reboots (systemd services, static IPs, iptables).
@@ -131,9 +132,19 @@ Cleanup will:
 |---------|----------|
 | **wg-quick DNS errors** | Ensure `resolvconf` is installed (handled by setup) and the endpoint hostname resolves. |
 | **Clients get DHCP but no internet** | Check `iptables -t nat -S \| grep MASQUERADE` and `iptables -S FORWARD`. Verify WireGuard handshake with `wg show`. |
-| **Gateway not working after reboot** | Run `sudo ./gateway-manage-or-setup.sh --start` or check `systemctl status wg-quick@wg0 dnsmasq hostapd`. |
+| **Gateway not working after reboot** | Check `systemctl status vpn-gateway-lan wg-quick@wg0 dnsmasq hostapd`, then run `sudo ./gateway-manage-or-setup.sh --start`. |
+| **dnsmasq says unknown interface** | Re-run `sudo ./gateway-manage-or-setup.sh --setup`, reselect the correct LAN interface using the metadata shown, then apply and reboot-test. |
 | **Wi-Fi AP not visible** | Check `rfkill list` for blocked wlan. Run `sudo rfkill unblock wlan`. |
 | **Using a wired AP instead of Pi Wi‑Fi** | Choose the Pi's Wi‑Fi as WAN and plug your wired AP/switch into the Pi's Ethernet as LAN. |
+
+For deeper boot diagnostics:
+
+```bash
+sudo systemctl status vpn-gateway-lan dnsmasq hostapd wg-quick@wg0
+sudo journalctl -b -u vpn-gateway-lan -u dnsmasq -u hostapd -u wg-quick@wg0 --no-pager
+ip -br link
+ip -br addr
+```
 
 ## Architecture
 
