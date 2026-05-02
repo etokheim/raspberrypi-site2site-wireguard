@@ -1,0 +1,23 @@
+---
+description: Dual-DNS plane: home DNS for LAN clients (via tunnel), public DNS for the Pi (via WAN)
+alwaysApply: true
+---
+
+# Dual-DNS Plane (Pi-Bypass Mode Only)
+
+When Pi-bypass routing is on (`PI_BYPASS_ROUTING=true`), locally-generated DNS lookups from the Pi go via WAN by default. Without explicit configuration, both the Pi *and* (transitively via dnsmasq) the LAN clients leak DNS to the WAN ISP, defeating GeoDNS / CDN routing for the home network.
+
+Two distinct DNS planes solve this:
+
+- **`HOME_DNS_SERVERS`** (LAN client plane): if set, dnsmasq is configured with `no-resolv` + one `server=<ip>` per entry. The lookups are Pi-local but their destination is inside an `AllowedIPs` subnet, so they ride the tunnel. LAN clients see geo-correct DNS.
+- **`PI_DNS_SERVERS`** (Pi plane): public resolvers (default `1.1.1.1 8.8.8.8`) wired into the Pi's `/etc/resolv.conf` via NetworkManager `ipv4.dns` + `ipv4.ignore-auto-dns yes`, dhcpcd's `static domain_name_servers` block, or a direct file write. The Pi keeps resolving apt / NTP / Pi Connect / the WG endpoint hostname even when the tunnel is down.
+
+Rules:
+
+- Both planes are gated on `PI_BYPASS_ROUTING=true`. In legacy mode, the Pi's own traffic goes through the tunnel anyway so the tunnel-side already provides DNS.
+- `HOME_DNS_SERVERS` entries must be covered by an `AllowedIPs` CIDR. The `prompt_home_dns` validator warns if not - WireGuard would otherwise drop the egress packets and LAN DNS would silently fail.
+- `do_configure_pi_dns` MUST use `nmcli dev reapply` (not `nmcli con up`) so changing DNS does not bounce the WAN link. An operator SSHed via WAN must not be dropped by a DNS change.
+- The dnsmasq config gets `no-resolv` ONLY when `HOME_DNS_SERVERS` is non-empty. With `no-resolv` set and zero `server=` entries, dnsmasq cannot resolve anything for LAN clients - never write that combination.
+- Backups: `/etc/dnsmasq.conf.bak` (created on first setup) and `/etc/resolv.conf.bak_gateway` (created on first `do_configure_pi_dns`) MUST be restored by cleanup. Do not overwrite the backup on re-runs.
+- `do_configure_pi_dns` must run BEFORE `do_configure_dnsmasq` so that `/etc/resolv.conf` reflects `PI_DNS_SERVERS` by the time dnsmasq starts (a pedantic safety net; dnsmasq's `no-resolv` makes it independent of resolv.conf, but the Pi's own lookups depend on it).
+- Do not couple `HOME_DNS_SERVERS` to wg-quick PostUp/PostDown. The home-DNS routing is implicit via the AllowedIPs subnet routes already installed by Pi-bypass `_wg_pi_bypass_up_cmds`.

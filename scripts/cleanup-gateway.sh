@@ -242,6 +242,43 @@ cleanup_dns_resolvconf() {
     fi
 }
 
+# Undo do_configure_pi_dns from setup-vpn-gateway.sh: restore the original
+# /etc/resolv.conf, drop the NM per-connection DNS overrides on WAN, and
+# remove the dhcpcd VPN-GATEWAY-PI-DNS block. Best-effort and idempotent.
+cleanup_pi_dns() {
+    local wan="$WAN_IFACE"
+
+    # NetworkManager: clear ipv4.dns and re-enable DHCP-supplied DNS.
+    if [ -n "$wan" ] && command -v nmcli >/dev/null 2>&1 \
+       && systemctl is-active --quiet NetworkManager; then
+        local con_name
+        con_name=$(nmcli -t -f NAME,DEVICE connection show 2>/dev/null \
+                   | grep ":$wan$" | cut -d: -f1 | head -n1)
+        if [ -n "$con_name" ]; then
+            echo "[pi_dns] Resetting NM ipv4.dns for '$con_name'" >> "$LOG_FILE"
+            nmcli con modify "$con_name" \
+                ipv4.ignore-auto-dns no \
+                ipv4.dns "" >> "$LOG_FILE" 2>&1 || true
+            nmcli dev reapply "$wan" >> "$LOG_FILE" 2>&1 \
+                || nmcli con up "$con_name" >> "$LOG_FILE" 2>&1 || true
+        fi
+    fi
+
+    # dhcpcd: strip the managed Pi-DNS block.
+    if [ -f /etc/dhcpcd.conf ] && grep -q '# VPN-GATEWAY-PI-DNS-START' /etc/dhcpcd.conf; then
+        echo "[pi_dns] Removing dhcpcd Pi-DNS block" >> "$LOG_FILE"
+        sed -i '/# VPN-GATEWAY-PI-DNS-START/,/# VPN-GATEWAY-PI-DNS-END/d' /etc/dhcpcd.conf
+        systemctl restart dhcpcd >> "$LOG_FILE" 2>&1 || true
+    fi
+
+    # Restore /etc/resolv.conf from backup if we wrote it directly.
+    if [ -e /etc/resolv.conf.bak_gateway ]; then
+        echo "[pi_dns] Restoring /etc/resolv.conf from backup" >> "$LOG_FILE"
+        cp -a /etc/resolv.conf.bak_gateway /etc/resolv.conf >> "$LOG_FILE" 2>&1 || true
+        rm -f /etc/resolv.conf.bak_gateway >> "$LOG_FILE" 2>&1 || true
+    fi
+}
+
 cleanup_gateway_nat_rules() {
     local lan_iface="$LAN_IFACE"
     local wan_iface="$WAN_IFACE"
@@ -407,6 +444,10 @@ main() {
     progress_add_step "Bring down WireGuard interface"
     progress_add_step "Stop DHCP server" "(dnsmasq)"
     progress_add_step "Clean up DNS" "(resolvconf)"
+    if [ -n "${PI_DNS_SERVERS:-}" ] || [ -e /etc/resolv.conf.bak_gateway ] \
+       || ([ -f /etc/dhcpcd.conf ] && grep -q '# VPN-GATEWAY-PI-DNS-START' /etc/dhcpcd.conf); then
+        progress_add_step "Restore Pi-local DNS" "(NM/dhcpcd/resolv.conf)"
+    fi
     
     # Check if hostapd is active
     local hostapd_active=false
@@ -471,6 +512,11 @@ main() {
     progress_run_step "Stop DHCP server" "systemctl stop dnsmasq 2>/dev/null; systemctl disable dnsmasq 2>/dev/null; true"
     
     progress_run_step "Clean up DNS" "cleanup_dns_resolvconf"
+
+    if [ -n "${PI_DNS_SERVERS:-}" ] || [ -e /etc/resolv.conf.bak_gateway ] \
+       || ([ -f /etc/dhcpcd.conf ] && grep -q '# VPN-GATEWAY-PI-DNS-START' /etc/dhcpcd.conf); then
+        progress_run_step "Restore Pi-local DNS" "cleanup_pi_dns"
+    fi
 
     if [ "$hostapd_active" = true ]; then
         progress_run_step "Stop Access Point" "systemctl stop hostapd; systemctl disable hostapd"

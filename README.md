@@ -74,7 +74,7 @@ sudo ./gateway-manage-or-setup.sh [OPTIONS]
 - **WireGuard** at `/etc/wireguard/wg0.conf`, `wg-quick@wg0` enabled, PostUp/PostDown iptables rules.
 - **Routing/NAT**: iptables forwarding and MASQUERADE from LAN → `wg0` (WAN MASQUERADE as secondary).
 - **Pi-bypass routing (recommended)**: forwarded LAN traffic goes through `wg0`; the Pi's *own* outbound (apt, Pi Connect, NTP, DNS, the WireGuard handshake itself) stays on WAN. See [How traffic is routed](#how-traffic-is-routed) below.
-- **DHCP/DNS**: dnsmasq on the LAN/AP subnet; DNS forwarded via WireGuard tunnel.
+- **DHCP/DNS**: dnsmasq on the LAN/AP subnet. With Pi-bypass routing the dual-DNS plane separates LAN client DNS (via `HOME_DNS_SERVERS` through the tunnel - geo-correct) from the Pi's own DNS (via `PI_DNS_SERVERS` over WAN - always reachable, even with the tunnel down). See [DNS plane separation](#dns-plane-separation-dual-dns-optional-but-recommended).
 - **Static IP (LAN)**: gateway `10.10.10.1/24` on the LAN/AP interface.
 - **Static IP (WAN, optional)**: fixed address on the upstream interface (suggested as the second IP in the router's subnet, e.g. `192.168.1.2` if the router is `192.168.1.1`).
 - **Access Point (optional)**: hostapd with your SSID/password when LAN is wireless.
@@ -119,8 +119,30 @@ The setup wizard asks once whether to enable **Pi-bypass routing** (recommended)
 - The Pi itself stays online because its traffic uses the main table, which is untouched. Remote management via Pi Connect, SSH-over-Internet, and apt continue to work.
 - This means an outage of the home WG peer disconnects LAN clients but never disconnects you from the Pi.
 
-#### DNS caveat
-LAN clients query the Pi's `dnsmasq`. dnsmasq forwards those queries upstream from the Pi (using the Pi's `resolv.conf`) - that upstream lookup is Pi-local traffic and therefore goes via WAN. So **LAN client DNS resolution keeps working even when the tunnel is down**. This is intentional; if you want DNS to also go via the tunnel, point dnsmasq at a DNS server in the home subnet (e.g. `server=10.33.33.53` in `/etc/dnsmasq.conf`) - that query then originates on the Pi to a home-subnet IP, which the main table routes via `wg0`.
+#### DNS plane separation (dual-DNS, optional but recommended)
+
+LAN clients query the Pi's `dnsmasq`. dnsmasq itself runs on the Pi, so where its *upstream* lookups go depends on how it is configured:
+
+- **`HOME_DNS_SERVERS` set** (recommended): dnsmasq is configured with `no-resolv` + `server=<home-dns-ip>`, so LAN client queries are forwarded to a DNS server inside the home network. Because that destination IP is covered by an `AllowedIPs` entry, the lookup goes via `wg0`. **GeoDNS / CDN responses match the home location**, even though the Pi sits abroad. Kill-switch: if `wg0` is down, LAN DNS stops working.
+- **`HOME_DNS_SERVERS` empty** (legacy / opt-out): dnsmasq falls back to the Pi's `/etc/resolv.conf`, which points at `PI_DNS_SERVERS` (public DNS via WAN). LAN DNS keeps working when the tunnel is down, but resolution geo-leaks to the WAN ISP's location.
+
+Either way, the **Pi's own** DNS is configured separately via `PI_DNS_SERVERS` (default `1.1.1.1 8.8.8.8`) and goes via WAN. apt, NTP, Pi Connect, and the WireGuard endpoint hostname keep resolving even when the tunnel is down, so remote management never breaks because of DNS.
+
+```
+LAN client ──DHCP-supplied DNS──> Pi (10.10.10.1)
+                                       │
+                                       │ dnsmasq
+                                       ▼
+                  ┌───── HOME_DNS_SERVERS set ─────┐
+                  │  no-resolv + server=10.33.33.1 │ ─► wg0 ─► home DNS (geo-correct)
+                  └────────────────────────────────┘
+                  ┌───── HOME_DNS_SERVERS empty ───┐
+                  │  uses Pi's /etc/resolv.conf    │ ─► WAN ─► public DNS (geo-leaks)
+                  └────────────────────────────────┘
+
+Pi-local lookups (apt, NTP, Pi Connect, wg endpoint) ─► /etc/resolv.conf
+                                                       (PI_DNS_SERVERS) ─► WAN ─► always works
+```
 
 ### Legacy / full-tunnel-including-Pi mode
 
@@ -164,6 +186,7 @@ Cleanup will:
 - Remove WAN firewall rules (if enabled)
 - Remove NAT/forward iptables rules; disable IP forwarding
 - Tear down Pi-bypass routing (the `iif=LAN` `ip rule`, the table-200 routes, IPv6 mirrors)
+- Restore Pi-local DNS settings (NetworkManager `ipv4.dns`, dhcpcd `static domain_name_servers` block, `/etc/resolv.conf` from backup)
 - Restore NetworkManager/dhcpcd to DHCP (on both LAN and WAN, if a static WAN IP was configured)
 - Remove watchdog configurations
 - Remove unattended-upgrades config (if auto-updates were enabled)

@@ -189,6 +189,67 @@ cidr_family() {
     esac
 }
 
+# Suggest a default home DNS server: the .1 of the first IPv4 home subnet.
+# Echoes empty string if no IPv4 home subnet was found in wg0.conf.
+suggest_home_dns_default() {
+    local cfg="$1"
+    [ -f "$cfg" ] || return 0
+    local cidr base
+    while IFS= read -r cidr; do
+        [ "$(cidr_family "$cidr")" = "4" ] || continue
+        base=$(echo "$cidr" | cut -d'/' -f1 | awk -F'.' '{print $1"."$2"."$3}')
+        if echo "$base" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "${base}.1"
+            return 0
+        fi
+    done < <(extract_home_subnets "$cfg")
+}
+
+# Normalize a free-form IP list (comma- or space-separated) into a single
+# space-separated, deduplicated list of valid IPv4 addresses. Invalid entries
+# are silently dropped; the caller is expected to surface them.
+normalize_ip_list() {
+    local raw="$1"
+    [ -z "$raw" ] && return 0
+    echo "$raw" | tr ',' ' ' | tr -s ' ' '\n' \
+        | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {
+              ok=1
+              n = split($0, p, ".")
+              for (i = 1; i <= n; i++) if (p[i] < 0 || p[i] > 255) ok=0
+              if (ok) print
+          }' \
+        | awk '!seen[$0]++' \
+        | tr '\n' ' ' | sed 's/[[:space:]]*$//'
+}
+
+# Convert IPv4 dotted-quad to a 32-bit unsigned integer (for prefix-match math).
+ipv4_to_uint() {
+    local ip="$1"
+    echo "$ip" | awk -F'.' '{ printf "%u", $1*16777216 + $2*65536 + $3*256 + $4 }'
+}
+
+# Test whether IPv4 $ip falls within IPv4 CIDR $cidr (e.g. "10.33.33.0/24").
+# Returns 0 (true) on match, 1 otherwise. Silently returns 1 on garbage input.
+ipv4_in_cidr() {
+    local ip="$1" cidr="$2"
+    local net prefix mask ip_int net_int
+    net="${cidr%/*}"
+    prefix="${cidr#*/}"
+    case "$cidr" in *":"*) return 1 ;; esac
+    case "$net"  in *":"*) return 1 ;; esac
+    [ -z "$prefix" ] && prefix=32
+    case "$prefix" in *[!0-9]*) return 1 ;; esac
+    [ "$prefix" -ge 0 ] && [ "$prefix" -le 32 ] || return 1
+    if [ "$prefix" = "0" ]; then
+        mask=0
+    else
+        mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+    fi
+    ip_int=$(ipv4_to_uint "$ip")
+    net_int=$(ipv4_to_uint "$net")
+    [ $(( ip_int & mask )) -eq $(( net_int & mask )) ]
+}
+
 # Detect default-route AllowedIPs in the user's WireGuard config.
 # Returns 0 (and echoes a short reason) if the config will redirect the Pi's
 # entire outbound traffic into the tunnel, which is the single most common
@@ -1266,6 +1327,167 @@ prompt_pi_bypass_routing() {
     fi
 }
 
+# Ask the operator for the home DNS server(s) that LAN clients' queries get
+# forwarded to via the tunnel. Persists HOME_DNS_SERVERS (space-separated).
+#
+# Only meaningful when Pi-bypass routing is enabled. In legacy mode the Pi's
+# default route is wg0 anyway, so dnsmasq's upstream lookups already go via
+# the tunnel - no separate config needed.
+#
+# Empty value is a valid answer: it means "do not redirect LAN client DNS
+# upstream to home", and dnsmasq will keep using whatever the Pi's
+# /etc/resolv.conf points to (i.e. PI_DNS_SERVERS, which leaks to public
+# DNS via WAN). We warn loudly because that is the GeoDNS leak the user
+# specifically wanted to fix.
+prompt_home_dns() {
+    if [ "${PI_BYPASS_ROUTING:-false}" != "true" ]; then
+        # In legacy mode the Pi's traffic goes through the tunnel by default,
+        # so dnsmasq's upstream DNS already routes home. Nothing to configure.
+        HOME_DNS_SERVERS="${HOME_DNS_SERVERS:-}"
+        save_config_var "HOME_DNS_SERVERS" "$HOME_DNS_SERVERS"
+        return
+    fi
+
+    local suggested=""
+    if [ -n "${WG_CONF_SRC:-}" ]; then
+        suggested=$(suggest_home_dns_default "$WG_CONF_SRC" 2>/dev/null || true)
+    fi
+
+    local default
+    if [ -n "${HOME_DNS_SERVERS:-}" ]; then
+        default="$HOME_DNS_SERVERS"
+    else
+        default="$suggested"
+    fi
+
+    echo ""
+    info "Home DNS forwarding (LAN clients -> home DNS via tunnel)"
+    echo -e "   ${BLUE}LAN clients send DNS queries to the Pi's dnsmasq, which then forwards${NC}"
+    echo -e "   ${BLUE}them to one of these servers. The forward goes through wg0, so DNS${NC}"
+    echo -e "   ${BLUE}resolution behaves as if the LAN client were on the home network${NC}"
+    echo -e "   ${BLUE}(GeoDNS / CDN routing matches your home location).${NC}"
+    echo ""
+    echo -e "   ${DIM}Each IP must be reachable through wg0 - i.e. covered by an${NC}"
+    echo -e "   ${DIM}AllowedIPs entry in your wg0.conf (typically the home subnet).${NC}"
+    echo -e "   ${DIM}Leave empty to skip; LAN client DNS will then leak to public DNS via WAN.${NC}"
+
+    if [ "$NONINTERACTIVE" = "true" ]; then
+        HOME_DNS_SERVERS="$(normalize_ip_list "$default")"
+        if [ -n "$HOME_DNS_SERVERS" ]; then
+            info "Non-interactive: HOME_DNS_SERVERS = '$HOME_DNS_SERVERS'"
+        else
+            warn "Non-interactive: HOME_DNS_SERVERS empty - LAN DNS will leak to public DNS via WAN."
+        fi
+        save_config_var "HOME_DNS_SERVERS" "$HOME_DNS_SERVERS"
+        return
+    fi
+
+    while true; do
+        if [ -n "$default" ]; then
+            echo -ne "   📡 Home DNS server IP(s) [default: ${BOLD}${YELLOW}${default}${NC}, empty=skip]: "
+        else
+            echo -ne "   📡 Home DNS server IP(s) (space/comma separated, empty=skip): "
+        fi
+        local raw
+        read -r raw < /dev/tty
+        if [ -z "$raw" ]; then
+            raw="$default"
+        fi
+        if [ -z "$raw" ]; then
+            HOME_DNS_SERVERS=""
+            warn "No home DNS configured - LAN DNS will leak to public DNS via WAN."
+            break
+        fi
+
+        local normalized
+        normalized=$(normalize_ip_list "$raw")
+        if [ -z "$normalized" ]; then
+            warn "No valid IPv4 addresses parsed from '$raw'. Try again."
+            continue
+        fi
+
+        # Validate each entry is covered by some AllowedIPs CIDR. Warn (do not
+        # block) - the user may add it to wg0.conf themselves before applying.
+        local subnets entry covered any_uncovered=false
+        subnets=$(extract_home_subnets "${WG_CONF_SRC:-/dev/null}" 2>/dev/null)
+        for entry in $normalized; do
+            covered=false
+            local cidr
+            for cidr in $subnets; do
+                if ipv4_in_cidr "$entry" "$cidr"; then covered=true; break; fi
+            done
+            if [ "$covered" != true ]; then
+                warn "  $entry is NOT covered by any AllowedIPs CIDR in wg0.conf."
+                warn "  WireGuard will drop packets to it unless you add it to AllowedIPs."
+                any_uncovered=true
+            fi
+        done
+
+        if [ "$any_uncovered" = true ]; then
+            echo -ne "   ${YELLOW}Use these values anyway? [y/N]: ${NC}"
+            local ack
+            read -r ack < /dev/tty
+            [[ "$ack" =~ ^[Yy]$ ]] || continue
+        fi
+
+        HOME_DNS_SERVERS="$normalized"
+        success "Home DNS: $HOME_DNS_SERVERS"
+        break
+    done
+
+    save_config_var "HOME_DNS_SERVERS" "$HOME_DNS_SERVERS"
+}
+
+# Ask the operator which DNS server(s) the Pi itself should use for its OWN
+# outbound name resolution (apt, NTP, Pi Connect bootstrap, the WireGuard
+# endpoint hostname, etc.). These run via WAN regardless of tunnel state.
+#
+# Default: 1.1.1.1 8.8.8.8 - matches the WAN-static-IP DNS default and is
+# resilient to single-provider outages.
+prompt_pi_dns() {
+    if [ "${PI_BYPASS_ROUTING:-false}" != "true" ]; then
+        # Legacy mode: the Pi's traffic goes via wg0 anyway. We do not touch
+        # /etc/resolv.conf so the Pi keeps using whatever DNS its WAN provider
+        # / NetworkManager hands it.
+        PI_DNS_SERVERS="${PI_DNS_SERVERS:-}"
+        save_config_var "PI_DNS_SERVERS" "$PI_DNS_SERVERS"
+        return
+    fi
+
+    local default="${PI_DNS_SERVERS:-1.1.1.1 8.8.8.8}"
+
+    echo ""
+    info "Pi-local DNS (used by the Pi itself, always via WAN)"
+    echo -e "   ${BLUE}This is the DNS the Pi resolves apt/NTP/Pi Connect/WireGuard endpoints${NC}"
+    echo -e "   ${BLUE}with. It must work even when the tunnel is down, otherwise package${NC}"
+    echo -e "   ${BLUE}updates and remote management break. Public resolvers are recommended.${NC}"
+
+    if [ "$NONINTERACTIVE" = "true" ]; then
+        PI_DNS_SERVERS="$(normalize_ip_list "$default")"
+        info "Non-interactive: PI_DNS_SERVERS = '$PI_DNS_SERVERS'"
+        save_config_var "PI_DNS_SERVERS" "$PI_DNS_SERVERS"
+        return
+    fi
+
+    while true; do
+        echo -ne "   🌐 DNS for the Pi itself [default: ${BOLD}${YELLOW}${default}${NC}]: "
+        local raw
+        read -r raw < /dev/tty
+        [ -z "$raw" ] && raw="$default"
+        local normalized
+        normalized=$(normalize_ip_list "$raw")
+        if [ -z "$normalized" ]; then
+            warn "No valid IPv4 addresses parsed from '$raw'. Try again."
+            continue
+        fi
+        PI_DNS_SERVERS="$normalized"
+        success "Pi-local DNS: $PI_DNS_SERVERS"
+        break
+    done
+
+    save_config_var "PI_DNS_SERVERS" "$PI_DNS_SERVERS"
+}
+
 prompt_wan_static_ip() {
     detect_wan_network "$WAN_IFACE"
 
@@ -1790,6 +2012,119 @@ prompt_ssh_safety_warnings() {
     fi
 }
 
+do_configure_dnsmasq() {
+    # Backup original /etc/dnsmasq.conf only the first time so re-runs do not
+    # overwrite the genuine original (cleanup relies on this to restore state).
+    if [ ! -f /etc/dnsmasq.conf.bak ] && [ -f /etc/dnsmasq.conf ]; then
+        cp /etc/dnsmasq.conf /etc/dnsmasq.conf.bak
+    fi
+
+    local server
+    {
+        printf '# Managed by raspberrypi-site2site-wireguard setup-vpn-gateway.sh\n'
+        printf 'interface=%s\n' "$LAN_IFACE"
+        printf 'except-interface=lo\n'
+        printf 'except-interface=%s\n' "$WAN_IFACE"
+        printf 'bind-dynamic\n'
+
+        # Dual-DNS plane (Option A): when home DNS is configured we forward LAN
+        # client queries to it via wg0 (geo-correct DNS). dnsmasq's own
+        # /etc/resolv.conf is then bypassed via 'no-resolv' so the Pi-local
+        # public-DNS settings (PI_DNS_SERVERS) do not bleed into LAN clients.
+        if [ -n "${HOME_DNS_SERVERS:-}" ]; then
+            printf 'no-resolv\n'
+            for server in $HOME_DNS_SERVERS; do
+                printf 'server=%s\n' "$server"
+            done
+        fi
+
+        printf 'dhcp-range=%s,%s,255.255.255.0,24h\n' "$DHCP_START" "$DHCP_END"
+        printf 'dhcp-option=option:dns-server,%s\n' "$LAN_GATEWAY"
+        printf 'dhcp-option=option:router,%s\n' "$LAN_GATEWAY"
+    } > /etc/dnsmasq.conf
+
+    systemctl restart dnsmasq
+    systemctl enable dnsmasq
+}
+
+# Configure the Pi's OWN DNS so that locally-generated lookups (apt, NTP,
+# Pi Connect, the WireGuard endpoint hostname, etc.) keep working via WAN
+# regardless of tunnel state. Backs up the previous /etc/resolv.conf the
+# first time so cleanup can restore it.
+#
+# Only runs when PI_BYPASS_ROUTING is enabled and PI_DNS_SERVERS is set; in
+# legacy mode we leave the system DNS configuration alone (the Pi's traffic
+# goes through the tunnel so the home peer's DNS is what gets used anyway).
+do_configure_pi_dns() {
+    if [ "${PI_BYPASS_ROUTING:-false}" != "true" ]; then
+        echo "[pi_dns] Pi-bypass disabled; leaving Pi DNS configuration alone." >> "$LOG_FILE"
+        return 0
+    fi
+    if [ -z "${PI_DNS_SERVERS:-}" ]; then
+        echo "[pi_dns] PI_DNS_SERVERS empty; not touching Pi DNS." >> "$LOG_FILE"
+        return 0
+    fi
+
+    echo "[pi_dns] Setting Pi-local DNS via WAN: $PI_DNS_SERVERS" >> "$LOG_FILE"
+
+    # Back up /etc/resolv.conf the first time so cleanup can restore it. We
+    # back up the file (or the symlink target if it is a symlink) verbatim.
+    if [ ! -e /etc/resolv.conf.bak_gateway ] && [ -e /etc/resolv.conf ]; then
+        cp -a /etc/resolv.conf /etc/resolv.conf.bak_gateway 2>>"$LOG_FILE" || true
+    fi
+
+    local applied=false
+
+    # Path 1: NetworkManager owns the WAN connection. Set per-connection DNS
+    # and ignore DHCP-supplied DNS so /etc/resolv.conf reflects PI_DNS_SERVERS.
+    # We use 'dev reapply' instead of 'con up' to avoid bouncing the link
+    # (which would briefly drop SSH if the operator is on WAN).
+    if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager; then
+        local con_name
+        con_name=$(nmcli -t -f NAME,DEVICE connection show 2>/dev/null \
+                   | grep ":$WAN_IFACE$" | cut -d: -f1 | head -n1)
+        if [ -n "$con_name" ]; then
+            local dns_csv="${PI_DNS_SERVERS// /,}"
+            nmcli con modify "$con_name" \
+                ipv4.ignore-auto-dns yes \
+                ipv4.dns "$dns_csv" >> "$LOG_FILE" 2>&1 || true
+            # 'dev reapply' avoids dropping the carrier; falls back to a quiet
+            # 'con up' only if reapply is unsupported or the connection is not
+            # currently active.
+            nmcli dev reapply "$WAN_IFACE" >> "$LOG_FILE" 2>&1 \
+                || nmcli con up "$con_name" >> "$LOG_FILE" 2>&1 || true
+            applied=true
+        fi
+    fi
+
+    # Path 2: dhcpcd. Inject a managed block scoped to WAN so the DHCP-supplied
+    # DNS is overridden but the rest of dhcpcd's behaviour is intact.
+    if [ "$applied" = false ] && [ -f /etc/dhcpcd.conf ]; then
+        sed -i '/# VPN-GATEWAY-PI-DNS-START/,/# VPN-GATEWAY-PI-DNS-END/d' /etc/dhcpcd.conf
+        {
+            echo '# VPN-GATEWAY-PI-DNS-START'
+            echo "interface $WAN_IFACE"
+            echo "static domain_name_servers=$PI_DNS_SERVERS"
+            echo '# VPN-GATEWAY-PI-DNS-END'
+        } >> /etc/dhcpcd.conf
+        systemctl restart dhcpcd >> "$LOG_FILE" 2>&1 || true
+        applied=true
+    fi
+
+    # Path 3: neither NM nor dhcpcd -> write /etc/resolv.conf directly. Best
+    # effort; some distros (resolvconf) will overwrite this on the next
+    # interface event, but Pi OS Lite without NM/dhcpcd is unusual.
+    if [ "$applied" = false ]; then
+        local server
+        {
+            echo "# Managed by raspberrypi-site2site-wireguard"
+            for server in $PI_DNS_SERVERS; do
+                echo "nameserver $server"
+            done
+        } > /etc/resolv.conf
+    fi
+}
+
 do_configure_lan_interface() {
     # Idempotent: if the LAN already has the correct gateway IP, do not flush.
     # This preserves any in-flight SSH session over the LAN interface on re-runs.
@@ -2127,6 +2462,21 @@ main() {
         else
             info "Pi-bypass routing: ${PI_BYPASS_ROUTING} (from saved config)."
         fi
+        # Dual-DNS plane (Option A): only meaningful when Pi-bypass is on.
+        # ${VAR+x} distinguishes "never set in config" (re-prompt) from
+        # "set to empty" (user opted out - keep that decision).
+        if [ "${PI_BYPASS_ROUTING:-false}" = "true" ]; then
+            if [ -z "${HOME_DNS_SERVERS+x}" ]; then
+                prompt_home_dns
+            else
+                info "Home DNS servers: '${HOME_DNS_SERVERS:-<none>}' (from saved config)."
+            fi
+            if [ -z "${PI_DNS_SERVERS+x}" ]; then
+                prompt_pi_dns
+            else
+                info "Pi-local DNS: '${PI_DNS_SERVERS:-<none>}' (from saved config)."
+            fi
+        fi
     else
         # Optional: configure a static IP on the WAN interface (recommended)
         if [ "$NONINTERACTIVE" = "true" ]; then
@@ -2171,6 +2521,13 @@ main() {
         # Pi-bypass routing: forwarded LAN -> wg0, Pi-local -> WAN.
         # Default Yes (strongly recommended); persisted so re-runs reuse it.
         prompt_pi_bypass_routing
+
+        # Dual-DNS plane (Option A): home DNS for LAN clients, public DNS for
+        # the Pi itself. Only meaningful when Pi-bypass routing is enabled.
+        if [ "${PI_BYPASS_ROUTING:-false}" = "true" ]; then
+            prompt_home_dns
+            prompt_pi_dns
+        fi
     fi
 
     # SSH-safety check is the LAST input-phase step. After this, no prompts
@@ -2202,7 +2559,14 @@ main() {
         progress_add_step "Configure WAN static IP" "$WAN_IFACE = ${WAN_STATIC_IP}/${WAN_STATIC_PREFIX}"
     fi
     progress_add_step "Configure LAN interface" "$LAN_IFACE = $LAN_GATEWAY"
-    progress_add_step "Configure DHCP server" "(dnsmasq)"
+    if [ "${PI_BYPASS_ROUTING:-false}" = "true" ] && [ -n "${PI_DNS_SERVERS:-}" ]; then
+        progress_add_step "Configure Pi-local DNS" "($PI_DNS_SERVERS via WAN)"
+    fi
+    if [ -n "${HOME_DNS_SERVERS:-}" ]; then
+        progress_add_step "Configure DHCP server" "(dnsmasq -> home DNS)"
+    else
+        progress_add_step "Configure DHCP server" "(dnsmasq)"
+    fi
     
     if [ "$IS_WIRELESS" = true ]; then
         progress_add_step "Configure Access Point" "(hostapd: $AP_SSID)"
@@ -2283,27 +2647,16 @@ main() {
 
     # Configure LAN interface
     progress_run_step "Configure LAN interface" "do_configure_lan_interface"
-    
+
+    # Configure Pi-local DNS (Option A: dual-DNS plane). Must run before
+    # dnsmasq is restarted - 'no-resolv' in dnsmasq.conf relies on
+    # PI_DNS_SERVERS being installed in /etc/resolv.conf for the Pi itself.
+    if [ "${PI_BYPASS_ROUTING:-false}" = "true" ] && [ -n "${PI_DNS_SERVERS:-}" ]; then
+        progress_run_step "Configure Pi-local DNS" "do_configure_pi_dns"
+    fi
+
     # Configure dnsmasq
-    # Backup original /etc/dnsmasq.conf only the first time so re-runs do not
-    # overwrite the genuine original (cleanup relies on this to restore state).
-    progress_run_step "Configure DHCP server" "
-        if [ ! -f /etc/dnsmasq.conf.bak ] && [ -f /etc/dnsmasq.conf ]; then
-            cp /etc/dnsmasq.conf /etc/dnsmasq.conf.bak
-        fi
-        cat > /etc/dnsmasq.conf <<DNSMASQ_EOF
-# Managed by raspberrypi-site2site-wireguard setup-vpn-gateway.sh
-interface=$LAN_IFACE
-except-interface=lo
-except-interface=$WAN_IFACE
-bind-dynamic
-dhcp-range=$DHCP_START,$DHCP_END,255.255.255.0,24h
-dhcp-option=option:dns-server,$LAN_GATEWAY
-dhcp-option=option:router,$LAN_GATEWAY
-DNSMASQ_EOF
-        systemctl restart dnsmasq
-        systemctl enable dnsmasq
-    "
+    progress_run_step "Configure DHCP server" "do_configure_dnsmasq"
     
     # Configure hostapd if wireless
     if [ "$IS_WIRELESS" = true ]; then

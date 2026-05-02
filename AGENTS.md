@@ -78,6 +78,45 @@ Any change that re-introduces a default route via `wg0` in the main
 routing table - or that ties non-tunnel-related rules to `wg-quick`
 PostUp/PostDown - is a regression.
 
+### Dual-DNS Plane (Pi-Bypass Mode)
+
+When Pi-bypass routing is on, locally-generated DNS lookups from the Pi
+no longer ride through the tunnel by default - they go via WAN like any
+other Pi-local traffic. That means without explicit DNS configuration,
+both the Pi *and* (via dnsmasq's upstream lookups) the LAN clients leak
+DNS to the WAN ISP, defeating GeoDNS / CDN routing.
+
+The fix is two distinct DNS planes, controlled by two `vpn-gateway.conf`
+variables:
+
+- `HOME_DNS_SERVERS` (LAN client plane): if non-empty, dnsmasq is
+  configured with `no-resolv` + one `server=<ip>` per entry. Those
+  upstream lookups come from the Pi's own user space, but their
+  destination IP is inside an `AllowedIPs` subnet, so the main table
+  routes them via `wg0`. LAN clients see geo-correct, home-anchored
+  DNS resolution. Empty value = legacy behaviour (LAN DNS leaks).
+- `PI_DNS_SERVERS` (Pi plane): public resolvers (default
+  `1.1.1.1 8.8.8.8`) installed via NetworkManager `ipv4.dns` +
+  `ipv4.ignore-auto-dns yes`, dhcpcd `static domain_name_servers` block,
+  or a direct `/etc/resolv.conf` write. The Pi keeps resolving apt /
+  NTP / Pi Connect / the WireGuard endpoint hostname **even when the
+  tunnel is down**, so DNS is never the reason remote management fails.
+
+Rules:
+
+- Both planes are only meaningful when `PI_BYPASS_ROUTING=true`. In
+  legacy mode the Pi's own traffic goes through the tunnel anyway, so
+  the tunnel-side already provides DNS.
+- `HOME_DNS_SERVERS` entries must be covered by an `AllowedIPs` CIDR;
+  the input prompt validates this and warns loudly. Otherwise WireGuard
+  drops the egress packets and LAN DNS silently fails.
+- Backups: `/etc/dnsmasq.conf.bak` is created the first time setup
+  rewrites it; `/etc/resolv.conf.bak_gateway` is created the first time
+  `do_configure_pi_dns` runs. Cleanup must restore both.
+- `do_configure_pi_dns` must use `nmcli dev reapply` (not `nmcli con
+  up`) so changing DNS does not bounce the WAN link and drop SSH for
+  an operator on the WAN interface.
+
 ### Disconnect-Safe Execution
 
 The execution phase must finish on its own even if the operator's terminal goes away (SSH drop, Pi Connect WebRTC failure, serial hang-up, laptop closed). Half-applied state on a remote Pi can be unrecoverable.
