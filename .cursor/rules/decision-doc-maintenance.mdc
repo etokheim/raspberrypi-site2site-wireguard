@@ -1,0 +1,19 @@
+---
+description: Keep AI instruction docs updated with durable decisions
+alwaysApply: true
+---
+
+# Maintain Agent Instructions
+
+When a user prompt contains a durable project decision, policy, or workflow constraint:
+
+- Update `AGENTS.md` in the same task.
+- Update relevant rule files under `.cursor/rules/` in the same task.
+- Write short, concrete instructions focused on future agent behavior.
+- Do not wait for a separate "docs" request when the decision affects future sessions.
+
+Examples of durable decisions:
+
+- Setup UX/process requirements
+- Operational safety requirements
+- Non-obvious architecture or deployment constraints

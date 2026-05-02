@@ -1,0 +1,19 @@
+---
+description: Enforce unattended-friendly setup flow
+alwaysApply: true
+---
+
+# Setup Flow: Gather First, Execute Second
+
+For setup/reconfiguration tasks, always separate work into:
+
+1. Input collection and validation
+2. Execution
+
+Rules:
+
+- Collect all required user choices before long-running steps.
+- Do not install dependencies while still gathering configuration answers.
+- Ask remaining critical questions early, then execute in one unattended run.
+- Keep prompts concise and front-loaded so the user can leave setup unattended.
+- Preserve idempotency for re-runs and reboot recovery.
