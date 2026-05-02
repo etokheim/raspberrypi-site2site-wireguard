@@ -133,6 +133,135 @@ detect_ssh_iface() {
         }'
 }
 
+# Detect whether Raspberry Pi Connect (or a similar remote-management daemon
+# that depends on outbound Internet) is running. Pi Connect uses a userspace
+# WebRTC client that needs the Pi's default route to reach Raspberry Pi's
+# relay; anything that hijacks the default route (e.g. WireGuard with
+# AllowedIPs = 0.0.0.0/0) will tear its session down.
+#
+# Returns 0 if active, 1 otherwise. Echoes a short label on success.
+detect_pi_connect_active() {
+    # Active systemd unit (system or user scope) is the most reliable signal.
+    if systemctl is-active --quiet rpi-connect 2>/dev/null \
+       || systemctl --user is-active --quiet rpi-connect 2>/dev/null; then
+        echo "rpi-connect"
+        return 0
+    fi
+    # Fallback: a process whose name matches rpi-connect / rpi-connect-wayvnc.
+    if pgrep -f 'rpi-connect(-wayvnc)?' >/dev/null 2>&1; then
+        echo "rpi-connect"
+        return 0
+    fi
+    return 1
+}
+
+# Detect default-route AllowedIPs in the user's WireGuard config.
+# Returns 0 (and echoes a short reason) if the config will redirect the Pi's
+# entire outbound traffic into the tunnel, which is the single most common
+# way a remote-managed Pi loses its management plane after wg-quick up.
+detect_wg_default_route() {
+    local cfg="$1"
+    [ -f "$cfg" ] || return 1
+
+    # Look at every AllowedIPs line; split on commas; trim whitespace; check
+    # for any of: 0.0.0.0/0, ::/0, or the 0.0.0.0/1 + 128.0.0.0/1 split-default
+    # trick used by some VPN configs to bypass policy routing.
+    awk '
+        BEGIN { has_lo=0; has_hi=0; matched="" }
+        /^[[:space:]]*AllowedIPs[[:space:]]*=/ {
+            sub(/^[^=]*=[[:space:]]*/, "", $0)
+            n = split($0, parts, ",")
+            for (i = 1; i <= n; i++) {
+                gsub(/[[:space:]]/, "", parts[i])
+                if (parts[i] == "0.0.0.0/0" || parts[i] == "::/0") {
+                    matched = "default-route (" parts[i] ")"
+                    next
+                }
+                if (parts[i] == "0.0.0.0/1") has_lo=1
+                if (parts[i] == "128.0.0.0/1") has_hi=1
+            }
+        }
+        END {
+            # exit code in awk body does not skip END, so use a flag instead.
+            if (matched != "") {
+                print matched
+                exit 0
+            }
+            if (has_lo && has_hi) {
+                print "split-default-route (0.0.0.0/1 + 128.0.0.0/1)"
+                exit 0
+            }
+            exit 1
+        }
+    ' "$cfg"
+}
+
+# Make this script survive a hangup of its controlling terminal (SSH drop,
+# Pi Connect WebRTC failure, serial console close, etc.) so that the
+# execution phase can finish unattended after every interactive prompt has
+# already been answered.
+#
+# Mechanics:
+#   1. trap '' HUP            -> ignore SIGHUP. Inherited (as ignored) by all
+#                                 child processes via fork+exec, so wg-quick,
+#                                 systemctl, apt-get, dnsmasq restarts, etc.
+#                                 will not be killed if the operator's TTY
+#                                 disappears.
+#   2. exec </dev/null        -> any later read would block forever on a dead
+#                                 TTY; close stdin to fail-fast instead.
+#   3. exec >>"$LOG_FILE" 2>&1 -> redirect this script's own stdout/stderr to
+#                                 the log file. Subsequent writes can no
+#                                 longer hit a closed pty (which would fail
+#                                 with EIO and abort the script).
+#   4. tail -f --pid=$$ ...   -> spawn a background mirror that streams new
+#                                 log content to the operator's TTY for as
+#                                 long as the TTY is alive. When the TTY dies
+#                                 the tail process exits silently; the main
+#                                 script keeps writing to the log file.
+#
+# After this function returns, NOTHING in the script may prompt the user.
+become_unattended() {
+    if [ "${VPN_GATEWAY_DETACHED:-0}" = "1" ]; then
+        return 0
+    fi
+
+    local tty_dev=""
+    tty_dev=$(tty 2>/dev/null) || tty_dev=""
+
+    echo ""
+    if [ -n "$tty_dev" ] && [ "$tty_dev" != "not a tty" ]; then
+        info "Input collected. Switching to unattended mode - setup will continue even if your connection drops."
+        info "Live progress (this terminal): tail -f $LOG_FILE"
+        info "After reconnecting, check status with: systemctl is-active vpn-gateway-lan dnsmasq wg-quick@wg0"
+        echo ""
+        sleep 1
+    fi
+
+    trap '' HUP
+    exec </dev/null
+
+    mkdir -p "$(dirname "$LOG_FILE")"
+    : >> "$LOG_FILE"
+
+    # Mirror new log lines to the operator's TTY (best-effort) while it is
+    # still attached. The mirror dies when the TTY is closed; the main script
+    # is unaffected because it now writes only to the log file.
+    if [ -n "$tty_dev" ] && [ "$tty_dev" != "not a tty" ] && [ -w "$tty_dev" ]; then
+        # --pid=$$ keeps the tail bound to the lifetime of this script.
+        ( tail -n0 -f --pid=$$ "$LOG_FILE" >"$tty_dev" 2>/dev/null ) &
+        TAIL_PID=$!
+        disown "$TAIL_PID" 2>/dev/null || true
+    fi
+
+    exec >>"$LOG_FILE" 2>&1
+
+    export VPN_GATEWAY_DETACHED=1
+    echo ""
+    echo "================================================================"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Entered unattended execution phase"
+    echo "================================================================"
+}
+
 parse_wg_listen_port() {
     local cfg="$1"
     local port
@@ -1313,15 +1442,28 @@ lan_iface_has_gateway_ip() {
         | awk '{print $4}' | grep -qx "$LAN_GATEWAY/24"
 }
 
-# Collect any user confirmations needed because of SSH-disconnect risk during
-# install. MUST be called during the input-collection phase only - never during
-# execution - so the run can proceed unattended once started.
+# Collect any user confirmations needed because of remote-management
+# disconnect risk during install. MUST be called during the input-collection
+# phase only - never during execution - so the run can proceed unattended
+# once started.
+#
+# Detected risks:
+#   - SSH session on LAN interface that will be reconfigured.
+#   - SSH session on WAN interface that will get a new static IP.
+#   - Pi Connect / similar daemon active and a step that will route the
+#     Pi's outbound traffic through wg0 (AllowedIPs default-route).
+#   - Generic Pi Connect detection without WireGuard default-route -
+#     informational only; the script will still self-detach so a Pi Connect
+#     drop cannot leave setup half-done.
 prompt_ssh_safety_warnings() {
     SSH_DISCONNECT_ACK="false"
     SSH_IFACE="$(detect_ssh_iface)"
 
-    if [ -z "$SSH_IFACE" ]; then
-        return 0
+    local pi_connect_active wg_default_route
+    pi_connect_active=$(detect_pi_connect_active 2>/dev/null || true)
+    wg_default_route=""
+    if [ -n "${WG_CONF_SRC:-}" ]; then
+        wg_default_route=$(detect_wg_default_route "$WG_CONF_SRC" 2>/dev/null || true)
     fi
 
     local wan_static_planned="${WAN_STATIC_IP_ENABLED:-false}"
@@ -1331,16 +1473,45 @@ prompt_ssh_safety_warnings() {
     fi
 
     local risk=false risk_lines=()
-    if [ "$SSH_IFACE" = "$LAN_IFACE" ] && [ "$lan_will_change" = true ]; then
-        risk=true
-        risk_lines+=("• Your SSH session is on the planned LAN interface ($SSH_IFACE).")
-        risk_lines+=("  The LAN interface will be reconfigured to $LAN_GATEWAY/24 - this WILL drop your SSH session.")
+
+    if [ -n "$SSH_IFACE" ]; then
+        if [ "$SSH_IFACE" = "$LAN_IFACE" ] && [ "$lan_will_change" = true ]; then
+            risk=true
+            risk_lines+=("• Your SSH session is on the planned LAN interface ($SSH_IFACE).")
+            risk_lines+=("  The LAN interface will be reconfigured to $LAN_GATEWAY/24 - this WILL drop your SSH session.")
+        fi
+        if [ "$SSH_IFACE" = "$WAN_IFACE" ] && [ "$wan_static_planned" = "true" ]; then
+            risk=true
+            risk_lines+=("• Your SSH session is on the WAN interface ($SSH_IFACE).")
+            risk_lines+=("  WAN static IP reassignment to $WAN_STATIC_IP/$WAN_STATIC_PREFIX WILL drop your SSH session.")
+            risk_lines+=("  Reconnect after install at: ssh <user>@$WAN_STATIC_IP")
+        fi
     fi
-    if [ "$SSH_IFACE" = "$WAN_IFACE" ] && [ "$wan_static_planned" = "true" ]; then
+
+    if [ -n "$wg_default_route" ]; then
         risk=true
-        risk_lines+=("• Your SSH session is on the WAN interface ($SSH_IFACE).")
-        risk_lines+=("  WAN static IP reassignment to $WAN_STATIC_IP/$WAN_STATIC_PREFIX WILL drop your SSH session.")
-        risk_lines+=("  Reconnect after install at: ssh <user>@$WAN_STATIC_IP")
+        risk_lines+=("• WireGuard config has $wg_default_route in AllowedIPs.")
+        risk_lines+=("  Starting wg0 will route ALL the Pi's outbound traffic through the tunnel.")
+        if [ -n "$pi_connect_active" ]; then
+            risk_lines+=("  Raspberry Pi Connect is active - its WebRTC session WILL be dropped")
+            risk_lines+=("  unless your WireGuard peer NATs the Pi's traffic out to the Internet.")
+        else
+            risk_lines+=("  Any remote-management session that depends on outbound Internet (SSH over")
+            risk_lines+=("  the public IP, Pi Connect, ngrok, etc.) WILL be dropped unless your peer")
+            risk_lines+=("  NATs the Pi's traffic out to the Internet.")
+        fi
+        if [ -z "$SSH_IFACE" ] && [ -z "$pi_connect_active" ]; then
+            risk_lines+=("  (You appear to be on a local console - no immediate action needed.)")
+        fi
+    fi
+
+    # Pi Connect on its own - no WG default route, no SSH session - is not a
+    # hard risk, but the operator should still know that the script will
+    # self-detach so a Pi Connect blip cannot leave setup half-done.
+    if [ -z "$SSH_IFACE" ] && [ -n "$pi_connect_active" ] && [ -z "$wg_default_route" ]; then
+        echo ""
+        info "Detected Raspberry Pi Connect session. Setup will detach from your"
+        info "terminal after the input phase so any Connect blip cannot interrupt it."
     fi
 
     if [ "$risk" = false ]; then
@@ -1349,23 +1520,26 @@ prompt_ssh_safety_warnings() {
     fi
 
     echo ""
-    warn "SSH disconnect risk detected:"
+    warn "Remote-management disconnect risk detected:"
     local line
     for line in "${risk_lines[@]}"; do
         echo -e "   ${YELLOW}${line}${NC}"
     done
     echo ""
+    info "After acknowledging, setup will switch to UNATTENDED mode and"
+    info "continue running even if your terminal disconnects."
+    echo ""
     if [ "$NONINTERACTIVE" = "true" ]; then
-        info "Non-interactive: proceeding (the operator must reconnect manually if SSH drops)."
+        info "Non-interactive: proceeding (the operator must reconnect manually if disconnected)."
         SSH_DISCONNECT_ACK="true"
         return 0
     fi
-    echo -ne "❓ ${YELLOW}Acknowledge and continue? Setup will run unattended. [y/N]:${NC} "
+    echo -ne "❓ ${YELLOW}Acknowledge and continue? [y/N]:${NC} "
     read -r ack < /dev/tty
     if [[ "$ack" =~ ^[Yy]$ ]]; then
         SSH_DISCONNECT_ACK="true"
     else
-        error "Aborted by user (SSH disconnect risk not acknowledged)."
+        error "Aborted by user (disconnect risk not acknowledged)."
         exit 1
     fi
 }
@@ -1810,7 +1984,14 @@ main() {
     # Reset box line count - the prompt invalidated our cursor position
     PROGRESS_BOX_LINES=0
     echo ""
-    
+
+    # --- Boundary: input -> execution ---
+    # All user input has been collected. Detach from the controlling terminal
+    # so a dropped SSH / Pi Connect / serial session cannot kill us mid-step
+    # and leave the Pi in a half-configured state. After this point, NOTHING
+    # in the script may prompt the user.
+    become_unattended
+
     # --- Execute Steps ---
     
     # Install dependencies

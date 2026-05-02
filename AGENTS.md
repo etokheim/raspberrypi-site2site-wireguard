@@ -56,6 +56,15 @@ Re-running setup on a configured Pi must reconfigure cleanly and fix prior reboo
 - Avoid destructive restarts (e.g., `wg-quick down`) when nothing changed.
 - The `--start` recovery path should also create/update missing systemd units, not just start them.
 
+### Disconnect-Safe Execution
+
+The execution phase must finish on its own even if the operator's terminal goes away (SSH drop, Pi Connect WebRTC failure, serial hang-up, laptop closed). Half-applied state on a remote Pi can be unrecoverable.
+
+- After the input phase, the script must detach from its controlling terminal: ignore `SIGHUP`, close stdin, and route stdout/stderr to the persistent log file.
+- Live progress on the operator's TTY may be provided by a side-channel `tail -f` that dies harmlessly when the TTY goes away.
+- Detect remote-management daemons (Raspberry Pi Connect, etc.) before the execution phase and warn explicitly when WireGuard `AllowedIPs` includes a default route (`0.0.0.0/0`, `::/0`, or `0.0.0.0/1` + `128.0.0.0/1`) - that single setting is the most common way a remote-managed Pi loses its management plane after `wg-quick up`.
+- Never add a prompt after the input phase. Any new question must move into the input-collection block.
+
 ## Living Decisions (Automatic Maintenance)
 
 When a user prompt introduces a new durable project decision:
