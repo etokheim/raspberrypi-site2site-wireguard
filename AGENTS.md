@@ -163,9 +163,14 @@ Rules:
 - `custom` mode entries must be covered by an `AllowedIPs` CIDR (a
   default-route `0.0.0.0/0` / `::/0` / split-default counts as coverage
   for that family); the input prompt validates this and warns loudly.
-- dnsmasq must set `IGNORE_RESOLVCONF=yes` in `/etc/default/dnsmasq` so
-  the Debian package does not register `127.0.0.1` with resolvconf and
-  hijack the Pi's own resolver (breaks apt + WG endpoint hostname).
+- dnsmasq must set `IGNORE_RESOLVCONF=yes` and `DNSMASQ_EXCEPT=lo` in
+  `/etc/default/dnsmasq` so the Debian package does not register
+  `127.0.0.1` with resolvconf and hijack the Pi's own resolver (breaks
+  apt + WG endpoint hostname).
+- Even when NetworkManager reapplies DNS successfully, also pin
+  `PI_DNS_SERVERS` via resolvconf `head` when that package is installed
+  (`/etc/resolv.conf` is often a resolvconf symlink NM does not fill).
+  Verify/repair resolv.conf after dnsmasq restart and before `wg-quick up`.
 - Legacy compat: a saved `HOME_DNS_SERVERS` without `HOME_DNS_MODE`
   (from before this redesign) is translated by
   `infer_home_dns_mode_legacy` to `MODE=custom` if non-empty, else

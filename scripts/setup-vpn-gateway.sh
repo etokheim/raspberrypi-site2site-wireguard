@@ -702,6 +702,11 @@ do_configure_wg_firewall_rules() {
 }
 
 do_start_wireguard() {
+    # Pi DNS must work before wg-quick resolves a hostname Endpoint=.
+    if [ "${PI_BYPASS_ROUTING:-false}" = "true" ] && [ -n "${PI_DNS_SERVERS:-}" ]; then
+        verify_or_repair_pi_dns
+    fi
+
     # Skip restart if wg0 is already up and the installed config has not changed
     # since the previous run (avoids gratuitous tunnel + LAN-traffic blip).
     local installed_hash="" prev_hash="${WG_PREV_HASH:-}"
@@ -2308,22 +2313,7 @@ do_configure_dnsmasq() {
         cp /etc/dnsmasq.conf /etc/dnsmasq.conf.bak
     fi
 
-    # Prevent Debian's dnsmasq package from registering 127.0.0.1 with
-    # resolvconf. That hijacks the Pi's own resolver and breaks apt / the
-    # WireGuard endpoint hostname lookup (exactly the failure mode where
-    # wg-quick reports "Temporary failure in name resolution").
-    if [ -f /etc/default/dnsmasq ]; then
-        if grep -qE '^[[:space:]]*IGNORE_RESOLVCONF=' /etc/default/dnsmasq; then
-            sed -i 's/^[[:space:]]*IGNORE_RESOLVCONF=.*/IGNORE_RESOLVCONF=yes/' /etc/default/dnsmasq
-        else
-            printf '\n# Managed by raspberrypi-site2site-wireguard: keep Pi DNS on WAN\nIGNORE_RESOLVCONF=yes\n' \
-                >> /etc/default/dnsmasq
-        fi
-    fi
-    # Drop any leftover lo.dnsmasq record from a previous package-default start.
-    if command -v resolvconf >/dev/null 2>&1; then
-        resolvconf -d lo.dnsmasq >> "$LOG_FILE" 2>&1 || true
-    fi
+    ensure_dnsmasq_no_resolv_hijack
 
     local server
     {
@@ -2371,6 +2361,146 @@ do_configure_dnsmasq() {
 
     systemctl restart dnsmasq
     systemctl enable dnsmasq
+
+    # dnsmasq restart is the most common moment resolv.conf gets hijacked to
+    # 127.0.0.1; re-assert Pi WAN DNS immediately.
+    ensure_dnsmasq_no_resolv_hijack
+    if [ "${PI_BYPASS_ROUTING:-false}" = "true" ] && [ -n "${PI_DNS_SERVERS:-}" ]; then
+        pin_pi_dns_via_resolvconf
+        verify_or_repair_pi_dns
+    fi
+}
+
+# Stop Debian dnsmasq from owning the Pi's stub resolver.
+# Without this, /etc/resolv.conf becomes "nameserver 127.0.0.1" while dnsmasq
+# only listens on $LAN_IFACE — Pi-local lookups (apt, WG Endpoint hostname)
+# fail with "Temporary failure in name resolution".
+ensure_dnsmasq_no_resolv_hijack() {
+    if [ -f /etc/default/dnsmasq ]; then
+        if grep -qE '^[[:space:]]*IGNORE_RESOLVCONF=' /etc/default/dnsmasq; then
+            sed -i 's/^[[:space:]]*IGNORE_RESOLVCONF=.*/IGNORE_RESOLVCONF=yes/' /etc/default/dnsmasq
+        else
+            printf '\n# Managed by raspberrypi-site2site-wireguard: keep Pi DNS on WAN\nIGNORE_RESOLVCONF=yes\n' \
+                >> /etc/default/dnsmasq
+        fi
+        # Also exclude lo so resolvconf hooks cannot publish 127.0.0.1.
+        if grep -qE '^[[:space:]]*DNSMASQ_EXCEPT=' /etc/default/dnsmasq; then
+            sed -i 's/^[[:space:]]*DNSMASQ_EXCEPT=.*/DNSMASQ_EXCEPT=lo/' /etc/default/dnsmasq
+        else
+            printf 'DNSMASQ_EXCEPT=lo\n' >> /etc/default/dnsmasq
+        fi
+    fi
+    if command -v resolvconf >/dev/null 2>&1; then
+        resolvconf -d lo.dnsmasq >> "$LOG_FILE" 2>&1 || true
+        # Some packages also register as dnsmasq / eth0.dnsmasq etc.
+        resolvconf -d dnsmasq >> "$LOG_FILE" 2>&1 || true
+    fi
+}
+
+# Pin PI_DNS_SERVERS at the top of resolvconf's merge (head file). Must run
+# even when NetworkManager also configures DNS: installing the resolvconf
+# package often makes /etc/resolv.conf a resolvconf symlink, so NM reapply
+# alone does not guarantee the libc resolver sees our servers.
+pin_pi_dns_via_resolvconf() {
+    [ -n "${PI_DNS_SERVERS:-}" ] || return 0
+    command -v resolvconf >/dev/null 2>&1 || return 0
+    local server
+    {
+        for server in $PI_DNS_SERVERS; do
+            echo "nameserver $server"
+        done
+    } | resolvconf -a "wan.${WAN_IFACE}.vpn-gateway" >> "$LOG_FILE" 2>&1 || true
+    mkdir -p /etc/resolvconf/resolv.conf.d
+    {
+        echo "# Managed by raspberrypi-site2site-wireguard"
+        for server in $PI_DNS_SERVERS; do
+            echo "nameserver $server"
+        done
+    } > /etc/resolvconf/resolv.conf.d/head
+    resolvconf -u >> "$LOG_FILE" 2>&1 || true
+}
+
+# Return 0 if /etc/resolv.conf looks usable for Pi-local WAN DNS.
+pi_dns_resolv_conf_ok() {
+    [ -n "${PI_DNS_SERVERS:-}" ] || return 1
+    [ -e /etc/resolv.conf ] || return 1
+    local ns has_non_loopback=false has_configured=false
+    while read -r ns; do
+        [ -z "$ns" ] && continue
+        case "$ns" in
+            127.*|::1) continue ;;
+        esac
+        has_non_loopback=true
+        local s
+        for s in $PI_DNS_SERVERS; do
+            if [ "$ns" = "$s" ]; then
+                has_configured=true
+                break
+            fi
+        done
+    done < <(awk '/^[[:space:]]*nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf)
+
+    # Prefer an explicit PI_DNS_SERVERS hit; otherwise any non-loopback NS is OK.
+    if [ "$has_configured" = true ]; then
+        return 0
+    fi
+    [ "$has_non_loopback" = true ]
+}
+
+# If resolv.conf is wrong after NM/dnsmasq/resolvconf churn, force PI_DNS_SERVERS
+# into place so the rest of setup (WG Endpoint hostname, apt) can resolve.
+verify_or_repair_pi_dns() {
+    [ "${PI_BYPASS_ROUTING:-false}" = "true" ] || return 0
+    [ -n "${PI_DNS_SERVERS:-}" ] || return 0
+
+    if pi_dns_resolv_conf_ok; then
+        echo "[pi_dns] resolv.conf OK: $(tr '\n' ' ' < /etc/resolv.conf | tr -s ' ')" >> "$LOG_FILE"
+        return 0
+    fi
+
+    echo "[pi_dns] resolv.conf broken or missing PI_DNS_SERVERS; repairing..." >> "$LOG_FILE"
+    echo "[pi_dns] before repair:" >> "$LOG_FILE"
+    cat /etc/resolv.conf >> "$LOG_FILE" 2>/dev/null || echo "(missing)" >> "$LOG_FILE"
+
+    ensure_dnsmasq_no_resolv_hijack
+    pin_pi_dns_via_resolvconf
+
+    if ! pi_dns_resolv_conf_ok; then
+        # Last resort: replace resolv.conf with a plain file. NetworkManager
+        # or resolvconf may overwrite later; head pin + IGNORE_RESOLVCONF
+        # usually keep it stable. Prefer replacing a symlink's target when
+        # possible; otherwise replace the path itself.
+        local server
+        local content
+        content=$(
+            echo "# Managed by raspberrypi-site2site-wireguard (repair)"
+            for server in $PI_DNS_SERVERS; do
+                echo "nameserver $server"
+            done
+        )
+        if [ -L /etc/resolv.conf ]; then
+            local target
+            target=$(readlink -f /etc/resolv.conf 2>/dev/null || true)
+            if [ -n "$target" ] && [ -d "$(dirname "$target")" ]; then
+                printf '%s\n' "$content" > "$target"
+            else
+                rm -f /etc/resolv.conf
+                printf '%s\n' "$content" > /etc/resolv.conf
+            fi
+        else
+            printf '%s\n' "$content" > /etc/resolv.conf
+        fi
+    fi
+
+    echo "[pi_dns] after repair:" >> "$LOG_FILE"
+    cat /etc/resolv.conf >> "$LOG_FILE" 2>/dev/null || true
+
+    if pi_dns_resolv_conf_ok; then
+        echo "[pi_dns] repair succeeded" >> "$LOG_FILE"
+        return 0
+    fi
+    echo "[pi_dns] WARNING: repair may not have stuck; WG Endpoint hostname resolution can still fail" >> "$LOG_FILE"
+    return 0
 }
 
 # Configure the Pi's OWN DNS so that locally-generated lookups (apt, NTP,
@@ -2393,20 +2523,7 @@ do_configure_pi_dns() {
 
     echo "[pi_dns] Setting Pi-local DNS via WAN: $PI_DNS_SERVERS" >> "$LOG_FILE"
 
-    # Belt-and-suspenders: if dnsmasq was started by its package postinst
-    # before we could set IGNORE_RESOLVCONF, drop any lo.dnsmasq hijack now
-    # so the rest of setup (and the WG endpoint hostname lookup) can resolve.
-    if [ -f /etc/default/dnsmasq ]; then
-        if grep -qE '^[[:space:]]*IGNORE_RESOLVCONF=' /etc/default/dnsmasq; then
-            sed -i 's/^[[:space:]]*IGNORE_RESOLVCONF=.*/IGNORE_RESOLVCONF=yes/' /etc/default/dnsmasq
-        else
-            printf '\n# Managed by raspberrypi-site2site-wireguard: keep Pi DNS on WAN\nIGNORE_RESOLVCONF=yes\n' \
-                >> /etc/default/dnsmasq
-        fi
-    fi
-    if command -v resolvconf >/dev/null 2>&1; then
-        resolvconf -d lo.dnsmasq >> "$LOG_FILE" 2>&1 || true
-    fi
+    ensure_dnsmasq_no_resolv_hijack
 
     # Back up /etc/resolv.conf the first time so cleanup can restore it. We
     # back up the file (or the symlink target if it is a symlink) verbatim.
@@ -2435,6 +2552,7 @@ do_configure_pi_dns() {
             nmcli dev reapply "$WAN_IFACE" >> "$LOG_FILE" 2>&1 \
                 || nmcli con up "$con_name" >> "$LOG_FILE" 2>&1 || true
             applied=true
+            echo "[pi_dns] NetworkManager DNS set on '$con_name'" >> "$LOG_FILE"
         fi
     fi
 
@@ -2450,39 +2568,28 @@ do_configure_pi_dns() {
         } >> /etc/dhcpcd.conf
         systemctl restart dhcpcd >> "$LOG_FILE" 2>&1 || true
         applied=true
+        echo "[pi_dns] dhcpcd static DNS set on $WAN_IFACE" >> "$LOG_FILE"
     fi
 
-    # Path 3: neither NM nor dhcpcd -> write DNS via resolvconf if present,
-    # otherwise write /etc/resolv.conf directly. Installing the resolvconf
-    # package (a setup dependency for wg-quick) turns /etc/resolv.conf into
-    # a managed file; a raw overwrite would be clobbered on the next update.
-    if [ "$applied" = false ]; then
+    # ALWAYS pin via resolvconf when present — even if NM/dhcpcd "applied".
+    # Installing resolvconf (a wg-quick dependency) commonly turns
+    # /etc/resolv.conf into a resolvconf symlink; NM reapply then does not
+    # populate what glibc reads, which is exactly how WG Endpoint hostname
+    # resolution fails right after a successful "Connection reapplied".
+    pin_pi_dns_via_resolvconf
+
+    # Path 3: neither NM nor dhcpcd and no resolvconf -> write directly.
+    if [ "$applied" = false ] && ! command -v resolvconf >/dev/null 2>&1; then
         local server
-        if command -v resolvconf >/dev/null 2>&1; then
-            {
-                for server in $PI_DNS_SERVERS; do
-                    echo "nameserver $server"
-                done
-            } | resolvconf -a "wan.${WAN_IFACE}.vpn-gateway" >> "$LOG_FILE" 2>&1 || true
-            # Also pin the values in resolvconf's head file so they survive
-            # interface flaps that delete the dynamic wan.* record.
-            mkdir -p /etc/resolvconf/resolv.conf.d
-            {
-                echo "# Managed by raspberrypi-site2site-wireguard"
-                for server in $PI_DNS_SERVERS; do
-                    echo "nameserver $server"
-                done
-            } > /etc/resolvconf/resolv.conf.d/head
-            resolvconf -u >> "$LOG_FILE" 2>&1 || true
-        else
-            {
-                echo "# Managed by raspberrypi-site2site-wireguard"
-                for server in $PI_DNS_SERVERS; do
-                    echo "nameserver $server"
-                done
-            } > /etc/resolv.conf
-        fi
+        {
+            echo "# Managed by raspberrypi-site2site-wireguard"
+            for server in $PI_DNS_SERVERS; do
+                echo "nameserver $server"
+            done
+        } > /etc/resolv.conf
     fi
+
+    verify_or_repair_pi_dns
 }
 
 do_configure_lan_interface() {

@@ -25,7 +25,16 @@ Rules:
 - For `custom` mode, every IP must be covered by an `AllowedIPs` CIDR (or a matching-family default route). The `prompt_home_dns` validator warns if not.
 - `do_configure_pi_dns` MUST use `nmcli dev reapply` (not `nmcli con up`) so changing DNS does not bounce the WAN link. An operator SSHed via WAN must not be dropped by a DNS change.
 - The dnsmasq config gets `no-resolv` ONLY when `HOME_DNS_MODE` is `tunnel` or `custom`. In `skip` mode dnsmasq must keep reading `/etc/resolv.conf`.
-- dnsmasq MUST set `IGNORE_RESOLVCONF=yes` in `/etc/default/dnsmasq` so the Debian package does not register `127.0.0.1` with resolvconf and hijack the Pi's own resolver (breaks apt + WG endpoint hostname resolution).
+- dnsmasq MUST set `IGNORE_RESOLVCONF=yes` and `DNSMASQ_EXCEPT=lo` in
+  `/etc/default/dnsmasq` so the Debian package does not register
+  `127.0.0.1` with resolvconf and hijack the Pi's own resolver (breaks
+  apt + WG endpoint hostname). `except-interface=lo` in dnsmasq.conf is
+  not enough on its own.
+- Even when NetworkManager successfully reapplies DNS, setup MUST also
+  pin `PI_DNS_SERVERS` via resolvconf's `head` file when the `resolvconf`
+  package is installed — otherwise `/etc/resolv.conf` is often a
+  resolvconf symlink that NM reapply does not populate. Verify/repair
+  resolv.conf after dnsmasq restart and before `wg-quick up`.
 - Backups: `/etc/dnsmasq.conf.bak` (created on first setup) and `/etc/resolv.conf.bak_gateway` (created on first `do_configure_pi_dns`) MUST be restored by cleanup. Do not overwrite the backup on re-runs.
 - `do_configure_pi_dns` must run BEFORE `do_configure_dnsmasq` so that `/etc/resolv.conf` reflects `PI_DNS_SERVERS` by the time dnsmasq starts.
 - Do not couple `HOME_DNS_*` to wg-quick PostUp/PostDown. Tunnel-mode routing relies on `@wg0` source-interface binding; custom-mode routing relies on the AllowedIPs subnet routes already installed by `_wg_pi_bypass_up_cmds`.
