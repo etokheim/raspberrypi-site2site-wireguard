@@ -17,3 +17,14 @@ Rules:
 - Ask remaining critical questions early, then execute in one unattended run.
 - Keep prompts concise and front-loaded so the user can leave setup unattended.
 - Preserve idempotency for re-runs and reboot recovery.
+
+## Interactive prompt layout
+
+Every interactive question must use this order (helpers `prompt_q` / `prompt_h` / `prompt_cue`):
+
+1. **Blank line** (separates from the previous answer)
+2. **Question** (bold) — what we are asking
+3. **Helper text** (dim) — clarifies *this* question only
+4. **Blank line + short input cue** — e.g. `[Y/n]:` or `IP:`
+
+Never put helper text before the question (ambiguous vs the previous answer) or after the input cue (unread before typing). Set `PROMPT_FD=2` when the caller captures stdout via command substitution.

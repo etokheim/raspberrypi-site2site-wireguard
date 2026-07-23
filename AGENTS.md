@@ -25,6 +25,19 @@ Do not start dependency installation early while still asking configuration ques
 - If information is missing, ask before triggering long-running operations.
 - Keep setup steps idempotent and resilient across reboot/power loss.
 
+### Interactive prompt layout
+
+Every setup question must follow **question → dim helper → short input cue**:
+
+1. Blank line (separates from the previous answer)
+2. Bold question headline
+3. Dim helper lines that clarify *this* question only
+4. Short cue last (`[Y/n]:`, `IP:`, `Path:`, …)
+
+Never put helper text before the question or after the input cue. Use the
+shared `prompt_q` / `prompt_h` / `prompt_cue` helpers in
+`scripts/setup-vpn-gateway.sh` (set `PROMPT_FD=2` when stdout is captured).
+
 ## Critical Operational Principles
 
 These principles must be preserved by any change to setup/cleanup/management scripts:
@@ -89,8 +102,8 @@ WAN ISP, defeating GeoDNS / CDN routing.
 The fix is two distinct DNS planes, controlled by three
 `vpn-gateway.conf` variables:
 
-- `HOME_DNS_MODE` (LAN client plane) - `tunnel` (default) | `custom` |
-  `skip`.
+- `HOME_DNS_MODE` (LAN client plane) - `tunnel` | `custom` |
+  `skip`. Default depends on the WireGuard config (see priority below).
   - **`tunnel`**: dnsmasq config gets `no-resolv` plus
     `server=<ip>@wg0` for each entry in `HOME_DNS_TUNNEL_DEFAULTS`
     (currently `1.1.1.1 8.8.8.8`). The `@wg0` source-interface binding
@@ -107,9 +120,13 @@ The fix is two distinct DNS planes, controlled by three
   - **`skip`**: no `no-resolv`, no `server=`. dnsmasq uses the Pi's
     `/etc/resolv.conf` upstream -> public DNS via WAN -> geo-leak.
 - `HOME_DNS_SERVERS` (custom-mode IPs only) - space-separated IPv4/IPv6.
-  When the WireGuard config has a `DNS =` line, those addresses are offered
-  as the custom-mode suggestion (and can be reused by typing `wg` at the
-  prompt). `DNS =` itself is *not* applied under Pi-bypass - see below.
+  **Default priority** when forwarding LAN DNS through the tunnel:
+  1. WireGuard `DNS =` from the source config → `MODE=custom` (operator
+     already named a home resolver; confirm-or-override prompt).
+  2. Else if `AllowedIPs` has a default route → `MODE=tunnel`.
+  3. Else `.1` of the first home subnet → `MODE=custom`.
+  `DNS =` itself is still *not* applied to the Pi under Pi-bypass (stripped
+  from the installed `wg0.conf`); we only reuse the values for LAN dnsmasq.
 - `PI_DNS_SERVERS` (Pi plane): public resolvers (default
   `1.1.1.1 8.8.8.8`) installed via NetworkManager `ipv4.dns` +
   `ipv4.ignore-auto-dns yes`, dhcpcd `static domain_name_servers` block,
@@ -126,17 +143,18 @@ WireGuard `DNS =` vs this gateway:
   remote-management safety. Setup therefore **strips `DNS =`** from the
   installed `/etc/wireguard/wg0.conf` when `PI_BYPASS_ROUTING=true`.
 - LAN client DNS is configured separately via dnsmasq (`HOME_DNS_*`). The
-  prompt surfaces any `DNS =` values found in the source config as a
-  reusable custom-mode suggestion.
+  prompt reuses any `DNS =` values from the source config as the LAN
+  DNS default (confirm-or-override).
 
 Rules:
 
 - Both planes are only meaningful when `PI_BYPASS_ROUTING=true`. In
   legacy mode the Pi's own traffic goes through the tunnel anyway, so
   the tunnel-side already provides DNS.
-- The default mode is `tunnel`. It is the simplest UX (no need to know
-  any home DNS IP), and only `custom` mode requires AllowedIPs
-  validation by the input prompt.
+- The default mode is `tunnel` only when the WireGuard config has **no**
+  `DNS =` line and `AllowedIPs` includes a default route. If `DNS =` is
+  present, default to `custom` with those servers and ask the operator
+  whether to keep or override them.
 - For `tunnel` mode every `server=<ip>@wg0` MUST use the `@wg0`
   source-interface binding. Without it, dnsmasq's outbound query
   follows the main table and goes via WAN (defeating the purpose);
@@ -145,9 +163,14 @@ Rules:
 - `custom` mode entries must be covered by an `AllowedIPs` CIDR (a
   default-route `0.0.0.0/0` / `::/0` / split-default counts as coverage
   for that family); the input prompt validates this and warns loudly.
-- dnsmasq must set `IGNORE_RESOLVCONF=yes` in `/etc/default/dnsmasq` so
-  the Debian package does not register `127.0.0.1` with resolvconf and
-  hijack the Pi's own resolver (breaks apt + WG endpoint hostname).
+- dnsmasq must set `IGNORE_RESOLVCONF=yes` and `DNSMASQ_EXCEPT=lo` in
+  `/etc/default/dnsmasq` so the Debian package does not register
+  `127.0.0.1` with resolvconf and hijack the Pi's own resolver (breaks
+  apt + WG endpoint hostname).
+- Even when NetworkManager reapplies DNS successfully, also pin
+  `PI_DNS_SERVERS` via resolvconf `head` when that package is installed
+  (`/etc/resolv.conf` is often a resolvconf symlink NM does not fill).
+  Verify/repair resolv.conf after dnsmasq restart and before `wg-quick up`.
 - Legacy compat: a saved `HOME_DNS_SERVERS` without `HOME_DNS_MODE`
   (from before this redesign) is translated by
   `infer_home_dns_mode_legacy` to `MODE=custom` if non-empty, else
