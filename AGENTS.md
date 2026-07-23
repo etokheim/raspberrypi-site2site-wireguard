@@ -89,8 +89,8 @@ WAN ISP, defeating GeoDNS / CDN routing.
 The fix is two distinct DNS planes, controlled by three
 `vpn-gateway.conf` variables:
 
-- `HOME_DNS_MODE` (LAN client plane) - `tunnel` (default) | `custom` |
-  `skip`.
+- `HOME_DNS_MODE` (LAN client plane) - `tunnel` | `custom` |
+  `skip`. Default depends on the WireGuard config (see priority below).
   - **`tunnel`**: dnsmasq config gets `no-resolv` plus
     `server=<ip>@wg0` for each entry in `HOME_DNS_TUNNEL_DEFAULTS`
     (currently `1.1.1.1 8.8.8.8`). The `@wg0` source-interface binding
@@ -107,9 +107,13 @@ The fix is two distinct DNS planes, controlled by three
   - **`skip`**: no `no-resolv`, no `server=`. dnsmasq uses the Pi's
     `/etc/resolv.conf` upstream -> public DNS via WAN -> geo-leak.
 - `HOME_DNS_SERVERS` (custom-mode IPs only) - space-separated IPv4/IPv6.
-  When the WireGuard config has a `DNS =` line, those addresses are offered
-  as the custom-mode suggestion (and can be reused by typing `wg` at the
-  prompt). `DNS =` itself is *not* applied under Pi-bypass - see below.
+  **Default priority** when forwarding LAN DNS through the tunnel:
+  1. WireGuard `DNS =` from the source config → `MODE=custom` (operator
+     already named a home resolver; confirm-or-override prompt).
+  2. Else if `AllowedIPs` has a default route → `MODE=tunnel`.
+  3. Else `.1` of the first home subnet → `MODE=custom`.
+  `DNS =` itself is still *not* applied to the Pi under Pi-bypass (stripped
+  from the installed `wg0.conf`); we only reuse the values for LAN dnsmasq.
 - `PI_DNS_SERVERS` (Pi plane): public resolvers (default
   `1.1.1.1 8.8.8.8`) installed via NetworkManager `ipv4.dns` +
   `ipv4.ignore-auto-dns yes`, dhcpcd `static domain_name_servers` block,
@@ -134,9 +138,10 @@ Rules:
 - Both planes are only meaningful when `PI_BYPASS_ROUTING=true`. In
   legacy mode the Pi's own traffic goes through the tunnel anyway, so
   the tunnel-side already provides DNS.
-- The default mode is `tunnel`. It is the simplest UX (no need to know
-  any home DNS IP), and only `custom` mode requires AllowedIPs
-  validation by the input prompt.
+- The default mode is `tunnel` only when the WireGuard config has **no**
+  `DNS =` line and `AllowedIPs` includes a default route. If `DNS =` is
+  present, default to `custom` with those servers and ask the operator
+  whether to keep or override them.
 - For `tunnel` mode every `server=<ip>@wg0` MUST use the `@wg0`
   source-interface binding. Without it, dnsmasq's outbound query
   follows the main table and goes via WAN (defeating the purpose);

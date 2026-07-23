@@ -10,17 +10,17 @@ When Pi-bypass routing is on (`PI_BYPASS_ROUTING=true`), locally-generated DNS l
 Three modes, controlled by `HOME_DNS_MODE`:
 
 - **`tunnel`** (default): dnsmasq emits `server=<ip>@wg0` for each entry in `HOME_DNS_TUNNEL_DEFAULTS` (`1.1.1.1 8.8.8.8`). The `@wg0` source-interface binding forces the upstream query out via wg0; the home peer NATs the lookup. Works without any DNS server inside the home network. Requires `AllowedIPs` to cover the chosen public DNS IPs (typically via `0.0.0.0/0`).
-- **`custom`**: dnsmasq emits `server=<ip>` for each entry in `HOME_DNS_SERVERS` (IPv4/IPv6). Routes via wg0 implicitly because the destination is inside an `AllowedIPs` subnet. The input prompt validates each IP against `AllowedIPs` (a default-route `0.0.0.0/0` / `::/0` / split-default counts as coverage) and warns when uncovered. WireGuard `DNS =` values from the source config are offered as the suggestion; typing `wg` reuses them.
+- **`custom`**: dnsmasq emits `server=<ip>` for each entry in `HOME_DNS_SERVERS` (IPv4/IPv6). Routes via wg0 implicitly because the destination is inside an `AllowedIPs` subnet. The input prompt validates each IP against `AllowedIPs` (a default-route `0.0.0.0/0` / `::/0` / split-default counts as coverage) and warns when uncovered. **If the source WireGuard config has `DNS =`, those values are the default** (confirm Y/n); the operator can override with tunnel-exit or other IPs.
 - **`skip`**: no `no-resolv`, no `server=`. dnsmasq uses the Pi's `/etc/resolv.conf` upstream -> public DNS via WAN -> geo-leak.
 
 The Pi-plane variable `PI_DNS_SERVERS` (default `1.1.1.1 8.8.8.8`) is wired into the Pi's `/etc/resolv.conf` via NetworkManager `ipv4.dns` + `ipv4.ignore-auto-dns yes`, dhcpcd's `static domain_name_servers` block, a resolvconf head pin, or a direct file write. The Pi keeps resolving apt / NTP / Pi Connect / the WG endpoint hostname even when the tunnel is down.
 
-WireGuard `DNS =` is client-mode semantics (`wg-quick` rewrites host resolv.conf). Under Pi-bypass it must **not** be applied — setup strips `DNS =` from the installed `/etc/wireguard/wg0.conf` so Pi DNS stays on `PI_DNS_SERVERS` via WAN. LAN clients use dnsmasq (`HOME_DNS_*`) instead; the prompt can reuse the source-config `DNS =` values for custom mode.
+WireGuard `DNS =` is client-mode semantics (`wg-quick` rewrites host resolv.conf). Under Pi-bypass it must **not** be applied — setup strips `DNS =` from the installed `/etc/wireguard/wg0.conf` so Pi DNS stays on `PI_DNS_SERVERS` via WAN. For LAN clients, those same `DNS =` values **are** the preferred HOME_DNS default (confirm-or-override).
 
 Rules:
 
 - All three planes/modes are gated on `PI_BYPASS_ROUTING=true`. In legacy mode, the Pi's own traffic goes through the tunnel anyway so the tunnel-side already provides DNS.
-- The default mode is `tunnel`. It is the simplest UX (no home DNS IP required) and the only mode that does not require an AllowedIPs validation step.
+- Default priority for LAN DNS when forwarding through the tunnel: (1) WireGuard `DNS =` → custom, (2) else default-route AllowedIPs → tunnel-exit, (3) else `.1` of first home subnet → custom.
 - For `tunnel` mode the `@wg0` suffix on every `server=` line is MANDATORY. Without it, dnsmasq's outbound query follows the main routing table and goes via WAN, defeating the purpose. With it, dnsmasq sets `SO_BINDTODEVICE` so the kernel routes the packet via wg0 unconditionally.
 - For `custom` mode, every IP must be covered by an `AllowedIPs` CIDR (or a matching-family default route). The `prompt_home_dns` validator warns if not.
 - `do_configure_pi_dns` MUST use `nmcli dev reapply` (not `nmcli con up`) so changing DNS does not bounce the WAN link. An operator SSHed via WAN must not be dropped by a DNS change.

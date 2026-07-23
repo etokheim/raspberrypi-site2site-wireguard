@@ -1419,26 +1419,18 @@ infer_home_dns_mode_legacy() {
     fi
 }
 
-# Ask the operator how LAN client DNS lookups should be forwarded.
+# Ask how LAN client DNS lookups should be forwarded.
 # Persists HOME_DNS_MODE (tunnel|custom|skip) and HOME_DNS_SERVERS (only
 # meaningful when MODE=custom).
 #
-# Only meaningful when Pi-bypass routing is enabled. In legacy mode the
-# Pi's default route is wg0 anyway, so dnsmasq's upstream lookups already
-# go via the tunnel - no separate config needed.
+# Default priority when the operator opts into tunnel-forwarded DNS:
+#   1. WireGuard DNS= from the source config  -> MODE=custom (explicit intent)
+#   2. Else if AllowedIPs has a default route -> MODE=tunnel (public DNS @wg0)
+#   3. Else .1 of first home subnet           -> MODE=custom
+#   4. Else ask for an IP                     -> MODE=custom
 #
-# Three modes:
-#   - tunnel  (default): dnsmasq forwards to public DNS via wg0
-#                        (`server=1.1.1.1@wg0` etc.). Home peer NATs the
-#                        lookup; GeoDNS responses match home location. No
-#                        DNS server required on the home network. Requires
-#                        AllowedIPs to cover 0.0.0.0/0 (or the chosen
-#                        public DNS IPs explicitly).
-#   - custom : dnsmasq forwards to a specific home-network DNS server
-#              (e.g. Pi-hole at 10.33.33.1). The user supplies the IP(s).
-#              Each IP is validated against AllowedIPs.
-#   - skip   : dnsmasq uses /etc/resolv.conf upstream -> Pi's WAN DNS.
-#              GeoDNS responses anchor at the WAN ISP's location (leak).
+# WireGuard DNS= is client-mode host resolv.conf semantics; under Pi-bypass
+# it is NOT applied to the Pi. We reuse the values for LAN dnsmasq only.
 prompt_home_dns() {
     if [ "${PI_BYPASS_ROUTING:-false}" != "true" ]; then
         # In legacy mode the Pi's traffic goes through the tunnel by default,
@@ -1458,37 +1450,23 @@ prompt_home_dns() {
         wg_dns=$(extract_wg_dns_servers "$WG_CONF_SRC" 2>/dev/null || true)
     fi
 
-    # Prefer DNS= from the WireGuard config as the custom-mode suggestion
-    # (those are usually the real home resolver). Fall back to .1 of the
-    # first home subnet when DNS= is absent.
-    local custom_suggestion="${wg_dns:-$suggested_home_ip}"
+    local tunnel_available="false"
+    [ -n "$has_default_route" ] && tunnel_available="true"
 
     echo ""
-    info "LAN client DNS forwarding (recommended)"
-    echo -e "   ${BLUE}When LAN clients ask the Pi for DNS, dnsmasq forwards their queries${NC}"
-    echo -e "   ${BLUE}upstream. Forwarding through the tunnel makes DNS responses reflect${NC}"
-    echo -e "   ${BLUE}your home network's geographic location (GeoDNS / CDN routing matches${NC}"
-    echo -e "   ${BLUE}home).${NC}"
-    echo ""
-    echo -e "   ${DIM}Note: a WireGuard ${BOLD}DNS =${NC}${DIM} line configures the *VPN client's*${NC}"
-    echo -e "   ${DIM}own resolv.conf via wg-quick. This gateway does NOT use that for the${NC}"
-    echo -e "   ${DIM}Pi (Pi-bypass keeps Pi DNS on WAN via PI_DNS_SERVERS). LAN clients${NC}"
-    echo -e "   ${DIM}get DNS from dnsmasq instead - that is what this prompt configures.${NC}"
-    if [ -n "$wg_dns" ]; then
-        echo -e "   ${DIM}Found in your WireGuard config: DNS = ${BOLD}${wg_dns}${NC}"
-        echo -e "   ${DIM}Press Enter for tunnel-exit (recommended with full-tunnel), or type${NC}"
-        echo -e "   ${DIM}those IPs (or 'wg') to reuse them as the home DNS for LAN clients.${NC}"
-    fi
+    info "LAN client DNS (via dnsmasq)"
+    echo -e "   ${BLUE}Devices on the Pi LAN get DNS from this Pi. Where should those${NC}"
+    echo -e "   ${BLUE}lookups be forwarded so answers match your home location (GeoDNS)?${NC}"
 
-    # Step 1: yes/no - forward LAN DNS through the tunnel at all?
+    # Step 1: forward through the tunnel at all?
     local default_yes="true"
-    [ "${HOME_DNS_MODE:-tunnel}" = "skip" ] && default_yes="false"
+    [ "${HOME_DNS_MODE:-}" = "skip" ] && default_yes="false"
 
     local prompt1
     if [ "$default_yes" = "true" ]; then
-        prompt1="📡 Forward LAN client DNS through the tunnel? [Y/n]"
+        prompt1="📡 Forward LAN DNS through the VPN tunnel? [Y/n]"
     else
-        prompt1="📡 Forward LAN client DNS through the tunnel? [y/N]"
+        prompt1="📡 Forward LAN DNS through the VPN tunnel? [y/N]"
     fi
 
     local forward_choice="$default_yes"
@@ -1515,127 +1493,15 @@ prompt_home_dns() {
     if [ "$forward_choice" = "false" ]; then
         HOME_DNS_MODE="skip"
         HOME_DNS_SERVERS=""
-        warn "LAN client DNS will use the Pi's WAN ISP DNS (geo-leaks to WAN location)."
+        warn "LAN DNS will use the Pi's WAN ISP DNS (geo-leaks to WAN location)."
         save_config_var "HOME_DNS_MODE" "$HOME_DNS_MODE"
         save_config_var "HOME_DNS_SERVERS" "$HOME_DNS_SERVERS"
         return
     fi
 
-    # Step 2: tunnel-exit (default) vs custom home-network DNS server.
-    #
-    # Default depends on AllowedIPs:
-    #   - has 0.0.0.0/0   -> tunnel-exit (works without home DNS server)
-    #   - only home subnet -> custom with WG DNS= or .1 of home subnet
-    #   - neither          -> custom (we have nothing better to suggest)
-    local prefer_tunnel="false"
-    if [ -n "$has_default_route" ]; then
-        prefer_tunnel="true"
-    fi
-
-    echo ""
-    if [ "$prefer_tunnel" = "true" ]; then
-        echo -e "   ${DIM}Default (press Enter): tunnel-exit. dnsmasq forwards to${NC}"
-        echo -e "   ${DIM}${HOME_DNS_TUNNEL_DEFAULTS} via wg0; your home peer NATs the lookup.${NC}"
-        echo -e "   ${DIM}No DNS server required on the home network.${NC}"
-        if [ -n "$custom_suggestion" ]; then
-            echo -e "   ${DIM}Override: type a home-network DNS IP (suggestion: ${custom_suggestion}${NC}"
-            echo -e "   ${DIM}- from your WireGuard DNS= / AllowedIPs; useful for Pi-hole etc.).${NC}"
-        else
-            echo -e "   ${DIM}Override: type a home-network DNS server IP (e.g. 10.33.33.1${NC}"
-            echo -e "   ${DIM}- useful if you run Pi-hole, AdGuard Home, or your home router's resolver).${NC}"
-        fi
-    else
-        if [ -n "$custom_suggestion" ]; then
-            echo -e "   ${DIM}Default (press Enter): forward to ${custom_suggestion}${NC}"
-            if [ -n "$wg_dns" ]; then
-                echo -e "   ${DIM}(from your WireGuard config's DNS= line).${NC}"
-            else
-                echo -e "   ${DIM}(the .1 of the first home subnet in AllowedIPs).${NC}"
-            fi
-            echo -e "   ${DIM}Override with another home-network DNS IP if needed.${NC}"
-        else
-            echo -e "   ${DIM}Type one or more home-network DNS server IPs (space/comma separated).${NC}"
-        fi
-        echo -e "   ${YELLOW}Tunnel-exit mode is unavailable: AllowedIPs has no default route${NC}"
-        echo -e "   ${YELLOW}(0.0.0.0/0). To use it, add 0.0.0.0/0 to your peer's AllowedIPs.${NC}"
-    fi
-
-    if [ "$NONINTERACTIVE" = "true" ]; then
-        if [ "${HOME_DNS_MODE:-}" = "custom" ] && [ -n "${HOME_DNS_SERVERS:-}" ]; then
-            info "Non-interactive: HOME_DNS_SERVERS = '$HOME_DNS_SERVERS' (from saved config)."
-        elif [ "$prefer_tunnel" = "true" ]; then
-            HOME_DNS_MODE="tunnel"
-            HOME_DNS_SERVERS=""
-            info "Non-interactive: tunnel-exit mode (dnsmasq -> ${HOME_DNS_TUNNEL_DEFAULTS} via wg0)."
-        elif [ -n "$custom_suggestion" ]; then
-            HOME_DNS_MODE="custom"
-            HOME_DNS_SERVERS="$custom_suggestion"
-            info "Non-interactive: custom home DNS = $HOME_DNS_SERVERS"
-        else
-            HOME_DNS_MODE="skip"
-            HOME_DNS_SERVERS=""
-            warn "Non-interactive: no default-route AllowedIPs and no home DNS to suggest."
-            warn "Falling back to skip mode (LAN DNS leaks to WAN)."
-        fi
-        save_config_var "HOME_DNS_MODE" "$HOME_DNS_MODE"
-        save_config_var "HOME_DNS_SERVERS" "$HOME_DNS_SERVERS"
-        return
-    fi
-
-    while true; do
-        local label
-        if [ "$prefer_tunnel" = "true" ]; then
-            label="📡 DNS server [Enter = tunnel-exit, or IP]"
-        elif [ -n "$custom_suggestion" ]; then
-            label="📡 DNS server [default: ${BOLD}${YELLOW}${custom_suggestion}${NC}]"
-        else
-            label="📡 Home DNS server IP(s) (space/comma separated)"
-        fi
-        echo -ne "   ${label}: "
-        local raw
-        read -r raw < /dev/tty
-
-        if [ -z "$raw" ]; then
-            if [ "$prefer_tunnel" = "true" ]; then
-                HOME_DNS_MODE="tunnel"
-                HOME_DNS_SERVERS=""
-                success "Tunnel-exit mode: dnsmasq -> ${HOME_DNS_TUNNEL_DEFAULTS} via wg0."
-                break
-            elif [ -n "$custom_suggestion" ]; then
-                raw="$custom_suggestion"
-            else
-                warn "No DNS server entered. Try again, or type 'skip' to opt out."
-                continue
-            fi
-        fi
-
-        if [ "$raw" = "skip" ]; then
-            HOME_DNS_MODE="skip"
-            HOME_DNS_SERVERS=""
-            warn "LAN client DNS will use the Pi's WAN ISP DNS (geo-leaks)."
-            break
-        fi
-
-        # Convenience: typing "wg" reuses DNS= from the WireGuard config.
-        if [ "$raw" = "wg" ] || [ "$raw" = "DNS" ] || [ "$raw" = "dns" ]; then
-            if [ -n "$wg_dns" ]; then
-                raw="$wg_dns"
-            else
-                warn "No DNS= line found in the WireGuard config. Enter IP(s) instead."
-                continue
-            fi
-        fi
-
-        local normalized
-        normalized=$(normalize_ip_list "$raw")
-        if [ -z "$normalized" ]; then
-            warn "No valid IPv4/IPv6 addresses parsed from '$raw'. Try again."
-            continue
-        fi
-
-        # Validate each entry is covered by some AllowedIPs CIDR. A default
-        # route (0.0.0.0/0 / ::/0 / split-default) covers the matching family.
-        # Warn (do not block) - the user may add the entry to wg0.conf later.
+    # --- helpers local to this prompt ---
+    _home_dns_accept_custom() {
+        local normalized="$1"
         local entry covered any_uncovered=false
         local has_v4_default=false has_v6_default=false
         case "$has_default_route" in
@@ -1656,8 +1522,6 @@ prompt_home_dns() {
                 for cidr in $home_subnets; do
                     if [[ "$entry" == *:* ]]; then
                         [ "$(cidr_family "$cidr")" = "6" ] || continue
-                        # Exact IPv6 CIDR math is skipped; accept if any IPv6
-                        # home subnet is present and warn only when none are.
                         covered=true
                         break
                     else
@@ -1671,17 +1535,192 @@ prompt_home_dns() {
                 any_uncovered=true
             fi
         done
-
         if [ "$any_uncovered" = true ]; then
-            echo -ne "   ${YELLOW}Use these values anyway? [y/N]: ${NC}"
-            local ack
-            read -r ack < /dev/tty
-            [[ "$ack" =~ ^[Yy]$ ]] || continue
+            if [ "$NONINTERACTIVE" = "true" ]; then
+                warn "Non-interactive: accepting uncovered DNS servers anyway."
+            else
+                echo -ne "   ${YELLOW}Use these values anyway? [y/N]: ${NC}"
+                local ack
+                read -r ack < /dev/tty
+                [[ "$ack" =~ ^[Yy]$ ]] || return 1
+            fi
         fi
-
         HOME_DNS_MODE="custom"
         HOME_DNS_SERVERS="$normalized"
-        success "Custom home DNS: $HOME_DNS_SERVERS"
+        success "LAN DNS upstream: $HOME_DNS_SERVERS (via tunnel)"
+        return 0
+    }
+
+    _home_dns_set_tunnel() {
+        HOME_DNS_MODE="tunnel"
+        HOME_DNS_SERVERS=""
+        success "LAN DNS upstream: ${HOME_DNS_TUNNEL_DEFAULTS} via wg0 (tunnel-exit)"
+    }
+
+    # Non-interactive path: saved config wins; else WG DNS= > tunnel > .1.
+    if [ "$NONINTERACTIVE" = "true" ]; then
+        if [ "${HOME_DNS_MODE:-}" = "custom" ] && [ -n "${HOME_DNS_SERVERS:-}" ]; then
+            info "Non-interactive: HOME_DNS_SERVERS = '$HOME_DNS_SERVERS' (from saved config)."
+        elif [ "${HOME_DNS_MODE:-}" = "tunnel" ]; then
+            _home_dns_set_tunnel
+        elif [ -n "$wg_dns" ]; then
+            _home_dns_accept_custom "$wg_dns" || true
+            [ "$HOME_DNS_MODE" = "custom" ] || _home_dns_set_tunnel
+            info "Non-interactive: using WireGuard DNS= ($HOME_DNS_SERVERS)."
+        elif [ "$tunnel_available" = "true" ]; then
+            _home_dns_set_tunnel
+            info "Non-interactive: tunnel-exit mode."
+        elif [ -n "$suggested_home_ip" ]; then
+            _home_dns_accept_custom "$suggested_home_ip" || true
+            info "Non-interactive: custom home DNS = ${HOME_DNS_SERVERS:-$suggested_home_ip}"
+        else
+            HOME_DNS_MODE="skip"
+            HOME_DNS_SERVERS=""
+            warn "Non-interactive: no DNS= / default-route / home subnet to suggest."
+            warn "Falling back to skip mode (LAN DNS leaks to WAN)."
+        fi
+        save_config_var "HOME_DNS_MODE" "$HOME_DNS_MODE"
+        save_config_var "HOME_DNS_SERVERS" "$HOME_DNS_SERVERS"
+        return
+    fi
+
+    # Step 2a: WireGuard DNS= present -> that is the default. Ask to confirm
+    # or override. This is the common case when the peer config was generated
+    # with a home resolver (router / Pi-hole / AdGuard).
+    if [ -n "$wg_dns" ]; then
+        echo ""
+        echo -e "   ${BLUE}Your WireGuard config already sets:${NC}  ${BOLD}DNS = $wg_dns${NC}"
+        echo -e "   ${DIM}We'll use that as the upstream DNS for LAN clients (via the tunnel).${NC}"
+        echo -e "   ${DIM}(The Pi itself still uses PI_DNS_SERVERS over WAN — not this list.)${NC}"
+        echo ""
+        echo -ne "   📡 Use these DNS servers for LAN clients? [Y/n]: "
+        local use_wg
+        read -r use_wg < /dev/tty
+        if [[ ! "$use_wg" =~ ^[Nn]$ ]]; then
+            if _home_dns_accept_custom "$wg_dns"; then
+                save_config_var "HOME_DNS_MODE" "$HOME_DNS_MODE"
+                save_config_var "HOME_DNS_SERVERS" "$HOME_DNS_SERVERS"
+                return
+            fi
+            # Validation rejected and user declined "anyway" -> fall through
+            # to the override prompt.
+        fi
+
+        echo ""
+        echo -e "   ${DIM}Override options:${NC}"
+        if [ "$tunnel_available" = "true" ]; then
+            echo -e "   ${DIM}  • press Enter / type 'tunnel'  → public DNS ${HOME_DNS_TUNNEL_DEFAULTS} via wg0${NC}"
+        fi
+        echo -e "   ${DIM}  • type other DNS IP(s)         → custom upstream via the tunnel${NC}"
+        echo -e "   ${DIM}  • type 'skip'                  → use Pi WAN DNS (geo-leaks)${NC}"
+
+        while true; do
+            local label="📡 LAN DNS override"
+            if [ "$tunnel_available" = "true" ]; then
+                label="📡 LAN DNS override [Enter = tunnel-exit, or IP(s)]"
+            else
+                label="📡 LAN DNS override [IP(s), or 'skip']"
+            fi
+            echo -ne "   ${label}: "
+            local raw
+            read -r raw < /dev/tty
+
+            if [ -z "$raw" ] || [ "$raw" = "tunnel" ]; then
+                if [ "$tunnel_available" = "true" ]; then
+                    _home_dns_set_tunnel
+                    break
+                fi
+                warn "Tunnel-exit needs AllowedIPs 0.0.0.0/0 (or ::/0). Enter IP(s) instead."
+                continue
+            fi
+            if [ "$raw" = "skip" ]; then
+                HOME_DNS_MODE="skip"
+                HOME_DNS_SERVERS=""
+                warn "LAN DNS will use the Pi's WAN ISP DNS (geo-leaks)."
+                break
+            fi
+            if [ "$raw" = "wg" ] || [ "$raw" = "DNS" ] || [ "$raw" = "dns" ]; then
+                raw="$wg_dns"
+            fi
+            local normalized
+            normalized=$(normalize_ip_list "$raw")
+            if [ -z "$normalized" ]; then
+                warn "No valid IPv4/IPv6 addresses parsed from '$raw'. Try again."
+                continue
+            fi
+            _home_dns_accept_custom "$normalized" || continue
+            break
+        done
+
+        save_config_var "HOME_DNS_MODE" "$HOME_DNS_MODE"
+        save_config_var "HOME_DNS_SERVERS" "$HOME_DNS_SERVERS"
+        return
+    fi
+
+    # Step 2b: no WireGuard DNS= -> tunnel-exit when possible, else home .1.
+    echo ""
+    if [ "$tunnel_available" = "true" ]; then
+        echo -e "   ${DIM}No DNS= in your WireGuard config. Default: tunnel-exit —${NC}"
+        echo -e "   ${DIM}dnsmasq forwards to ${HOME_DNS_TUNNEL_DEFAULTS} via wg0 (home peer NATs).${NC}"
+        echo -e "   ${DIM}Override: type a home DNS IP (e.g. Pi-hole), or 'skip'.${NC}"
+        if [ -n "$suggested_home_ip" ]; then
+            echo -e "   ${DIM}Suggestion if you have one: ${suggested_home_ip}${NC}"
+        fi
+    elif [ -n "$suggested_home_ip" ]; then
+        echo -e "   ${DIM}Default: forward to ${suggested_home_ip} (.1 of first home AllowedIPs subnet).${NC}"
+        echo -e "   ${YELLOW}Tunnel-exit unavailable (no 0.0.0.0/0 in AllowedIPs).${NC}"
+    else
+        echo -e "   ${DIM}Type one or more home-network DNS server IPs (space/comma separated).${NC}"
+        echo -e "   ${YELLOW}Tunnel-exit unavailable (no 0.0.0.0/0 in AllowedIPs).${NC}"
+    fi
+
+    while true; do
+        local label
+        if [ "$tunnel_available" = "true" ]; then
+            label="📡 LAN DNS upstream [Enter = tunnel-exit, or IP(s)]"
+        elif [ -n "$suggested_home_ip" ]; then
+            label="📡 LAN DNS upstream [default: ${BOLD}${YELLOW}${suggested_home_ip}${NC}]"
+        else
+            label="📡 Home DNS server IP(s)"
+        fi
+        echo -ne "   ${label}: "
+        local raw
+        read -r raw < /dev/tty
+
+        if [ -z "$raw" ]; then
+            if [ "$tunnel_available" = "true" ]; then
+                _home_dns_set_tunnel
+                break
+            elif [ -n "$suggested_home_ip" ]; then
+                raw="$suggested_home_ip"
+            else
+                warn "No DNS server entered. Try again, or type 'skip'."
+                continue
+            fi
+        fi
+
+        if [ "$raw" = "skip" ]; then
+            HOME_DNS_MODE="skip"
+            HOME_DNS_SERVERS=""
+            warn "LAN DNS will use the Pi's WAN ISP DNS (geo-leaks)."
+            break
+        fi
+        if [ "$raw" = "tunnel" ]; then
+            if [ "$tunnel_available" = "true" ]; then
+                _home_dns_set_tunnel
+                break
+            fi
+            warn "Tunnel-exit needs AllowedIPs 0.0.0.0/0 (or ::/0)."
+            continue
+        fi
+
+        local normalized
+        normalized=$(normalize_ip_list "$raw")
+        if [ -z "$normalized" ]; then
+            warn "No valid IPv4/IPv6 addresses parsed from '$raw'. Try again."
+            continue
+        fi
+        _home_dns_accept_custom "$normalized" || continue
         break
     done
 
