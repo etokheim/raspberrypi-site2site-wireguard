@@ -129,6 +129,8 @@ LAN clients query the Pi's `dnsmasq`. dnsmasq itself runs on the Pi, so where it
 
 In all three modes, the **Pi's own** DNS is configured separately via `PI_DNS_SERVERS` (default `1.1.1.1 8.8.8.8`) and goes via WAN. apt, NTP, Pi Connect, and the WireGuard endpoint hostname keep resolving even when the tunnel is down, so remote management never breaks because of DNS.
 
+A WireGuard `DNS =` line in your peer config is **not** the same thing: that is client-mode (`wg-quick` rewriting the host resolv.conf). Under Pi-bypass setup strips `DNS =` from the installed `wg0.conf` so it cannot override `PI_DNS_SERVERS`. If those addresses are your home resolver (Pi-hole, etc.), the LAN-DNS prompt offers them as a custom-mode suggestion — press Enter for tunnel-exit, or type the IPs / `wg` to reuse them for LAN clients.
+
 ```
 LAN client ──DHCP-supplied DNS──> Pi (10.10.10.1)
                                        │
@@ -162,15 +164,16 @@ If you say *No* to Pi-bypass at the prompt, `wg-quick` manages routes the standa
 - Note: the script locks LAN subnets to /24. If you enter another prefix, it will coerce it to a /24 in the same third-octet block (e.g., `192.168.50.0/20` becomes `192.168.50.0/24`).
 
 ## Verify it works
-On the Pi:
+On the Pi (with Pi-bypass enabled, this shows the *WAN* egress IP — not home):
 ```bash
 wg show
-curl https://ifconfig.me   # should show your home/central egress IP
+curl https://ifconfig.me   # Pi-local traffic stays on WAN
 ```
-On a client connected to the Pi LAN/AP:
+On a client connected to the Pi LAN/AP (this shows the *home* egress IP):
 ```bash
 ping 10.10.10.1                 # gateway reachability
-ping 1.1.1.1                    # routing/NAT
+ping 1.1.1.1                    # routing/NAT via the tunnel
+curl https://ifconfig.me        # should show your home/central egress IP
 nslookup google.com 10.10.10.1  # DNS via dnsmasq
 ```
 

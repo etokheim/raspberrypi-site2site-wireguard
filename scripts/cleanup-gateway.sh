@@ -277,6 +277,19 @@ cleanup_pi_dns() {
         cp -a /etc/resolv.conf.bak_gateway /etc/resolv.conf >> "$LOG_FILE" 2>&1 || true
         rm -f /etc/resolv.conf.bak_gateway >> "$LOG_FILE" 2>&1 || true
     fi
+
+    # Drop resolvconf records / head pins written by do_configure_pi_dns.
+    if command -v resolvconf >/dev/null 2>&1; then
+        if [ -n "$wan" ]; then
+            resolvconf -d "wan.${wan}.vpn-gateway" >> "$LOG_FILE" 2>&1 || true
+        fi
+        if [ -f /etc/resolvconf/resolv.conf.d/head ] \
+           && grep -q 'Managed by raspberrypi-site2site-wireguard' /etc/resolvconf/resolv.conf.d/head 2>/dev/null; then
+            echo "[pi_dns] Clearing resolvconf head pin" >> "$LOG_FILE"
+            : > /etc/resolvconf/resolv.conf.d/head
+            resolvconf -u >> "$LOG_FILE" 2>&1 || true
+        fi
+    fi
 }
 
 cleanup_gateway_nat_rules() {

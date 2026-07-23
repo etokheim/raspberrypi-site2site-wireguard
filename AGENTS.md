@@ -106,13 +106,28 @@ The fix is two distinct DNS planes, controlled by three
     to pick up local hostname resolution.
   - **`skip`**: no `no-resolv`, no `server=`. dnsmasq uses the Pi's
     `/etc/resolv.conf` upstream -> public DNS via WAN -> geo-leak.
-- `HOME_DNS_SERVERS` (custom-mode IPs only) - space-separated.
+- `HOME_DNS_SERVERS` (custom-mode IPs only) - space-separated IPv4/IPv6.
+  When the WireGuard config has a `DNS =` line, those addresses are offered
+  as the custom-mode suggestion (and can be reused by typing `wg` at the
+  prompt). `DNS =` itself is *not* applied under Pi-bypass - see below.
 - `PI_DNS_SERVERS` (Pi plane): public resolvers (default
   `1.1.1.1 8.8.8.8`) installed via NetworkManager `ipv4.dns` +
   `ipv4.ignore-auto-dns yes`, dhcpcd `static domain_name_servers` block,
-  or a direct `/etc/resolv.conf` write. The Pi keeps resolving apt /
-  NTP / Pi Connect / the WireGuard endpoint hostname **even when the
-  tunnel is down**, so DNS is never the reason remote management fails.
+  resolvconf head pin, or a direct `/etc/resolv.conf` write. The Pi keeps
+  resolving apt / NTP / Pi Connect / the WireGuard endpoint hostname
+  **even when the tunnel is down**, so DNS is never the reason remote
+  management fails.
+
+WireGuard `DNS =` vs this gateway:
+
+- `DNS =` in `wg0.conf` is client-mode semantics: `wg-quick` rewrites the
+  *host* resolv.conf when the tunnel is up (via resolvconf).
+- Under Pi-bypass that would make the Pi's own DNS depend on `wg0`, defeating
+  remote-management safety. Setup therefore **strips `DNS =`** from the
+  installed `/etc/wireguard/wg0.conf` when `PI_BYPASS_ROUTING=true`.
+- LAN client DNS is configured separately via dnsmasq (`HOME_DNS_*`). The
+  prompt surfaces any `DNS =` values found in the source config as a
+  reusable custom-mode suggestion.
 
 Rules:
 
@@ -127,9 +142,12 @@ Rules:
   follows the main table and goes via WAN (defeating the purpose);
   with it, dnsmasq sets `SO_BINDTODEVICE` so the kernel routes via
   wg0 unconditionally.
-- `custom` mode entries must be covered by an `AllowedIPs` CIDR; the
-  input prompt validates this and warns loudly. Otherwise WireGuard
-  drops the egress packets and LAN DNS silently fails.
+- `custom` mode entries must be covered by an `AllowedIPs` CIDR (a
+  default-route `0.0.0.0/0` / `::/0` / split-default counts as coverage
+  for that family); the input prompt validates this and warns loudly.
+- dnsmasq must set `IGNORE_RESOLVCONF=yes` in `/etc/default/dnsmasq` so
+  the Debian package does not register `127.0.0.1` with resolvconf and
+  hijack the Pi's own resolver (breaks apt + WG endpoint hostname).
 - Legacy compat: a saved `HOME_DNS_SERVERS` without `HOME_DNS_MODE`
   (from before this redesign) is translated by
   `infer_home_dns_mode_legacy` to `MODE=custom` if non-empty, else
@@ -146,7 +164,7 @@ Rules:
 The execution phase must finish on its own even if the operator's terminal goes away (SSH drop, Pi Connect WebRTC failure, serial hang-up, laptop closed). Half-applied state on a remote Pi can be unrecoverable.
 
 - After the input phase, the script must detach from its controlling terminal: ignore `SIGHUP`, close stdin, and route stdout/stderr to the persistent log file.
-- Live progress on the operator's TTY may be provided by a side-channel `tail -f` that dies harmlessly when the TTY goes away.
+- Keep a dedicated FD open on the operator's TTY for the progress box/spinner. Detailed command output (apt, wg-quick, systemctl) stays in the log only — do **not** auto-tail the full log onto the TTY (that interleaves with the spinner and makes the UI unreadable). Operators who want the raw stream can `tail -f` the log themselves.
 - Detect remote-management daemons (Raspberry Pi Connect, etc.) before the execution phase and warn explicitly when WireGuard `AllowedIPs` includes a default route (`0.0.0.0/0`, `::/0`, or `0.0.0.0/1` + `128.0.0.0/1`) - that single setting is the most common way a remote-managed Pi loses its management plane after `wg-quick up`.
 - Never add a prompt after the input phase. Any new question must move into the input-collection block.
 
