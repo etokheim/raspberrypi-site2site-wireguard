@@ -123,8 +123,8 @@ The setup wizard asks once whether to enable **Pi-bypass routing** (recommended)
 
 LAN clients query the Pi's `dnsmasq`. dnsmasq itself runs on the Pi, so where its *upstream* lookups go depends on which **mode** the operator picked at the prompt (`HOME_DNS_MODE` in `vpn-gateway.conf`):
 
-- **`tunnel` (default)** - dnsmasq forwards to public DNS bound to `wg0`: `server=1.1.1.1@wg0`, `server=8.8.8.8@wg0`. Each query exits via the tunnel; the home peer NATs it out from the home location, so DNS responses are geo-anchored at home. Works without any DNS server on the home network. Requires `AllowedIPs` to cover the chosen public DNS IPs (typically via `0.0.0.0/0`).
-- **`custom`** - dnsmasq forwards to a specific home-network DNS server you specify (e.g. Pi-hole or AdGuard Home at `10.33.33.1`). Use this if you want LAN clients to also pick up local hostname resolution from your home DNS. The destination IP must be covered by an `AllowedIPs` entry; the input prompt validates this.
+- **`tunnel`** - dnsmasq forwards to public DNS bound to `wg0`: `server=1.1.1.1@wg0`, `server=8.8.8.8@wg0`. Each query exits via the tunnel; the home peer NATs it out from the home location, so DNS responses are geo-anchored at home. Works without any DNS server on the home network. Requires `AllowedIPs` to cover the chosen public DNS IPs (typically via `0.0.0.0/0`). Default when the WireGuard config has **no** `DNS =` line.
+- **`custom`** - dnsmasq forwards to a specific home-network DNS server (e.g. Pi-hole or AdGuard Home). **Default when your WireGuard config has `DNS =`** — setup asks you to confirm those addresses, or override. The destination IP must be covered by an `AllowedIPs` entry; the input prompt validates this.
 - **`skip`** - dnsmasq falls back to the Pi's `/etc/resolv.conf` (which points at `PI_DNS_SERVERS` over WAN). LAN DNS keeps working when the tunnel is down, but resolution geo-leaks to the WAN ISP's location.
 
 In all three modes, the **Pi's own** DNS is configured separately via `PI_DNS_SERVERS` (default `1.1.1.1 8.8.8.8`) and goes via WAN. apt, NTP, Pi Connect, and the WireGuard endpoint hostname keep resolving even when the tunnel is down, so remote management never breaks because of DNS.
@@ -138,10 +138,11 @@ LAN client ──DHCP-supplied DNS──> Pi (10.10.10.1)
                                        ▼
                   ┌───── HOME_DNS_MODE=tunnel ─────┐
                   │  server=1.1.1.1@wg0            │ ─► wg0 ─► home peer NATs ─► public DNS
-                  │  (default; geo-correct)        │           (response geo-anchored at home)
+                  │  (geo-correct; default if no DNS=) │           (response geo-anchored at home)
                   └────────────────────────────────┘
                   ┌───── HOME_DNS_MODE=custom ─────┐
                   │  server=<your home DNS IP>     │ ─► wg0 ─► home DNS server (Pi-hole etc.)
+                  │  (default when WG has DNS=)    │
                   └────────────────────────────────┘
                   ┌───── HOME_DNS_MODE=skip ───────┐
                   │  uses Pi's /etc/resolv.conf    │ ─► WAN ─► public DNS (geo-leaks)

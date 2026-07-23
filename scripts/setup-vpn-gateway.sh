@@ -535,9 +535,11 @@ ensure_wg_perms() {
         chmod 600 "$path"
         return
     fi
-    echo -ne "❓ ${YELLOW}WireGuard config $path has loose permissions ($mode $owner:$group). Fix to 600 root:root? [Y/n]${NC} "
-    read -r fix_perm
-    if [[ ! "$fix_perm" =~ ^[Nn]$ ]]; then
+    prompt_q "❓ Fix WireGuard config permissions?"
+    prompt_h "$path is currently $mode $owner:$group."
+    prompt_h "Recommended: 600 root:root (private key material)."
+    prompt_cue "[Y/n]"
+    if [[ ! "$PROMPT_REPLY" =~ ^[Nn]$ ]]; then
         chown root:root "$path"
         chmod 600 "$path"
         success "Permissions corrected for $path"
@@ -1099,6 +1101,55 @@ error() {
     echo -e "${RED}❌ $1${NC}"
 }
 
+# --- Interactive prompt layout ---
+# Pattern for every question:
+#   <blank line>
+#   QUESTION (bold)     -- what we are asking
+#   helper (dim)        -- clarifies THIS question only
+#   ...
+#   <blank line>
+#   cue: █              -- short input only ([Y/n], path, IP, ...)
+#
+# Never put helper text before the question (ambiguous vs the previous answer)
+# or after the input cue (unread before typing). Set PROMPT_FD=2 when the
+# caller captures stdout (command substitution).
+PROMPT_FD=1
+
+prompt_q() {
+    echo "" >&"$PROMPT_FD"
+    echo -e "   ${BOLD}$1${NC}" >&"$PROMPT_FD"
+}
+
+prompt_h() {
+    echo -e "   ${DIM}$1${NC}" >&"$PROMPT_FD"
+}
+
+prompt_hw() {
+    echo -e "   ${YELLOW}$1${NC}" >&"$PROMPT_FD"
+}
+
+# Print a short input cue and read into PROMPT_REPLY from the TTY.
+# $1 = cue text without a trailing colon, e.g. "[Y/n]" or "IP".
+prompt_cue() {
+    local cue="$1"
+    echo "" >&"$PROMPT_FD"
+    echo -ne "   ${cue}: " >&"$PROMPT_FD"
+    read -r PROMPT_REPLY < /dev/tty
+}
+
+# Like prompt_cue, but shows a highlighted default in the cue.
+# $1 = label (e.g. "LAN subnet"), $2 = default value (may be empty).
+prompt_cue_default() {
+    local label="$1" def="$2"
+    echo "" >&"$PROMPT_FD"
+    if [ -n "$def" ]; then
+        echo -ne "   ${label} [default: ${BOLD}${YELLOW}${def}${NC}]: " >&"$PROMPT_FD"
+    else
+        echo -ne "   ${label}: " >&"$PROMPT_FD"
+    fi
+    read -r PROMPT_REPLY < /dev/tty
+}
+
 # Function to run a command with a spinner and logging
 # Usage: run_step "Description of task" command_to_run arg1 arg2 ...
 run_step() {
@@ -1319,25 +1370,6 @@ prompt_pi_bypass_routing() {
         has_default_route=$(detect_wg_default_route "$WG_CONF_SRC" 2>/dev/null || true)
     fi
 
-    echo ""
-    info "Pi-bypass routing (RECOMMENDED)"
-    echo -e "   ${BLUE}This routes forwarded LAN client traffic through the VPN tunnel,${NC}"
-    echo -e "   ${BLUE}while keeping the Pi's OWN outbound traffic on the WAN:${NC}"
-    echo -e "     ${DIM}LAN clients      -> wg0 (full-tunnel, kill-switch when wg0 is down)${NC}"
-    echo -e "     ${DIM}Pi (apt, Pi Connect, NTP, DNS, WG handshake)  -> WAN (always)${NC}"
-    echo ""
-    if [ -n "$has_default_route" ]; then
-        echo -e "   ${YELLOW}Your wg0.conf has $has_default_route in AllowedIPs.${NC}"
-        echo -e "   ${YELLOW}Without Pi-bypass, starting wg0 will route ALL the Pi's outbound${NC}"
-        echo -e "   ${YELLOW}traffic into the tunnel. If your home peer does not NAT the Pi to${NC}"
-        echo -e "   ${YELLOW}the Internet, the Pi will instantly lose Pi Connect, apt, and any${NC}"
-        echo -e "   ${YELLOW}SSH session that comes in via its public IP. This is exactly the${NC}"
-        echo -e "   ${YELLOW}lockout class of issue that prompted this option.${NC}"
-        echo ""
-    fi
-    echo -e "   ${DIM}Enabling rewrites /etc/wireguard/wg0.conf to set Table=off and adds${NC}"
-    echo -e "   ${DIM}policy-routing PostUp/PostDown. Disabling leaves wg0.conf alone.${NC}"
-
     # Default behaviour:
     #   - Saved value present  -> keep it (interactive AND non-interactive).
     #   - Interactive + no value -> default Y (recommended), but always ask.
@@ -1352,13 +1384,6 @@ prompt_pi_bypass_routing() {
         default="true"
     fi
 
-    local prompt_label
-    if [ "$default" = "true" ]; then
-        prompt_label="🛡️  Enable Pi-bypass routing? [Y/n]"
-    else
-        prompt_label="🛡️  Enable Pi-bypass routing? [y/N]"
-    fi
-
     if [ "$NONINTERACTIVE" = "true" ]; then
         if [ -n "${PI_BYPASS_ROUTING:-}" ]; then
             info "Non-interactive: Pi-bypass routing = $default (from saved config)."
@@ -1371,16 +1396,30 @@ prompt_pi_bypass_routing() {
         return
     fi
 
-    echo ""
-    echo -ne "   $prompt_label: "
-    local answer
-    read -r answer < /dev/tty
+    local cue
+    if [ "$default" = "true" ]; then
+        cue="[Y/n]"
+    else
+        cue="[y/N]"
+    fi
+
+    prompt_q "🛡️  Enable Pi-bypass routing? (recommended)"
+    prompt_h "LAN clients go through the VPN tunnel; the Pi's own traffic stays on WAN."
+    prompt_h "  LAN clients  → wg0 (full-tunnel; kill-switch when wg0 is down)"
+    prompt_h "  Pi itself    → WAN (apt, Pi Connect, NTP, DNS, WG handshake)"
+    prompt_h "Enabling rewrites wg0.conf (Table=off + policy-routing PostUp/PostDown)."
+    if [ -n "$has_default_route" ]; then
+        prompt_hw "Your wg0.conf has $has_default_route in AllowedIPs."
+        prompt_hw "Without Pi-bypass, starting wg0 sends ALL Pi traffic into the tunnel."
+        prompt_hw "If the home peer does not NAT the Pi, you lose Pi Connect / apt / public SSH."
+    fi
+    prompt_cue "$cue"
 
     local enabled="$default"
     if [ "$default" = "true" ]; then
-        [[ "$answer" =~ ^[Nn]$ ]] && enabled="false"
+        [[ "$PROMPT_REPLY" =~ ^[Nn]$ ]] && enabled="false"
     else
-        [[ "$answer" =~ ^[Yy]$ ]] && enabled="true"
+        [[ "$PROMPT_REPLY" =~ ^[Yy]$ ]] && enabled="true"
     fi
 
     PI_BYPASS_ROUTING="$enabled"
@@ -1395,6 +1434,7 @@ prompt_pi_bypass_routing() {
         fi
     fi
 }
+
 
 # Default upstream DNS servers used in tunnel-exit mode. Each is sent out
 # via wg0 (using dnsmasq's `server=IP@wg0` source-interface binding), so
@@ -1431,10 +1471,10 @@ infer_home_dns_mode_legacy() {
 #
 # WireGuard DNS= is client-mode host resolv.conf semantics; under Pi-bypass
 # it is NOT applied to the Pi. We reuse the values for LAN dnsmasq only.
+# Interactive layout: question → dim helper → short input cue (see prompt_q).
+
 prompt_home_dns() {
     if [ "${PI_BYPASS_ROUTING:-false}" != "true" ]; then
-        # In legacy mode the Pi's traffic goes through the tunnel by default,
-        # so dnsmasq's upstream DNS already routes home. Nothing to configure.
         HOME_DNS_MODE="${HOME_DNS_MODE:-skip}"
         HOME_DNS_SERVERS="${HOME_DNS_SERVERS:-}"
         save_config_var "HOME_DNS_MODE" "$HOME_DNS_MODE"
@@ -1453,53 +1493,6 @@ prompt_home_dns() {
     local tunnel_available="false"
     [ -n "$has_default_route" ] && tunnel_available="true"
 
-    echo ""
-    info "LAN client DNS (via dnsmasq)"
-    echo -e "   ${BLUE}Devices on the Pi LAN get DNS from this Pi. Where should those${NC}"
-    echo -e "   ${BLUE}lookups be forwarded so answers match your home location (GeoDNS)?${NC}"
-
-    # Step 1: forward through the tunnel at all?
-    local default_yes="true"
-    [ "${HOME_DNS_MODE:-}" = "skip" ] && default_yes="false"
-
-    local prompt1
-    if [ "$default_yes" = "true" ]; then
-        prompt1="📡 Forward LAN DNS through the VPN tunnel? [Y/n]"
-    else
-        prompt1="📡 Forward LAN DNS through the VPN tunnel? [y/N]"
-    fi
-
-    local forward_choice="$default_yes"
-    if [ "$NONINTERACTIVE" = "true" ]; then
-        if [ -n "${HOME_DNS_MODE+x}" ]; then
-            [ "${HOME_DNS_MODE}" != "skip" ] && forward_choice="true" || forward_choice="false"
-            info "Non-interactive: HOME_DNS_MODE = ${HOME_DNS_MODE} (from saved config)."
-        else
-            forward_choice="true"
-            info "Non-interactive default: forwarding LAN DNS through tunnel."
-        fi
-    else
-        echo ""
-        echo -ne "   $prompt1: "
-        local answer
-        read -r answer < /dev/tty
-        if [ "$default_yes" = "true" ]; then
-            [[ "$answer" =~ ^[Nn]$ ]] && forward_choice="false"
-        else
-            [[ "$answer" =~ ^[Yy]$ ]] && forward_choice="true"
-        fi
-    fi
-
-    if [ "$forward_choice" = "false" ]; then
-        HOME_DNS_MODE="skip"
-        HOME_DNS_SERVERS=""
-        warn "LAN DNS will use the Pi's WAN ISP DNS (geo-leaks to WAN location)."
-        save_config_var "HOME_DNS_MODE" "$HOME_DNS_MODE"
-        save_config_var "HOME_DNS_SERVERS" "$HOME_DNS_SERVERS"
-        return
-    fi
-
-    # --- helpers local to this prompt ---
     _home_dns_accept_custom() {
         local normalized="$1"
         local entry covered any_uncovered=false
@@ -1539,10 +1532,10 @@ prompt_home_dns() {
             if [ "$NONINTERACTIVE" = "true" ]; then
                 warn "Non-interactive: accepting uncovered DNS servers anyway."
             else
-                echo -ne "   ${YELLOW}Use these values anyway? [y/N]: ${NC}"
-                local ack
-                read -r ack < /dev/tty
-                [[ "$ack" =~ ^[Yy]$ ]] || return 1
+                prompt_q "Use these DNS servers anyway?"
+                prompt_hw "One or more addresses are outside AllowedIPs — WireGuard may drop them."
+                prompt_cue "[y/N]"
+                [[ "$PROMPT_REPLY" =~ ^[Yy]$ ]] || return 1
             fi
         fi
         HOME_DNS_MODE="custom"
@@ -1557,7 +1550,41 @@ prompt_home_dns() {
         success "LAN DNS upstream: ${HOME_DNS_TUNNEL_DEFAULTS} via wg0 (tunnel-exit)"
     }
 
-    # Non-interactive path: saved config wins; else WG DNS= > tunnel > .1.
+    local default_yes="true"
+    [ "${HOME_DNS_MODE:-}" = "skip" ] && default_yes="false"
+
+    local forward_choice="$default_yes"
+    if [ "$NONINTERACTIVE" = "true" ]; then
+        if [ -n "${HOME_DNS_MODE+x}" ]; then
+            [ "${HOME_DNS_MODE}" != "skip" ] && forward_choice="true" || forward_choice="false"
+            info "Non-interactive: HOME_DNS_MODE = ${HOME_DNS_MODE} (from saved config)."
+        else
+            forward_choice="true"
+            info "Non-interactive default: forwarding LAN DNS through tunnel."
+        fi
+    else
+        local cue1="[Y/n]"
+        [ "$default_yes" = "false" ] && cue1="[y/N]"
+        prompt_q "📡 Forward LAN DNS through the VPN tunnel?"
+        prompt_h "Devices on the Pi LAN get DNS from this Pi (dnsmasq)."
+        prompt_h "Forwarding through the tunnel makes answers match your home location (GeoDNS)."
+        prompt_cue "$cue1"
+        if [ "$default_yes" = "true" ]; then
+            [[ "$PROMPT_REPLY" =~ ^[Nn]$ ]] && forward_choice="false"
+        else
+            [[ "$PROMPT_REPLY" =~ ^[Yy]$ ]] && forward_choice="true"
+        fi
+    fi
+
+    if [ "$forward_choice" = "false" ]; then
+        HOME_DNS_MODE="skip"
+        HOME_DNS_SERVERS=""
+        warn "LAN DNS will use the Pi's WAN ISP DNS (geo-leaks to WAN location)."
+        save_config_var "HOME_DNS_MODE" "$HOME_DNS_MODE"
+        save_config_var "HOME_DNS_SERVERS" "$HOME_DNS_SERVERS"
+        return
+    fi
+
     if [ "$NONINTERACTIVE" = "true" ]; then
         if [ "${HOME_DNS_MODE:-}" = "custom" ] && [ -n "${HOME_DNS_SERVERS:-}" ]; then
             info "Non-interactive: HOME_DNS_SERVERS = '$HOME_DNS_SERVERS' (from saved config)."
@@ -1584,53 +1611,42 @@ prompt_home_dns() {
         return
     fi
 
-    # Step 2a: WireGuard DNS= present -> that is the default. Ask to confirm
-    # or override. This is the common case when the peer config was generated
-    # with a home resolver (router / Pi-hole / AdGuard).
     if [ -n "$wg_dns" ]; then
-        echo ""
-        echo -e "   ${BLUE}Your WireGuard config already sets:${NC}  ${BOLD}DNS = $wg_dns${NC}"
-        echo -e "   ${DIM}We'll use that as the upstream DNS for LAN clients (via the tunnel).${NC}"
-        echo -e "   ${DIM}(The Pi itself still uses PI_DNS_SERVERS over WAN — not this list.)${NC}"
-        echo ""
-        echo -ne "   📡 Use these DNS servers for LAN clients? [Y/n]: "
-        local use_wg
-        read -r use_wg < /dev/tty
-        if [[ ! "$use_wg" =~ ^[Nn]$ ]]; then
+        prompt_q "📡 Use these DNS servers for LAN clients?"
+        prompt_h "Found in your WireGuard config:"
+        echo -e "   ${BOLD}DNS = $wg_dns${NC}"
+        prompt_h "LAN clients would use these via the tunnel (local hostnames, Pi-hole, etc.)."
+        prompt_h "The Pi itself still uses PI_DNS_SERVERS over WAN — not this list."
+        prompt_cue "[Y/n]"
+        if [[ ! "$PROMPT_REPLY" =~ ^[Nn]$ ]]; then
             if _home_dns_accept_custom "$wg_dns"; then
                 save_config_var "HOME_DNS_MODE" "$HOME_DNS_MODE"
                 save_config_var "HOME_DNS_SERVERS" "$HOME_DNS_SERVERS"
                 return
             fi
-            # Validation rejected and user declined "anyway" -> fall through
-            # to the override prompt.
         fi
 
-        echo ""
-        echo -e "   ${DIM}Override options:${NC}"
+        prompt_q "📡 Override LAN DNS upstream"
         if [ "$tunnel_available" = "true" ]; then
-            echo -e "   ${DIM}  • press Enter / type 'tunnel'  → public DNS ${HOME_DNS_TUNNEL_DEFAULTS} via wg0${NC}"
+            prompt_h "Press Enter / type 'tunnel' → public DNS ${HOME_DNS_TUNNEL_DEFAULTS} via wg0"
         fi
-        echo -e "   ${DIM}  • type other DNS IP(s)         → custom upstream via the tunnel${NC}"
-        echo -e "   ${DIM}  • type 'skip'                  → use Pi WAN DNS (geo-leaks)${NC}"
+        prompt_h "Type other DNS IP(s) → custom upstream via the tunnel"
+        prompt_h "Type 'skip' → use Pi WAN DNS (geo-leaks)"
+        if [ "$tunnel_available" = "true" ]; then
+            prompt_cue_default "Upstream" "tunnel-exit"
+        else
+            prompt_cue "IP(s) or 'skip'"
+        fi
 
         while true; do
-            local label="📡 LAN DNS override"
-            if [ "$tunnel_available" = "true" ]; then
-                label="📡 LAN DNS override [Enter = tunnel-exit, or IP(s)]"
-            else
-                label="📡 LAN DNS override [IP(s), or 'skip']"
-            fi
-            echo -ne "   ${label}: "
-            local raw
-            read -r raw < /dev/tty
-
-            if [ -z "$raw" ] || [ "$raw" = "tunnel" ]; then
+            local raw="$PROMPT_REPLY"
+            if [ -z "$raw" ] || [ "$raw" = "tunnel" ] || [ "$raw" = "tunnel-exit" ]; then
                 if [ "$tunnel_available" = "true" ]; then
                     _home_dns_set_tunnel
                     break
                 fi
                 warn "Tunnel-exit needs AllowedIPs 0.0.0.0/0 (or ::/0). Enter IP(s) instead."
+                prompt_cue "IP(s) or 'skip'"
                 continue
             fi
             if [ "$raw" = "skip" ]; then
@@ -1646,9 +1662,10 @@ prompt_home_dns() {
             normalized=$(normalize_ip_list "$raw")
             if [ -z "$normalized" ]; then
                 warn "No valid IPv4/IPv6 addresses parsed from '$raw'. Try again."
+                prompt_cue "IP(s) or 'skip'"
                 continue
             fi
-            _home_dns_accept_custom "$normalized" || continue
+            _home_dns_accept_custom "$normalized" || { prompt_cue "IP(s) or 'skip'"; continue; }
             break
         done
 
@@ -1657,44 +1674,42 @@ prompt_home_dns() {
         return
     fi
 
-    # Step 2b: no WireGuard DNS= -> tunnel-exit when possible, else home .1.
-    echo ""
     if [ "$tunnel_available" = "true" ]; then
-        echo -e "   ${DIM}No DNS= in your WireGuard config. Default: tunnel-exit —${NC}"
-        echo -e "   ${DIM}dnsmasq forwards to ${HOME_DNS_TUNNEL_DEFAULTS} via wg0 (home peer NATs).${NC}"
-        echo -e "   ${DIM}Override: type a home DNS IP (e.g. Pi-hole), or 'skip'.${NC}"
+        prompt_q "📡 LAN DNS upstream"
+        prompt_h "No DNS= in your WireGuard config. Default is tunnel-exit:"
+        prompt_h "dnsmasq → ${HOME_DNS_TUNNEL_DEFAULTS} via wg0 (home peer NATs the lookup)."
+        prompt_h "Override: type a home DNS IP (e.g. Pi-hole), or 'skip'."
         if [ -n "$suggested_home_ip" ]; then
-            echo -e "   ${DIM}Suggestion if you have one: ${suggested_home_ip}${NC}"
+            prompt_h "Suggestion if you have a home resolver: ${suggested_home_ip}"
         fi
+        prompt_cue_default "Upstream" "tunnel-exit"
     elif [ -n "$suggested_home_ip" ]; then
-        echo -e "   ${DIM}Default: forward to ${suggested_home_ip} (.1 of first home AllowedIPs subnet).${NC}"
-        echo -e "   ${YELLOW}Tunnel-exit unavailable (no 0.0.0.0/0 in AllowedIPs).${NC}"
+        prompt_q "📡 LAN DNS upstream"
+        prompt_h "Default: ${suggested_home_ip} (.1 of first home AllowedIPs subnet)."
+        prompt_hw "Tunnel-exit unavailable (no 0.0.0.0/0 in AllowedIPs)."
+        prompt_cue_default "Upstream" "$suggested_home_ip"
     else
-        echo -e "   ${DIM}Type one or more home-network DNS server IPs (space/comma separated).${NC}"
-        echo -e "   ${YELLOW}Tunnel-exit unavailable (no 0.0.0.0/0 in AllowedIPs).${NC}"
+        prompt_q "📡 LAN DNS upstream"
+        prompt_h "Type one or more home-network DNS server IPs (space/comma separated)."
+        prompt_hw "Tunnel-exit unavailable (no 0.0.0.0/0 in AllowedIPs)."
+        prompt_cue "IP(s) or 'skip'"
     fi
 
     while true; do
-        local label
-        if [ "$tunnel_available" = "true" ]; then
-            label="📡 LAN DNS upstream [Enter = tunnel-exit, or IP(s)]"
-        elif [ -n "$suggested_home_ip" ]; then
-            label="📡 LAN DNS upstream [default: ${BOLD}${YELLOW}${suggested_home_ip}${NC}]"
-        else
-            label="📡 Home DNS server IP(s)"
-        fi
-        echo -ne "   ${label}: "
-        local raw
-        read -r raw < /dev/tty
-
-        if [ -z "$raw" ]; then
+        local raw="$PROMPT_REPLY"
+        if [ -z "$raw" ] || [ "$raw" = "tunnel" ] || [ "$raw" = "tunnel-exit" ]; then
             if [ "$tunnel_available" = "true" ]; then
                 _home_dns_set_tunnel
                 break
-            elif [ -n "$suggested_home_ip" ]; then
+            elif [ -z "$raw" ] && [ -n "$suggested_home_ip" ]; then
                 raw="$suggested_home_ip"
-            else
+            elif [ -z "$raw" ]; then
                 warn "No DNS server entered. Try again, or type 'skip'."
+                prompt_cue "IP(s) or 'skip'"
+                continue
+            else
+                warn "Tunnel-exit needs AllowedIPs 0.0.0.0/0 (or ::/0)."
+                prompt_cue "IP(s) or 'skip'"
                 continue
             fi
         fi
@@ -1705,22 +1720,15 @@ prompt_home_dns() {
             warn "LAN DNS will use the Pi's WAN ISP DNS (geo-leaks)."
             break
         fi
-        if [ "$raw" = "tunnel" ]; then
-            if [ "$tunnel_available" = "true" ]; then
-                _home_dns_set_tunnel
-                break
-            fi
-            warn "Tunnel-exit needs AllowedIPs 0.0.0.0/0 (or ::/0)."
-            continue
-        fi
 
         local normalized
         normalized=$(normalize_ip_list "$raw")
         if [ -z "$normalized" ]; then
             warn "No valid IPv4/IPv6 addresses parsed from '$raw'. Try again."
+            prompt_cue "IP(s) or 'skip'"
             continue
         fi
-        _home_dns_accept_custom "$normalized" || continue
+        _home_dns_accept_custom "$normalized" || { prompt_cue "IP(s) or 'skip'"; continue; }
         break
     done
 
@@ -1728,29 +1736,14 @@ prompt_home_dns() {
     save_config_var "HOME_DNS_SERVERS" "$HOME_DNS_SERVERS"
 }
 
-# Ask the operator which DNS server(s) the Pi itself should use for its OWN
-# outbound name resolution (apt, NTP, Pi Connect bootstrap, the WireGuard
-# endpoint hostname, etc.). These run via WAN regardless of tunnel state.
-#
-# Default: 1.1.1.1 8.8.8.8 - matches the WAN-static-IP DNS default and is
-# resilient to single-provider outages.
 prompt_pi_dns() {
     if [ "${PI_BYPASS_ROUTING:-false}" != "true" ]; then
-        # Legacy mode: the Pi's traffic goes via wg0 anyway. We do not touch
-        # /etc/resolv.conf so the Pi keeps using whatever DNS its WAN provider
-        # / NetworkManager hands it.
         PI_DNS_SERVERS="${PI_DNS_SERVERS:-}"
         save_config_var "PI_DNS_SERVERS" "$PI_DNS_SERVERS"
         return
     fi
 
     local default="${PI_DNS_SERVERS:-1.1.1.1 8.8.8.8}"
-
-    echo ""
-    info "Pi-local DNS (used by the Pi itself, always via WAN)"
-    echo -e "   ${BLUE}This is the DNS the Pi resolves apt/NTP/Pi Connect/WireGuard endpoints${NC}"
-    echo -e "   ${BLUE}with. It must work even when the tunnel is down, otherwise package${NC}"
-    echo -e "   ${BLUE}updates and remote management break. Public resolvers are recommended.${NC}"
 
     if [ "$NONINTERACTIVE" = "true" ]; then
         PI_DNS_SERVERS="$(normalize_ip_list "$default")"
@@ -1760,9 +1753,11 @@ prompt_pi_dns() {
     fi
 
     while true; do
-        echo -ne "   🌐 DNS for the Pi itself [default: ${BOLD}${YELLOW}${default}${NC}]: "
-        local raw
-        read -r raw < /dev/tty
+        prompt_q "🌐 DNS for the Pi itself (always via WAN)"
+        prompt_h "Used by apt, NTP, Pi Connect, and the WireGuard endpoint hostname."
+        prompt_h "Must work even when the tunnel is down. Public resolvers are recommended."
+        prompt_cue_default "DNS servers" "$default"
+        local raw="$PROMPT_REPLY"
         [ -z "$raw" ] && raw="$default"
         local normalized
         normalized=$(normalize_ip_list "$raw")
@@ -1786,37 +1781,34 @@ prompt_wan_static_ip() {
         already_static=true
     fi
 
-    echo ""
-    info "WAN Static IP (optional, recommended)"
-    echo -e "   ${BLUE}👉 A static WAN IP ensures the Pi is always reachable at a predictable${NC}"
-    echo -e "   ${BLUE}   address from the upstream network (SSH, diagnostics, port forwards).${NC}"
+    local default_yes=true
+    [ "$already_static" = true ] && default_yes=false
+    local cue="[Y/n]"
+    [ "$default_yes" = true ] || cue="[y/N]"
+
+    if [ "$already_static" = true ]; then
+        prompt_q "🔒 Reconfigure static IP on $WAN_IFACE?"
+    else
+        prompt_q "🔒 Configure a static IP on $WAN_IFACE? (recommended)"
+    fi
+    prompt_h "A static WAN IP keeps the Pi reachable at a predictable address"
+    prompt_h "(SSH, diagnostics, port forwards) on the upstream network."
     if [ -n "$WAN_CURRENT_IP" ]; then
-        echo -e "   ${DIM}Current IP on $WAN_IFACE: ${WAN_CURRENT_IP}/${WAN_CURRENT_PREFIX}${NC}"
+        prompt_h "Current IP on $WAN_IFACE: ${WAN_CURRENT_IP}/${WAN_CURRENT_PREFIX}"
     fi
     if [ -n "$WAN_GATEWAY" ]; then
-        echo -e "   ${DIM}Detected gateway:        ${WAN_GATEWAY}${NC}"
+        prompt_h "Detected gateway: ${WAN_GATEWAY}"
     fi
     if [ "$already_static" = true ]; then
         echo -e "   ${GREEN}✔ $WAN_IFACE already appears to have a static configuration.${NC}"
     fi
-
-    local default_yes=true
-    [ "$already_static" = true ] && default_yes=false
-
-    local prompt
-    if [ "$default_yes" = true ]; then
-        prompt="🔒 Configure a static IP on $WAN_IFACE? [Y/n]"
-    else
-        prompt="🔒 Reconfigure static IP on $WAN_IFACE? [y/N]"
-    fi
-    echo -ne "   $prompt: "
-    read -r answer < /dev/tty
+    prompt_cue "$cue"
 
     local enabled="false"
     if [ "$default_yes" = true ]; then
-        [[ "$answer" =~ ^[Nn]$ ]] || enabled="true"
+        [[ "$PROMPT_REPLY" =~ ^[Nn]$ ]] || enabled="true"
     else
-        [[ "$answer" =~ ^[Yy]$ ]] && enabled="true"
+        [[ "$PROMPT_REPLY" =~ ^[Yy]$ ]] && enabled="true"
     fi
 
     WAN_STATIC_IP_ENABLED="$enabled"
@@ -1829,15 +1821,12 @@ prompt_wan_static_ip() {
 
     local suggestion
     suggestion=$(suggest_wan_static_ip "$WAN_GATEWAY" "$WAN_CURRENT_IP")
-
     local default_ip="${WAN_STATIC_IP:-$suggestion}"
     while true; do
-        if [ -n "$default_ip" ]; then
-            echo -ne "   📌 Static IP [default: ${BOLD}${YELLOW}${default_ip}${NC}]: "
-        else
-            echo -ne "   📌 Static IP: "
-        fi
-        read -r user_ip < /dev/tty
+        prompt_q "📌 WAN static IP address"
+        prompt_h "IPv4 address to assign to $WAN_IFACE."
+        prompt_cue_default "IP" "$default_ip"
+        local user_ip="$PROMPT_REPLY"
         [ -z "$user_ip" ] && user_ip="$default_ip"
         if is_valid_ipv4 "$user_ip"; then
             WAN_STATIC_IP="$user_ip"
@@ -1848,8 +1837,10 @@ prompt_wan_static_ip() {
 
     local default_prefix="${WAN_STATIC_PREFIX:-${WAN_CURRENT_PREFIX:-24}}"
     while true; do
-        echo -ne "   📐 Prefix length [default: ${BOLD}${YELLOW}${default_prefix}${NC}]: "
-        read -r user_prefix < /dev/tty
+        prompt_q "📐 WAN prefix length"
+        prompt_h "CIDR prefix for the static address (usually 24)."
+        prompt_cue_default "Prefix" "$default_prefix"
+        local user_prefix="$PROMPT_REPLY"
         [ -z "$user_prefix" ] && user_prefix="$default_prefix"
         if echo "$user_prefix" | grep -Eq '^[0-9]+$' && [ "$user_prefix" -ge 8 ] && [ "$user_prefix" -le 32 ]; then
             WAN_STATIC_PREFIX="$user_prefix"
@@ -1860,12 +1851,10 @@ prompt_wan_static_ip() {
 
     local default_gateway="${WAN_STATIC_GATEWAY:-${WAN_GATEWAY}}"
     while true; do
-        if [ -n "$default_gateway" ]; then
-            echo -ne "   🧭 Gateway [default: ${BOLD}${YELLOW}${default_gateway}${NC}]: "
-        else
-            echo -ne "   🧭 Gateway: "
-        fi
-        read -r user_gateway < /dev/tty
+        prompt_q "🧭 WAN gateway"
+        prompt_h "Upstream default gateway for $WAN_IFACE (leave empty only if none)."
+        prompt_cue_default "Gateway" "$default_gateway"
+        local user_gateway="$PROMPT_REPLY"
         [ -z "$user_gateway" ] && user_gateway="$default_gateway"
         if [ -z "$user_gateway" ] || is_valid_ipv4 "$user_gateway"; then
             WAN_STATIC_GATEWAY="$user_gateway"
@@ -1875,8 +1864,10 @@ prompt_wan_static_ip() {
     done
 
     local default_dns="${WAN_STATIC_DNS:-1.1.1.1 8.8.8.8}"
-    echo -ne "   🌐 DNS servers (space-separated) [default: ${BOLD}${YELLOW}${default_dns}${NC}]: "
-    read -r user_dns < /dev/tty
+    prompt_q "🌐 WAN DNS servers"
+    prompt_h "Used while the static WAN config is applied (space-separated)."
+    prompt_cue_default "DNS servers" "$default_dns"
+    local user_dns="$PROMPT_REPLY"
     [ -z "$user_dns" ] && user_dns="$default_dns"
     WAN_STATIC_DNS="$user_dns"
 
@@ -1884,16 +1875,9 @@ prompt_wan_static_ip() {
     save_config_var "WAN_STATIC_PREFIX" "$WAN_STATIC_PREFIX"
     save_config_var "WAN_STATIC_GATEWAY" "$WAN_STATIC_GATEWAY"
     save_config_var "WAN_STATIC_DNS" "$WAN_STATIC_DNS"
-
-    success "Static WAN IP: $WAN_STATIC_IP/$WAN_STATIC_PREFIX via ${WAN_STATIC_GATEWAY:-<none>}"
+    success "WAN static: $WAN_STATIC_IP/$WAN_STATIC_PREFIX via ${WAN_STATIC_GATEWAY:-<none>} DNS=$WAN_STATIC_DNS"
 }
 
-# Marker used on every iptables INPUT rule installed by ensure_wan_firewall_rules
-# so we can find/remove them safely on re-run (handles SSH_PORT / WG_LISTEN_PORT
-# or WAN_IFACE changes without leaving stale or wrongly-ordered rules behind).
-FW_RULE_TAG="vpn-gateway"
-
-# Remove any previously-tagged INPUT rules. Safe to call before re-applying.
 remove_tagged_input_rules() {
     local tag="$FW_RULE_TAG"
     # iptables-save preserves rule order; keep deleting matched lines until none.
@@ -2043,30 +2027,46 @@ select_interface() {
     done
     echo "" >&2
 
-    # Build colored prompt
-    local prompt="👉 \e[1;34mSelect interface number"
+    local old_fd="$PROMPT_FD"
+    PROMPT_FD=2
+    prompt_q "👉 Select interface number"
     if [ -n "$default_iface" ]; then
-        prompt+=" [Default: \e[1;33m${default_iface}\e[0m]"
+        prompt_h "Press Enter for the default, or type a number from the list above."
+        prompt_cue_default "Number" "$default_iface"
+    else
+        prompt_h "Type a number from the list above."
+        prompt_cue "Number"
     fi
-    prompt+=": \e[0m"
+    PROMPT_FD="$old_fd"
 
     while true; do
-        # read from tty to avoid capture issues
-        read -r -p "$(echo -e "$prompt")" choice < /dev/tty
-
+        local choice="$PROMPT_REPLY"
+        # If the default iface name was accepted via empty Enter, map it.
         if [ -z "$choice" ] && [ -n "$default_iface" ]; then
             chosen_iface="$default_iface"
             break
-        elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#iface_list[@]}" ]; then
+        fi
+        # Allow typing the interface name as well as the number / default name.
+        if [ -n "$default_iface" ] && [ "$choice" = "$default_iface" ]; then
+            chosen_iface="$default_iface"
+            break
+        fi
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#iface_list[@]}" ]; then
             chosen_iface="${iface_list[$((choice-1))]}"
             break
-        else
-            if [ -n "$default_iface" ]; then
-                warn "Invalid selection. Press Enter for default or choose a valid number." >&2
-            else
-                warn "Invalid selection. Please try again." >&2
-            fi
         fi
+        if [ -n "$default_iface" ]; then
+            warn "Invalid selection. Press Enter for default or choose a valid number." >&2
+        else
+            warn "Invalid selection. Please try again." >&2
+        fi
+        PROMPT_FD=2
+        if [ -n "$default_iface" ]; then
+            prompt_cue_default "Number" "$default_iface"
+        else
+            prompt_cue "Number"
+        fi
+        PROMPT_FD="$old_fd"
     done
 
     echo "$chosen_iface"
@@ -2075,56 +2075,58 @@ select_interface() {
 get_wg_config() {
     # Pre-fill default from config if available
     local default_path="${WG_CONF_PATH:-}"
-    
+    local old_fd="$PROMPT_FD"
+    PROMPT_FD=2
+
     while true; do
         # Prompt to stderr so it is visible when stdout is captured by command substitution.
-        # Use readline (-e) with optional initial text for tab completion and easier editing.
+        prompt_q "📂 WireGuard peer config file"
+        prompt_h "Contains your private key and peer settings for the home VPN."
+        echo "" >&2
         if [ -n "$default_path" ]; then
-            printf "📂 Enter path to WireGuard peer config file [default: \e[1;33m%s\e[0m]: " "$default_path" >&2
+            echo -ne "   Path [default: ${BOLD}${YELLOW}${default_path}${NC}]: " >&2
             read -e -i "$default_path" -r input_path < /dev/tty
         else
-            printf "📂 Enter path to WireGuard peer config file: " >&2
+            echo -ne "   Path: " >&2
             read -e -r input_path < /dev/tty
         fi
-        
-        # Use input or default
+
         if [ -z "$input_path" ] && [ -n "$default_path" ]; then
             wg_conf_path="$default_path"
         else
             wg_conf_path="$input_path"
         fi
 
-        echo -e "   ${BLUE}👉 This file contains your private key and peer settings for the home VPN.${NC}" >&2
         if [ -f "$wg_conf_path" ]; then
             echo "$wg_conf_path"
-            # Update global var for saving later
-            WG_CONF_PATH="$wg_conf_path" 
+            WG_CONF_PATH="$wg_conf_path"
+            PROMPT_FD="$old_fd"
             break
         else
             warn "File not found: $wg_conf_path. Please try again." >&2
         fi
     done
+    PROMPT_FD="$old_fd"
 }
 
 get_ip_range() {
     local default_cidr="${LAN_CIDR:-10.10.10.0/24}"
-    
-    # Debug logging
+    local old_fd="$PROMPT_FD"
+    PROMPT_FD=2
+
     echo "[DEBUG] Entering get_ip_range function" >> "$LOG_FILE"
-    
-    # Prompt on stderr so it is visible even when this function is used in a
-    # command substitution (stdout is captured for the return value).
-    echo -ne "🌐 Enter LAN IP range (CIDR, forced to /24) [default: ${BOLD}${YELLOW}$default_cidr${NC}]: " >&2
-    
-    # Force read from terminal
-    read -r input_cidr < /dev/tty
-    
+
+    prompt_q "🌐 LAN IP range (CIDR)"
+    prompt_h "Private subnet for devices on the LAN/AP side."
+    prompt_h "Subnets are locked to /24 (other prefixes are coerced)."
+    prompt_cue_default "CIDR" "$default_cidr"
+    local input_cidr="$PROMPT_REPLY"
+
     echo "[DEBUG] Read IP input: '$input_cidr'" >> "$LOG_FILE"
-    
+
     if [ -z "$input_cidr" ]; then
         LAN_CIDR="$default_cidr"
     else
-        # Strip any existing prefix and force /24
         local ip_only prefix
         ip_only=$(echo "$input_cidr" | cut -d'/' -f1)
         prefix=$(echo "$ip_only" | awk -F'.' '{print $1"."$2"."$3}')
@@ -2138,8 +2140,8 @@ get_ip_range() {
             echo -e "   ${YELLOW}⚠️  Input not recognized; using default ${LAN_CIDR}.${NC}" >&2
         fi
     fi
-    
-    echo -e "   ${BLUE}👉 The private subnet for devices connecting to the AP (LAN side).${NC}" >&2
+
+    PROMPT_FD="$old_fd"
     echo "$LAN_CIDR"
 }
 
@@ -2277,24 +2279,21 @@ prompt_ssh_safety_warnings() {
         return 0
     fi
 
-    echo ""
-    warn "Remote-management disconnect risk detected:"
+    prompt_q "❓ Acknowledge disconnect risk and continue?"
+    prompt_hw "Remote-management disconnect risk detected:"
     local line
     for line in "${risk_lines[@]}"; do
-        echo -e "   ${YELLOW}${line}${NC}"
+        prompt_hw "$line"
     done
-    echo ""
-    info "After acknowledging, setup will switch to UNATTENDED mode and"
-    info "continue running even if your terminal disconnects."
-    echo ""
+    prompt_h "After this, setup switches to unattended mode and keeps running if your session drops."
+    prompt_h "You may need to reconnect afterward."
     if [ "$NONINTERACTIVE" = "true" ]; then
         info "Non-interactive: proceeding (the operator must reconnect manually if disconnected)."
         SSH_DISCONNECT_ACK="true"
         return 0
     fi
-    echo -ne "❓ ${YELLOW}Acknowledge and continue? [y/N]:${NC} "
-    read -r ack < /dev/tty
-    if [[ "$ack" =~ ^[Yy]$ ]]; then
+    prompt_cue "[y/N]"
+    if [[ "$PROMPT_REPLY" =~ ^[Yy]$ ]]; then
         SSH_DISCONNECT_ACK="true"
     else
         error "Aborted by user (disconnect risk not acknowledged)."
@@ -2557,9 +2556,10 @@ main() {
             USE_EXISTING_CONFIG=true
             info "Non-interactive mode: proceeding with existing configuration."
         else
-            echo -ne "Proceed with existing configuration? [Y/n]: "
-            read -r use_existing
-            if [[ ! "$use_existing" =~ ^[Nn]$ ]]; then
+            prompt_q "Proceed with existing configuration?"
+            prompt_h "Reuse saved settings from vpn-gateway.conf (skip re-asking most questions)."
+            prompt_cue "[Y/n]"
+            if [[ ! "$PROMPT_REPLY" =~ ^[Nn]$ ]]; then
                 USE_EXISTING_CONFIG=true
             fi
         fi
@@ -2590,11 +2590,10 @@ main() {
         if [ "$USE_EXISTING_CONFIG" = true ] && [ "${INSTALL_DEPENDENCIES:-}" = "true" ]; then
             info "Will install missing packages:$MISSING_PKGS"
         else
-            info "System Dependencies Check"
-            echo -e "   ${YELLOW}Missing packages:${NC}$MISSING_PKGS"
-            echo -ne "📦 ${YELLOW}Install required system packages?$MISSING_PKGS [Y/n]${NC} "
-            read -r install_choice
-            if [[ "$install_choice" =~ ^[Nn]$ ]]; then
+            prompt_q "📦 Install required system packages?"
+            prompt_h "Missing:$MISSING_PKGS"
+            prompt_cue "[Y/n]"
+            if [[ "$PROMPT_REPLY" =~ ^[Nn]$ ]]; then
                 error "Package installation is required to proceed. Exiting."
                 exit 1
             fi
@@ -2612,19 +2611,21 @@ main() {
     if [ "$USE_EXISTING_CONFIG" = true ]; then
         info "Using existing configuration from $CONFIG_FILE"
     else
-        info "Network Interface Selection"
-        echo -e "   ${BLUE}👉 Identify which port connects to the Internet (WAN) and which serves the local private network (LAN).${NC}"
-        echo "------------------------------------------------"
+        echo ""
+        echo -e "   ${BOLD}Network interface selection${NC}"
+        prompt_h "Identify which port is WAN (Internet) and which is LAN (private subnet)."
         
-        echo -e "\n${BOLD}Step 1: Select the WAN interface${NC}"
-        echo -e "   ${BLUE}ℹ️  This interface connects to the upstream Internet (e.g., USB adapter or built-in Ethernet connected to the site's router).${NC}"
+        prompt_q "Step 1: Select the WAN interface"
+        prompt_h "This port connects to the upstream Internet"
+        prompt_h "(USB adapter or built-in Ethernet to the site's router)."
         WAN_IFACE=$(select_interface "Available interfaces:" "$WAN_IFACE")
         save_config_var "WAN_IFACE" "$WAN_IFACE"
         success "WAN Interface selected: $WAN_IFACE"
         
-        echo -e "\n${BOLD}Step 2: Select the LAN interface${NC}"
-        echo -e "   ${BLUE}ℹ️  This interface will host the secure private subnet (e.g., built-in Ethernet connected to your Access Point).${NC}"
-        echo -e "   ${YELLOW}👉 If you select a wireless interface (e.g., wlan0), the Pi will be configured as a Wi-Fi Access Point.${NC}"
+        prompt_q "Step 2: Select the LAN interface"
+        prompt_h "This port hosts the secure private subnet"
+        prompt_h "(e.g. built-in Ethernet to your Access Point)."
+        prompt_hw "If you select Wi-Fi (wlan0), the Pi becomes a Wi-Fi Access Point."
         LAN_IFACE=$(select_interface "Available interfaces:" "$LAN_IFACE")
         save_config_var "LAN_IFACE" "$LAN_IFACE"
         if [ -n "$PREV_LAN_IFACE" ] && [ "$PREV_LAN_IFACE" != "$LAN_IFACE" ]; then
@@ -2654,10 +2655,10 @@ main() {
                 if [ "${INSTALL_HOSTAPD:-}" = "true" ]; then
                     info "Will install hostapd for Access Point."
                 else
-                    info "Wireless LAN requires hostapd (not installed)."
-                    echo -ne "❓ ${YELLOW}Install hostapd for Access Point? [Y/n]${NC} "
-                    read -r ap_install_choice
-                    if [[ "$ap_install_choice" =~ ^[Nn]$ ]]; then
+                    prompt_q "❓ Install hostapd for Access Point?"
+                    prompt_h "Wireless LAN requires hostapd (not installed)."
+                    prompt_cue "[Y/n]"
+                    if [[ "$PROMPT_REPLY" =~ ^[Nn]$ ]]; then
                         error "Cannot proceed with wireless LAN without hostapd. Exiting."
                         exit 1
                     fi
@@ -2677,17 +2678,17 @@ main() {
             IS_WIRELESS=true
             save_config_var "IS_WIRELESS" "true"
             info "Wireless LAN interface detected ($LAN_IFACE)."
-            echo -e "   ${BLUE}ℹ️  To use this interface for the private subnet, the Pi must act as a Wi-Fi Access Point.${NC}"
-            echo -e "   ${BLUE}ℹ️  This requires installing 'hostapd' (Host Access Point Daemon).${NC}"
-            
+
             if is_pkg_installed hostapd; then
                  success "'hostapd' is already installed."
                  INSTALL_HOSTAPD="false"
                  save_config_var "INSTALL_HOSTAPD" "false"
             else
-                echo -ne "❓ ${YELLOW}Do you want to proceed with installing hostapd? [Y/n]${NC} "
-                read -r ap_install_choice
-                if [[ "$ap_install_choice" =~ ^[Nn]$ ]]; then
+                prompt_q "❓ Install hostapd for Access Point?"
+                prompt_h "To use $LAN_IFACE for the private subnet, the Pi must act as a Wi-Fi AP."
+                prompt_h "This requires installing hostapd (Host Access Point Daemon)."
+                prompt_cue "[Y/n]"
+                if [[ "$PROMPT_REPLY" =~ ^[Nn]$ ]]; then
                     error "Cannot proceed with wireless LAN without hostapd. Exiting."
                     exit 1
                 fi
@@ -2695,26 +2696,20 @@ main() {
                 save_config_var "INSTALL_HOSTAPD" "true"
             fi
 
-            # Pre-fill SSID from config
             default_ssid="${AP_SSID:-}"
-            prompt_ssid="📡 Enter SSID (Network Name) for the AP"
-            if [ -n "$default_ssid" ]; then
-                 prompt_ssid="$prompt_ssid [default: ${BOLD}${YELLOW}$default_ssid${NC}]"
-            fi
-            
             while true; do
-                echo -ne "$prompt_ssid: "
-                read -r input_ssid
+                prompt_q "📡 Access Point SSID (network name)"
+                prompt_h "1–32 characters; no quotes, backslashes, or control characters."
+                prompt_cue_default "SSID" "$default_ssid"
+                input_ssid="$PROMPT_REPLY"
                 if [ -z "$input_ssid" ] && [ -n "$default_ssid" ]; then
                     AP_SSID="$default_ssid"
                     break
                 elif [ -n "$input_ssid" ]; then
-                    # Validate SSID: 1-32 characters, no control characters or quotes
                     if [ ${#input_ssid} -gt 32 ]; then
                         warn "SSID must be 32 characters or less."
                         continue
                     fi
-                    # Check for problematic characters (quotes, backslashes, control chars)
                     if echo "$input_ssid" | grep -qE '["\x27\\]|[[:cntrl:]]'; then
                         warn "SSID cannot contain quotes, backslashes, or control characters."
                         continue
@@ -2726,22 +2721,25 @@ main() {
                 fi
             done
             save_config_var "AP_SSID" "$AP_SSID"
-            
-            # Pre-fill Password from config (warn user)
+
             default_pass="${AP_PASS:-}"
-            prompt_pass="🔑 Enter Password for the AP (min 8 chars)"
-            if [ -n "$default_pass" ]; then
-                 prompt_pass="$prompt_pass [default: ${BOLD}${YELLOW}********${NC}]"
-            fi
-            
             while true; do
-                echo -ne "$prompt_pass: "
-                read -r -s input_pass
+                prompt_q "🔑 Access Point password"
+                prompt_h "8–63 characters; no quotes, backslashes, or control characters."
+                if [ -n "$default_pass" ]; then
+                    prompt_h "Press Enter to keep the previously saved password."
+                fi
                 echo ""
-                
-                # Logging input length only, not the password itself
+                if [ -n "$default_pass" ]; then
+                    echo -ne "   Password [default: ${BOLD}${YELLOW}********${NC}]: "
+                else
+                    echo -ne "   Password: "
+                fi
+                read -r -s input_pass < /dev/tty
+                echo ""
+
                 echo "[DEBUG] Password input received. Length: ${#input_pass}" >> "$LOG_FILE"
-                
+
                 if [ -z "$input_pass" ] && [ -n "$default_pass" ]; then
                     AP_PASS="$default_pass"
                     break
@@ -2754,7 +2752,6 @@ main() {
                     echo "[DEBUG] Password too long." >> "$LOG_FILE"
                     continue
                 fi
-                # Check for problematic characters (quotes, backslashes, control chars)
                 if echo "$input_pass" | grep -qE '["\x27\\]|[[:cntrl:]]'; then
                     warn "Password cannot contain quotes, backslashes, or control characters."
                     echo "[DEBUG] Password contains invalid characters." >> "$LOG_FILE"
@@ -2763,7 +2760,6 @@ main() {
                 AP_PASS="$input_pass"
                 break
             done
-            # Explicit log to confirm loop exit
             echo "[DEBUG] Password accepted." >> "$LOG_FILE"
             save_config_var "AP_PASS" "$AP_PASS"
         else
@@ -2854,9 +2850,10 @@ main() {
 
         # Ask whether to configure firewall (WAN hardening)
         echo ""
-        echo -ne "🛡️  Configure WAN firewall (allow SSH + WireGuard, drop other inbound)? [Y/n]: "
-        read -r fw_choice
-        if [[ "$fw_choice" =~ ^[Nn]$ ]]; then
+        prompt_q "🛡️  Configure WAN firewall?"
+        prompt_h "Allow SSH + WireGuard inbound; drop other unsolicited WAN traffic."
+        prompt_cue "[Y/n]"
+        if [[ "$PROMPT_REPLY" =~ ^[Nn]$ ]]; then
             FIREWALL_ENABLED="false"
         else
             FIREWALL_ENABLED="true"
@@ -2864,10 +2861,10 @@ main() {
         save_config_var "FIREWALL_ENABLED" "$FIREWALL_ENABLED"
 
         # Ask about automatic updates (logs only, no email)
-        echo ""
-        echo -ne "🔄 Enable automatic updates (all packages) nightly at 03:00? [Y/n]: "
-        read -r auto_updates_choice
-        if [[ "$auto_updates_choice" =~ ^[Nn]$ ]]; then
+        prompt_q "🔄 Enable automatic updates?"
+        prompt_h "Installs unattended-upgrades; runs nightly around 03:00."
+        prompt_cue "[Y/n]"
+        if [[ "$PROMPT_REPLY" =~ ^[Nn]$ ]]; then
             AUTO_UPDATES_ENABLED="false"
         else
             AUTO_UPDATES_ENABLED="true"
@@ -2875,9 +2872,10 @@ main() {
         save_config_var "AUTO_UPDATES_ENABLED" "$AUTO_UPDATES_ENABLED"
 
         echo ""
-        echo -ne "🛠️  Enable hardware watchdog (kernel-level auto-reboot on system hang)? [Y/n]: "
-        read -r watchdog_choice
-        if [[ "$watchdog_choice" =~ ^[Nn]$ ]]; then
+        prompt_q "🛠️  Enable hardware watchdog?"
+        prompt_h "Kernel-level auto-reboot if the system hangs (bcm2835 watchdog)."
+        prompt_cue "[Y/n]"
+        if [[ "$PROMPT_REPLY" =~ ^[Nn]$ ]]; then
             WATCHDOG_ENABLED="false"
         else
             WATCHDOG_ENABLED="true"
@@ -2959,9 +2957,10 @@ main() {
         info "Non-interactive mode: applying changes without confirmation."
         APPLYING_CHANGES=true
     else
-        echo -ne "${BOLD}Proceed with setup? [Y/n]:${NC} "
-        read -r proceed_choice
-        if [[ "$proceed_choice" =~ ^[Nn]$ ]]; then
+        prompt_q "Proceed with setup?"
+        prompt_h "After this, setup runs unattended (survives SSH/Pi Connect disconnect)."
+        prompt_cue "[Y/n]"
+        if [[ "$PROMPT_REPLY" =~ ^[Nn]$ ]]; then
             warn "Aborting setup by user request."
             exit 1
         fi

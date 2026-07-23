@@ -25,6 +25,19 @@ Do not start dependency installation early while still asking configuration ques
 - If information is missing, ask before triggering long-running operations.
 - Keep setup steps idempotent and resilient across reboot/power loss.
 
+### Interactive prompt layout
+
+Every setup question must follow **question → dim helper → short input cue**:
+
+1. Blank line (separates from the previous answer)
+2. Bold question headline
+3. Dim helper lines that clarify *this* question only
+4. Short cue last (`[Y/n]:`, `IP:`, `Path:`, …)
+
+Never put helper text before the question or after the input cue. Use the
+shared `prompt_q` / `prompt_h` / `prompt_cue` helpers in
+`scripts/setup-vpn-gateway.sh` (set `PROMPT_FD=2` when stdout is captured).
+
 ## Critical Operational Principles
 
 These principles must be preserved by any change to setup/cleanup/management scripts:
@@ -130,8 +143,8 @@ WireGuard `DNS =` vs this gateway:
   remote-management safety. Setup therefore **strips `DNS =`** from the
   installed `/etc/wireguard/wg0.conf` when `PI_BYPASS_ROUTING=true`.
 - LAN client DNS is configured separately via dnsmasq (`HOME_DNS_*`). The
-  prompt surfaces any `DNS =` values found in the source config as a
-  reusable custom-mode suggestion.
+  prompt reuses any `DNS =` values from the source config as the LAN
+  DNS default (confirm-or-override).
 
 Rules:
 
