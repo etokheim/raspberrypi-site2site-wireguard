@@ -13,10 +13,11 @@ Rules:
   - `trap '' HUP` so SIGHUP is ignored (inherited as ignored by all child processes).
   - Close stdin (`exec </dev/null`) so any stray read fails fast instead of blocking.
   - Redirect stdout/stderr to the persistent log file so writes cannot fail with `EIO` on a dead pty.
-  - Optionally mirror new log content to the operator's TTY via a backgrounded `tail -f` that dies harmlessly when the TTY closes.
+  - Keep a dedicated FD open on the operator's TTY for the progress box/spinner (`PROGRESS_UI_FD`). Detailed command output (apt, wg-quick, systemctl) stays in the log ONLY.
+  - Do **not** auto-tail the full log onto the TTY — that interleaves with the spinner and makes the UI unreadable. Tell the operator they can `tail -f` the log themselves if they want the raw stream.
 - Never add an interactive prompt after the input phase. Any new question must move into the input-collection block.
 - Before detaching, surface every known disconnect risk in a single consolidated warning:
   - SSH session bound to LAN/WAN that will be reconfigured.
   - Pi Connect (or similar daemon) active.
   - WireGuard `AllowedIPs` containing a default route (`0.0.0.0/0`, `::/0`, or `0.0.0.0/1` + `128.0.0.0/1`) - this redirects all outbound traffic into the tunnel and almost always breaks remote management unless the peer NATs the Pi's traffic.
-- The script's progress UI may degrade after detach (no TTY redraws, etc.) - that is acceptable. Correctness of the unattended run is the priority.
+- The progress UI may degrade if the TTY disappears mid-run (writes to the UI FD fail silently) — that is acceptable. Correctness of the unattended run is the priority.

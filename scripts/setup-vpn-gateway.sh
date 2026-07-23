@@ -205,19 +205,54 @@ suggest_home_dns_default() {
     done < <(extract_home_subnets "$cfg")
 }
 
+# Extract DNS= values from a WireGuard config (Interface section).
+# wg-quick uses these to rewrite the *host* resolv.conf when the tunnel is
+# up - that is client-mode semantics. On this gateway, LAN clients get DNS
+# from dnsmasq (HOME_DNS_*) and the Pi itself uses PI_DNS_SERVERS via WAN,
+# so DNS= is NOT applied under Pi-bypass. The values are still useful as a
+# suggestion for HOME_DNS_MODE=custom (home Pi-hole / router resolver).
+# Echoes a space-separated list of IPv4/IPv6 addresses (may be empty).
+extract_wg_dns_servers() {
+    local cfg="$1"
+    [ -f "$cfg" ] || return 0
+    local raw
+    raw=$(awk '
+        BEGIN { in_iface=0 }
+        /^\[/ { in_iface = ($0 ~ /^\[Interface\]/) }
+        in_iface && /^[[:space:]]*DNS[[:space:]]*=/ {
+            sub(/^[^=]*=[[:space:]]*/, "", $0)
+            gsub(/[[:space:]]/, "", $0)
+            # Drop inline comments
+            sub(/#.*$/, "", $0)
+            if ($0 != "") print $0
+        }
+    ' "$cfg" | tr ',' ' ')
+    normalize_ip_list "$raw"
+}
+
 # Normalize a free-form IP list (comma- or space-separated) into a single
-# space-separated, deduplicated list of valid IPv4 addresses. Invalid entries
-# are silently dropped; the caller is expected to surface them.
+# space-separated, deduplicated list of valid IPv4/IPv6 addresses. Invalid
+# entries are silently dropped; the caller is expected to surface them.
 normalize_ip_list() {
     local raw="$1"
     [ -z "$raw" ] && return 0
     echo "$raw" | tr ',' ' ' | tr -s ' ' '\n' \
-        | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {
-              ok=1
-              n = split($0, p, ".")
-              for (i = 1; i <= n; i++) if (p[i] < 0 || p[i] > 255) ok=0
-              if (ok) print
-          }' \
+        | awk '
+            # IPv4 dotted-quad
+            /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {
+                ok=1
+                n = split($0, p, ".")
+                for (i = 1; i <= n; i++) if (p[i] < 0 || p[i] > 255) ok=0
+                if (ok) print
+                next
+            }
+            # IPv6: at least one colon, only hex digits + colons (no zone id)
+            /:/ && /^[0-9a-fA-F:]+$/ {
+                # Must not be only colons; must look like an address
+                if ($0 ~ /[0-9a-fA-F]/ && $0 !~ /:::|::::/) print tolower($0)
+                next
+            }
+          ' \
         | awk '!seen[$0]++' \
         | tr '\n' ' ' | sed 's/[[:space:]]*$//'
 }
@@ -261,34 +296,55 @@ detect_wg_default_route() {
     # Look at every AllowedIPs line; split on commas; trim whitespace; check
     # for any of: 0.0.0.0/0, ::/0, or the 0.0.0.0/1 + 128.0.0.0/1 split-default
     # trick used by some VPN configs to bypass policy routing.
+    # Echoes a human-readable summary listing every match found (so callers can
+    # tell IPv4-default apart from IPv6-default).
     awk '
-        BEGIN { has_lo=0; has_hi=0; matched="" }
+        BEGIN { has_lo=0; has_hi=0; has_v4=0; has_v6=0 }
         /^[[:space:]]*AllowedIPs[[:space:]]*=/ {
             sub(/^[^=]*=[[:space:]]*/, "", $0)
             n = split($0, parts, ",")
             for (i = 1; i <= n; i++) {
                 gsub(/[[:space:]]/, "", parts[i])
-                if (parts[i] == "0.0.0.0/0" || parts[i] == "::/0") {
-                    matched = "default-route (" parts[i] ")"
-                    next
-                }
+                if (parts[i] == "0.0.0.0/0") has_v4=1
+                if (parts[i] == "::/0") has_v6=1
                 if (parts[i] == "0.0.0.0/1") has_lo=1
                 if (parts[i] == "128.0.0.0/1") has_hi=1
             }
         }
         END {
-            # exit code in awk body does not skip END, so use a flag instead.
-            if (matched != "") {
-                print matched
-                exit 0
-            }
-            if (has_lo && has_hi) {
-                print "split-default-route (0.0.0.0/1 + 128.0.0.0/1)"
-                exit 0
-            }
+            out=""
+            if (has_v4) out = out (out==""?"":", ") "default-route (0.0.0.0/0)"
+            if (has_lo && has_hi) out = out (out==""?"":", ") "split-default-route (0.0.0.0/1 + 128.0.0.0/1)"
+            if (has_v6) out = out (out==""?"":", ") "default-route (::/0)"
+            if (out != "") { print out; exit 0 }
             exit 1
         }
     ' "$cfg"
+}
+
+# FD used for the progress spinner / box after become_unattended. Empty means
+# "use stdout" (pre-detach, or when no TTY was available). Kept as a plain
+# variable (not exported) so child shells do not inherit a stale FD number.
+PROGRESS_UI_FD=""
+
+# Write to the operator's progress TTY when detached; otherwise stdout.
+# Failures are ignored so a dead TTY cannot abort the unattended run.
+ui_printf() {
+    if [ -n "${PROGRESS_UI_FD:-}" ]; then
+        # shellcheck disable=SC2059
+        printf "$@" >&"$PROGRESS_UI_FD" 2>/dev/null || true
+    else
+        # shellcheck disable=SC2059
+        printf "$@"
+    fi
+}
+
+ui_echo() {
+    if [ -n "${PROGRESS_UI_FD:-}" ]; then
+        echo -e "$@" >&"$PROGRESS_UI_FD" 2>/dev/null || true
+    else
+        echo -e "$@"
+    fi
 }
 
 # Make this script survive a hangup of its controlling terminal (SSH drop,
@@ -308,11 +364,14 @@ detect_wg_default_route() {
 #                                 the log file. Subsequent writes can no
 #                                 longer hit a closed pty (which would fail
 #                                 with EIO and abort the script).
-#   4. tail -f --pid=$$ ...   -> spawn a background mirror that streams new
-#                                 log content to the operator's TTY for as
-#                                 long as the TTY is alive. When the TTY dies
-#                                 the tail process exits silently; the main
-#                                 script keeps writing to the log file.
+#   4. Keep PROGRESS_UI_FD open on the original TTY so the progress box and
+#                                 spinner can redraw cleanly. Detailed command
+#                                 output (apt, systemctl, wg-quick) stays in
+#                                 the log ONLY - we deliberately do NOT
+#                                 auto-tail the full log onto the TTY, because
+#                                 that interleaves with the spinner and makes
+#                                 the UI unreadable. Operators who want the
+#                                 raw stream can `tail -f` the log themselves.
 #
 # After this function returns, NOTHING in the script may prompt the user.
 become_unattended() {
@@ -326,7 +385,9 @@ become_unattended() {
     echo ""
     if [ -n "$tty_dev" ] && [ "$tty_dev" != "not a tty" ]; then
         info "Input collected. Switching to unattended mode - setup will continue even if your connection drops."
-        info "Live progress (this terminal): tail -f $LOG_FILE"
+        info "Progress stays on this terminal; detailed command output goes only to:"
+        info "  $LOG_FILE"
+        info "Optional detail stream:  tail -f $LOG_FILE"
         info "After reconnecting, check status with: systemctl is-active vpn-gateway-lan dnsmasq wg-quick@wg0"
         echo ""
         sleep 1
@@ -338,14 +399,12 @@ become_unattended() {
     mkdir -p "$(dirname "$LOG_FILE")"
     : >> "$LOG_FILE"
 
-    # Mirror new log lines to the operator's TTY (best-effort) while it is
-    # still attached. The mirror dies when the TTY is closed; the main script
-    # is unaffected because it now writes only to the log file.
+    # Hold an open FD on the operator's TTY for the progress UI. Do not mirror
+    # the full log here - apt/wg-quick noise would fight the spinner.
+    PROGRESS_UI_FD=""
     if [ -n "$tty_dev" ] && [ "$tty_dev" != "not a tty" ] && [ -w "$tty_dev" ]; then
-        # --pid=$$ keeps the tail bound to the lifetime of this script.
-        ( tail -n0 -f --pid=$$ "$LOG_FILE" >"$tty_dev" 2>/dev/null ) &
-        TAIL_PID=$!
-        disown "$TAIL_PID" 2>/dev/null || true
+        exec 3>"$tty_dev"
+        PROGRESS_UI_FD=3
     fi
 
     exec >>"$LOG_FILE" 2>&1
@@ -588,6 +647,13 @@ do_configure_wg_firewall_rules() {
     local up_block down_block
     if [ "${PI_BYPASS_ROUTING:-false}" = "true" ]; then
         pi_bypass="true"
+        # Pi-bypass manages DNS via PI_DNS_SERVERS (Pi) + HOME_DNS_* (LAN).
+        # Strip DNS= so wg-quick/resolvconf cannot overwrite the Pi's WAN DNS
+        # when the tunnel comes up (that would make Pi DNS depend on wg0).
+        if grep -qE '^[[:space:]]*DNS[[:space:]]*=' "$WG_CONF_DEST"; then
+            echo "[wg] Stripping DNS= from $WG_CONF_DEST (Pi-bypass: Pi DNS is PI_DNS_SERVERS via WAN)" >> "$LOG_FILE"
+            sed -i '/^[[:space:]]*DNS[[:space:]]*=/d' "$WG_CONF_DEST"
+        fi
         # Split AllowedIPs home subnets into IPv4 / IPv6 buckets.
         local home_v4="" home_v6=""
         while IFS= read -r cidr; do
@@ -818,6 +884,8 @@ progress_find_step() {
 
 progress_draw_box() {
     # Box is 76 chars: │ + space + 72 content + space + │
+    # Always drawn via ui_* so it stays on the operator TTY after detach
+    # (stdout is the log file in the unattended phase).
     local box_w=76
     local content_w=72
     local border
@@ -827,16 +895,16 @@ progress_draw_box() {
     if [ "$PROGRESS_BOX_LINES" -gt 0 ]; then
         # Move up and clear each line
         for ((j=0; j<PROGRESS_BOX_LINES; j++)); do
-            printf "\033[A\033[2K"
+            ui_printf "\033[A\033[2K"
         done
     fi
     
     local lines=0
     
     # Header
-    echo -e "${CYAN}╭${border}╮${NC}"
-    echo -e "${CYAN}│${NC} ${BOLD}${YELLOW}⚡ Setup Progress${NC}$(printf '%*s' $((content_w - 17)) '') ${CYAN}│${NC}"
-    echo -e "${CYAN}├${border}┤${NC}"
+    ui_echo "${CYAN}╭${border}╮${NC}"
+    ui_echo "${CYAN}│${NC} ${BOLD}${YELLOW}⚡ Setup Progress${NC}$(printf '%*s' $((content_w - 17)) '') ${CYAN}│${NC}"
+    ui_echo "${CYAN}├${border}┤${NC}"
     lines=$((lines + 3))
     
     # Steps
@@ -877,15 +945,15 @@ progress_draw_box() {
         
         # Print the line
         if [ -n "$extra" ]; then
-            echo -e "${CYAN}│${NC} ${color}${icon} ${step}${NC} ${DIM}${extra}${NC}$(printf '%*s' $padding '') ${CYAN}│${NC}"
+            ui_echo "${CYAN}│${NC} ${color}${icon} ${step}${NC} ${DIM}${extra}${NC}$(printf '%*s' $padding '') ${CYAN}│${NC}"
         else
-            echo -e "${CYAN}│${NC} ${color}${icon} ${step}${NC}$(printf '%*s' $padding '') ${CYAN}│${NC}"
+            ui_echo "${CYAN}│${NC} ${color}${icon} ${step}${NC}$(printf '%*s' $padding '') ${CYAN}│${NC}"
         fi
         lines=$((lines + 1))
     done
     
     # Footer
-    echo -e "${CYAN}╰${border}╯${NC}"
+    ui_echo "${CYAN}╰${border}╯${NC}"
     lines=$((lines + 1))
     
     PROGRESS_BOX_LINES=$lines
@@ -907,24 +975,25 @@ progress_run_step() {
     progress_set_status "$idx" "running"
     progress_draw_box
     
-    # Run the command in background
+    # Run the command in background; output goes to the log only so it cannot
+    # interleave with the spinner on the operator TTY.
     echo "[$step_name] Executing: $cmd" >> "$LOG_FILE"
     eval "$cmd" >> "$LOG_FILE" 2>&1 &
     local pid=$!
     
-    # Animated spinner while waiting
+    # Animated spinner while waiting (on the progress TTY, not the log)
     local spin_frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
     local frame=0
     
     # Show spinner below the box
-    printf "   "
+    ui_printf "   "
     while kill -0 $pid 2>/dev/null; do
-        printf "\r   ${YELLOW}${spin_frames[$frame]}${NC} Running: ${DIM}%s${NC}   " "$step_name"
+        ui_printf "\r   ${YELLOW}%s${NC} Running: ${DIM}%s${NC}   " "${spin_frames[$frame]}" "$step_name"
         frame=$(( (frame + 1) % ${#spin_frames[@]} ))
         sleep 0.1
     done
     # Clear the spinner line
-    printf "\r\033[K"
+    ui_printf "\r\033[K"
     
     wait $pid
     local exit_code=$?
@@ -1381,12 +1450,18 @@ prompt_home_dns() {
         return
     fi
 
-    local has_default_route="" home_subnets="" suggested_home_ip=""
+    local has_default_route="" home_subnets="" suggested_home_ip="" wg_dns=""
     if [ -n "${WG_CONF_SRC:-}" ]; then
         has_default_route=$(detect_wg_default_route "$WG_CONF_SRC" 2>/dev/null || true)
         suggested_home_ip=$(suggest_home_dns_default "$WG_CONF_SRC" 2>/dev/null || true)
         home_subnets=$(extract_home_subnets "$WG_CONF_SRC" 2>/dev/null)
+        wg_dns=$(extract_wg_dns_servers "$WG_CONF_SRC" 2>/dev/null || true)
     fi
+
+    # Prefer DNS= from the WireGuard config as the custom-mode suggestion
+    # (those are usually the real home resolver). Fall back to .1 of the
+    # first home subnet when DNS= is absent.
+    local custom_suggestion="${wg_dns:-$suggested_home_ip}"
 
     echo ""
     info "LAN client DNS forwarding (recommended)"
@@ -1394,6 +1469,16 @@ prompt_home_dns() {
     echo -e "   ${BLUE}upstream. Forwarding through the tunnel makes DNS responses reflect${NC}"
     echo -e "   ${BLUE}your home network's geographic location (GeoDNS / CDN routing matches${NC}"
     echo -e "   ${BLUE}home).${NC}"
+    echo ""
+    echo -e "   ${DIM}Note: a WireGuard ${BOLD}DNS =${NC}${DIM} line configures the *VPN client's*${NC}"
+    echo -e "   ${DIM}own resolv.conf via wg-quick. This gateway does NOT use that for the${NC}"
+    echo -e "   ${DIM}Pi (Pi-bypass keeps Pi DNS on WAN via PI_DNS_SERVERS). LAN clients${NC}"
+    echo -e "   ${DIM}get DNS from dnsmasq instead - that is what this prompt configures.${NC}"
+    if [ -n "$wg_dns" ]; then
+        echo -e "   ${DIM}Found in your WireGuard config: DNS = ${BOLD}${wg_dns}${NC}"
+        echo -e "   ${DIM}Press Enter for tunnel-exit (recommended with full-tunnel), or type${NC}"
+        echo -e "   ${DIM}those IPs (or 'wg') to reuse them as the home DNS for LAN clients.${NC}"
+    fi
 
     # Step 1: yes/no - forward LAN DNS through the tunnel at all?
     local default_yes="true"
@@ -1440,7 +1525,7 @@ prompt_home_dns() {
     #
     # Default depends on AllowedIPs:
     #   - has 0.0.0.0/0   -> tunnel-exit (works without home DNS server)
-    #   - only home subnet -> custom with .1 of home subnet as suggestion
+    #   - only home subnet -> custom with WG DNS= or .1 of home subnet
     #   - neither          -> custom (we have nothing better to suggest)
     local prefer_tunnel="false"
     if [ -n "$has_default_route" ]; then
@@ -1452,12 +1537,22 @@ prompt_home_dns() {
         echo -e "   ${DIM}Default (press Enter): tunnel-exit. dnsmasq forwards to${NC}"
         echo -e "   ${DIM}${HOME_DNS_TUNNEL_DEFAULTS} via wg0; your home peer NATs the lookup.${NC}"
         echo -e "   ${DIM}No DNS server required on the home network.${NC}"
-        echo -e "   ${DIM}Override: type a home-network DNS server IP (e.g. ${suggested_home_ip:-10.33.33.1}${NC}"
-        echo -e "   ${DIM}- useful if you run Pi-hole, AdGuard Home, or your home router's resolver).${NC}"
+        if [ -n "$custom_suggestion" ]; then
+            echo -e "   ${DIM}Override: type a home-network DNS IP (suggestion: ${custom_suggestion}${NC}"
+            echo -e "   ${DIM}- from your WireGuard DNS= / AllowedIPs; useful for Pi-hole etc.).${NC}"
+        else
+            echo -e "   ${DIM}Override: type a home-network DNS server IP (e.g. 10.33.33.1${NC}"
+            echo -e "   ${DIM}- useful if you run Pi-hole, AdGuard Home, or your home router's resolver).${NC}"
+        fi
     else
-        if [ -n "$suggested_home_ip" ]; then
-            echo -e "   ${DIM}Default (press Enter): forward to ${suggested_home_ip} (the .1 of the${NC}"
-            echo -e "   ${DIM}first home subnet in AllowedIPs). Override with another home-network DNS IP.${NC}"
+        if [ -n "$custom_suggestion" ]; then
+            echo -e "   ${DIM}Default (press Enter): forward to ${custom_suggestion}${NC}"
+            if [ -n "$wg_dns" ]; then
+                echo -e "   ${DIM}(from your WireGuard config's DNS= line).${NC}"
+            else
+                echo -e "   ${DIM}(the .1 of the first home subnet in AllowedIPs).${NC}"
+            fi
+            echo -e "   ${DIM}Override with another home-network DNS IP if needed.${NC}"
         else
             echo -e "   ${DIM}Type one or more home-network DNS server IPs (space/comma separated).${NC}"
         fi
@@ -1472,14 +1567,14 @@ prompt_home_dns() {
             HOME_DNS_MODE="tunnel"
             HOME_DNS_SERVERS=""
             info "Non-interactive: tunnel-exit mode (dnsmasq -> ${HOME_DNS_TUNNEL_DEFAULTS} via wg0)."
-        elif [ -n "$suggested_home_ip" ]; then
+        elif [ -n "$custom_suggestion" ]; then
             HOME_DNS_MODE="custom"
-            HOME_DNS_SERVERS="$suggested_home_ip"
+            HOME_DNS_SERVERS="$custom_suggestion"
             info "Non-interactive: custom home DNS = $HOME_DNS_SERVERS"
         else
             HOME_DNS_MODE="skip"
             HOME_DNS_SERVERS=""
-            warn "Non-interactive: no default-route AllowedIPs and no home subnet to suggest."
+            warn "Non-interactive: no default-route AllowedIPs and no home DNS to suggest."
             warn "Falling back to skip mode (LAN DNS leaks to WAN)."
         fi
         save_config_var "HOME_DNS_MODE" "$HOME_DNS_MODE"
@@ -1491,8 +1586,8 @@ prompt_home_dns() {
         local label
         if [ "$prefer_tunnel" = "true" ]; then
             label="📡 DNS server [Enter = tunnel-exit, or IP]"
-        elif [ -n "$suggested_home_ip" ]; then
-            label="📡 DNS server [default: ${BOLD}${YELLOW}${suggested_home_ip}${NC}]"
+        elif [ -n "$custom_suggestion" ]; then
+            label="📡 DNS server [default: ${BOLD}${YELLOW}${custom_suggestion}${NC}]"
         else
             label="📡 Home DNS server IP(s) (space/comma separated)"
         fi
@@ -1506,8 +1601,8 @@ prompt_home_dns() {
                 HOME_DNS_SERVERS=""
                 success "Tunnel-exit mode: dnsmasq -> ${HOME_DNS_TUNNEL_DEFAULTS} via wg0."
                 break
-            elif [ -n "$suggested_home_ip" ]; then
-                raw="$suggested_home_ip"
+            elif [ -n "$custom_suggestion" ]; then
+                raw="$custom_suggestion"
             else
                 warn "No DNS server entered. Try again, or type 'skip' to opt out."
                 continue
@@ -1521,22 +1616,55 @@ prompt_home_dns() {
             break
         fi
 
+        # Convenience: typing "wg" reuses DNS= from the WireGuard config.
+        if [ "$raw" = "wg" ] || [ "$raw" = "DNS" ] || [ "$raw" = "dns" ]; then
+            if [ -n "$wg_dns" ]; then
+                raw="$wg_dns"
+            else
+                warn "No DNS= line found in the WireGuard config. Enter IP(s) instead."
+                continue
+            fi
+        fi
+
         local normalized
         normalized=$(normalize_ip_list "$raw")
         if [ -z "$normalized" ]; then
-            warn "No valid IPv4 addresses parsed from '$raw'. Try again."
+            warn "No valid IPv4/IPv6 addresses parsed from '$raw'. Try again."
             continue
         fi
 
-        # Validate each entry is covered by some AllowedIPs CIDR. Warn (do not
-        # block) - the user may add the entry to wg0.conf themselves later.
+        # Validate each entry is covered by some AllowedIPs CIDR. A default
+        # route (0.0.0.0/0 / ::/0 / split-default) covers the matching family.
+        # Warn (do not block) - the user may add the entry to wg0.conf later.
         local entry covered any_uncovered=false
+        local has_v4_default=false has_v6_default=false
+        case "$has_default_route" in
+            *'0.0.0.0/0'*|*'split-default-route'*) has_v4_default=true ;;
+        esac
+        case "$has_default_route" in
+            *'::/0'*) has_v6_default=true ;;
+        esac
         for entry in $normalized; do
             covered=false
-            local cidr
-            for cidr in $home_subnets; do
-                if ipv4_in_cidr "$entry" "$cidr"; then covered=true; break; fi
-            done
+            if [[ "$entry" == *:* ]]; then
+                [ "$has_v6_default" = true ] && covered=true
+            else
+                [ "$has_v4_default" = true ] && covered=true
+            fi
+            if [ "$covered" != true ]; then
+                local cidr
+                for cidr in $home_subnets; do
+                    if [[ "$entry" == *:* ]]; then
+                        [ "$(cidr_family "$cidr")" = "6" ] || continue
+                        # Exact IPv6 CIDR math is skipped; accept if any IPv6
+                        # home subnet is present and warn only when none are.
+                        covered=true
+                        break
+                    else
+                        if ipv4_in_cidr "$entry" "$cidr"; then covered=true; break; fi
+                    fi
+                done
+            fi
             if [ "$covered" != true ]; then
                 warn "  $entry is NOT covered by any AllowedIPs CIDR in wg0.conf."
                 warn "  WireGuard will drop packets to it unless you add it to AllowedIPs."
@@ -1600,7 +1728,7 @@ prompt_pi_dns() {
         local normalized
         normalized=$(normalize_ip_list "$raw")
         if [ -z "$normalized" ]; then
-            warn "No valid IPv4 addresses parsed from '$raw'. Try again."
+            warn "No valid IPv4/IPv6 addresses parsed from '$raw'. Try again."
             continue
         fi
         PI_DNS_SERVERS="$normalized"
@@ -2142,6 +2270,23 @@ do_configure_dnsmasq() {
         cp /etc/dnsmasq.conf /etc/dnsmasq.conf.bak
     fi
 
+    # Prevent Debian's dnsmasq package from registering 127.0.0.1 with
+    # resolvconf. That hijacks the Pi's own resolver and breaks apt / the
+    # WireGuard endpoint hostname lookup (exactly the failure mode where
+    # wg-quick reports "Temporary failure in name resolution").
+    if [ -f /etc/default/dnsmasq ]; then
+        if grep -qE '^[[:space:]]*IGNORE_RESOLVCONF=' /etc/default/dnsmasq; then
+            sed -i 's/^[[:space:]]*IGNORE_RESOLVCONF=.*/IGNORE_RESOLVCONF=yes/' /etc/default/dnsmasq
+        else
+            printf '\n# Managed by raspberrypi-site2site-wireguard: keep Pi DNS on WAN\nIGNORE_RESOLVCONF=yes\n' \
+                >> /etc/default/dnsmasq
+        fi
+    fi
+    # Drop any leftover lo.dnsmasq record from a previous package-default start.
+    if command -v resolvconf >/dev/null 2>&1; then
+        resolvconf -d lo.dnsmasq >> "$LOG_FILE" 2>&1 || true
+    fi
+
     local server
     {
         printf '# Managed by raspberrypi-site2site-wireguard setup-vpn-gateway.sh\n'
@@ -2210,6 +2355,21 @@ do_configure_pi_dns() {
 
     echo "[pi_dns] Setting Pi-local DNS via WAN: $PI_DNS_SERVERS" >> "$LOG_FILE"
 
+    # Belt-and-suspenders: if dnsmasq was started by its package postinst
+    # before we could set IGNORE_RESOLVCONF, drop any lo.dnsmasq hijack now
+    # so the rest of setup (and the WG endpoint hostname lookup) can resolve.
+    if [ -f /etc/default/dnsmasq ]; then
+        if grep -qE '^[[:space:]]*IGNORE_RESOLVCONF=' /etc/default/dnsmasq; then
+            sed -i 's/^[[:space:]]*IGNORE_RESOLVCONF=.*/IGNORE_RESOLVCONF=yes/' /etc/default/dnsmasq
+        else
+            printf '\n# Managed by raspberrypi-site2site-wireguard: keep Pi DNS on WAN\nIGNORE_RESOLVCONF=yes\n' \
+                >> /etc/default/dnsmasq
+        fi
+    fi
+    if command -v resolvconf >/dev/null 2>&1; then
+        resolvconf -d lo.dnsmasq >> "$LOG_FILE" 2>&1 || true
+    fi
+
     # Back up /etc/resolv.conf the first time so cleanup can restore it. We
     # back up the file (or the symlink target if it is a symlink) verbatim.
     if [ ! -e /etc/resolv.conf.bak_gateway ] && [ -e /etc/resolv.conf ]; then
@@ -2254,17 +2414,36 @@ do_configure_pi_dns() {
         applied=true
     fi
 
-    # Path 3: neither NM nor dhcpcd -> write /etc/resolv.conf directly. Best
-    # effort; some distros (resolvconf) will overwrite this on the next
-    # interface event, but Pi OS Lite without NM/dhcpcd is unusual.
+    # Path 3: neither NM nor dhcpcd -> write DNS via resolvconf if present,
+    # otherwise write /etc/resolv.conf directly. Installing the resolvconf
+    # package (a setup dependency for wg-quick) turns /etc/resolv.conf into
+    # a managed file; a raw overwrite would be clobbered on the next update.
     if [ "$applied" = false ]; then
         local server
-        {
-            echo "# Managed by raspberrypi-site2site-wireguard"
-            for server in $PI_DNS_SERVERS; do
-                echo "nameserver $server"
-            done
-        } > /etc/resolv.conf
+        if command -v resolvconf >/dev/null 2>&1; then
+            {
+                for server in $PI_DNS_SERVERS; do
+                    echo "nameserver $server"
+                done
+            } | resolvconf -a "wan.${WAN_IFACE}.vpn-gateway" >> "$LOG_FILE" 2>&1 || true
+            # Also pin the values in resolvconf's head file so they survive
+            # interface flaps that delete the dynamic wan.* record.
+            mkdir -p /etc/resolvconf/resolv.conf.d
+            {
+                echo "# Managed by raspberrypi-site2site-wireguard"
+                for server in $PI_DNS_SERVERS; do
+                    echo "nameserver $server"
+                done
+            } > /etc/resolvconf/resolv.conf.d/head
+            resolvconf -u >> "$LOG_FILE" 2>&1 || true
+        else
+            {
+                echo "# Managed by raspberrypi-site2site-wireguard"
+                for server in $PI_DNS_SERVERS; do
+                    echo "nameserver $server"
+                done
+            } > /etc/resolv.conf
+        fi
     fi
 }
 
@@ -2867,18 +3046,18 @@ HOSTAPD_EOF
     # Final redraw to show all complete
     progress_draw_box
 
-    echo ""
-    echo -e "${GREEN}${BOLD}🎉 Setup Complete!${NC}"
-    echo ""
-    success "Status:"
-    echo -e "   • WAN Interface: ${BOLD}$WAN_IFACE${NC}"
-    echo -e "   • LAN Interface: ${BOLD}$LAN_IFACE${NC} (Gateway: $LAN_GATEWAY)"
-    echo -e "   • VPN Interface: ${BOLD}wg0${NC}"
-    echo ""
-    info "Setup log saved to: $LOG_FILE"
+    ui_echo ""
+    ui_echo "${GREEN}${BOLD}🎉 Setup Complete!${NC}"
+    ui_echo ""
+    ui_echo "${GREEN}✔${NC} Status:"
+    ui_echo "   • WAN Interface: ${BOLD}$WAN_IFACE${NC}"
+    ui_echo "   • LAN Interface: ${BOLD}$LAN_IFACE${NC} (Gateway: $LAN_GATEWAY)"
+    ui_echo "   • VPN Interface: ${BOLD}wg0${NC}"
+    ui_echo ""
+    ui_echo "${BLUE}ℹ️${NC}  Setup log saved to: $LOG_FILE"
     
     save_config
-    info "Configuration saved to: $CONFIG_FILE"
+    ui_echo "${BLUE}ℹ️${NC}  Configuration saved to: $CONFIG_FILE"
 }
 
 main
