@@ -316,13 +316,21 @@ cleanup_gateway_nat_rules() {
     ip route flush table "$bypass_table" >> "$LOG_FILE" 2>&1 || true
     ip -6 route flush table "$bypass_table" >> "$LOG_FILE" 2>&1 || true
 
-    # Remove specific forward rules (LAN -> wg0)
+    # Remove specific forward rules (LAN -> wg0 and LAN -> WAN)
     if [ -n "$lan_iface" ]; then
         if iptables -C FORWARD -i "$lan_iface" -o wg0 -j ACCEPT >/dev/null 2>&1; then
             iptables -D FORWARD -i "$lan_iface" -o wg0 -j ACCEPT >> "$LOG_FILE" 2>&1 || true
         fi
         if iptables -C FORWARD -i wg0 -o "$lan_iface" -m state --state RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1; then
             iptables -D FORWARD -i wg0 -o "$lan_iface" -m state --state RELATED,ESTABLISHED -j ACCEPT >> "$LOG_FILE" 2>&1 || true
+        fi
+        if [ -n "$wan_iface" ]; then
+            if iptables -C FORWARD -i "$lan_iface" -o "$wan_iface" -j ACCEPT >/dev/null 2>&1; then
+                iptables -D FORWARD -i "$lan_iface" -o "$wan_iface" -j ACCEPT >> "$LOG_FILE" 2>&1 || true
+            fi
+            if iptables -C FORWARD -i "$wan_iface" -o "$lan_iface" -m state --state RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1; then
+                iptables -D FORWARD -i "$wan_iface" -o "$lan_iface" -m state --state RELATED,ESTABLISHED -j ACCEPT >> "$LOG_FILE" 2>&1 || true
+            fi
         fi
     fi
     

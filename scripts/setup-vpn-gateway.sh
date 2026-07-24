@@ -71,6 +71,11 @@ show_existing_config() {
     printf "${CYAN}│${NC}  LAN interface:   ${BOLD}%-${field_w}s${NC} ${CYAN}│${NC}\n" "${LAN_IFACE:-<unset>}"
     printf "${CYAN}│${NC}  LAN CIDR:        ${BOLD}%-${field_w}s${NC} ${CYAN}│${NC}\n" "${LAN_CIDR:-<unset>}"
     printf "${CYAN}│${NC}  WireGuard:       ${DIM}%-${field_w}s${NC} ${CYAN}│${NC}\n" "$wg_display"
+    if [ "${PI_BYPASS_ROUTING:-false}" = "true" ]; then
+        local fwd_label="all traffic via VPN"
+        [ "${LAN_FORWARD_MODE:-all}" = "home" ] && fwd_label="home subnets only"
+        printf "${CYAN}│${NC}  LAN via VPN:     ${BOLD}%-${field_w}s${NC} ${CYAN}│${NC}\n" "$fwd_label"
+    fi
     if [ "${IS_WIRELESS:-false}" = "true" ]; then
         printf "${CYAN}│${NC}  Wi-Fi SSID:      ${BOLD}%-${field_w}s${NC} ${CYAN}│${NC}\n" "${AP_SSID:-<unset>}"
     fi
@@ -347,6 +352,18 @@ ui_echo() {
     fi
 }
 
+# Ookla WAN-vs-tunnel speedtest helpers (do_speedtest_comparison, run_speedtest_only).
+# shellcheck source=speedtest-comparison.sh
+source "$SCRIPT_DIR/speedtest-comparison.sh"
+
+# Post-setup route verification (do_verify_routes, run_verify_routes_only).
+# shellcheck source=verify-routes.sh
+source "$SCRIPT_DIR/verify-routes.sh"
+
+# Selective single-setting edit (run_selective_edit / --edit).
+# shellcheck source=selective-edit.sh
+source "$SCRIPT_DIR/selective-edit.sh"
+
 # Make this script survive a hangup of its controlling terminal (SSH drop,
 # Pi Connect WebRTC failure, serial console close, etc.) so that the
 # execution phase can finish unattended after every interactive prompt has
@@ -588,23 +605,31 @@ EOF
 # under wg-quick's `set -e` semantics, so anything that may legitimately
 # already exist must be guarded with `|| true` or a `-C` precheck.
 #
-# Routing model:
+# Routing model (LAN_FORWARD_MODE):
 #   - main table: default via WAN gw (untouched), $home_subnets dev wg0
 #     (so the Pi itself can reach the home network via the tunnel)
-#   - table $WG_BYPASS_TABLE_ID: default dev wg0, $home_subnets dev wg0
+#   - table $WG_BYPASS_TABLE_ID:
+#       all  → default dev wg0 + $home_subnets  (full LAN tunnel / kill-switch)
+#       home → $home_subnets only               (split: other LAN Internet → WAN)
 #   - ip rule: forwarded packets (iif=$LAN_IFACE) -> table $WG_BYPASS_TABLE_ID
+#     Unmatched destinations in table 200 fall through to the next rule (main).
 _wg_pi_bypass_up_cmds() {
     local v4="$1" v6="$2"
+    local mode="${LAN_FORWARD_MODE:-all}"
     local tbl="$WG_BYPASS_TABLE_ID" prio="$WG_BYPASS_RULE_PRIO"
     local s
-    echo "ip route replace default dev %i table $tbl"
+    if [ "$mode" = "all" ]; then
+        echo "ip route replace default dev %i table $tbl"
+    fi
     for s in $v4; do
         echo "ip route replace $s dev %i"
         echo "ip route replace $s dev %i table $tbl"
     done
     echo "(ip rule list | grep -q 'iif $LAN_IFACE lookup $tbl') || ip rule add iif $LAN_IFACE lookup $tbl priority $prio"
     if [ -n "$v6" ]; then
-        echo "ip -6 route replace ::/0 dev %i table $tbl"
+        if [ "$mode" = "all" ]; then
+            echo "ip -6 route replace ::/0 dev %i table $tbl"
+        fi
         for s in $v6; do
             echo "ip -6 route replace $s dev %i"
             echo "ip -6 route replace $s dev %i table $tbl"
@@ -667,7 +692,11 @@ do_configure_wg_firewall_rules() {
             fi
         done < <(extract_home_subnets "$WG_CONF_DEST")
 
-        echo "[wg] Pi-bypass routing enabled (table=$WG_BYPASS_TABLE_ID prio=$WG_BYPASS_RULE_PRIO v4='$home_v4' v6='$home_v6')" >> "$LOG_FILE"
+        echo "[wg] Pi-bypass routing enabled (mode=${LAN_FORWARD_MODE:-all} table=$WG_BYPASS_TABLE_ID prio=$WG_BYPASS_RULE_PRIO v4='$home_v4' v6='$home_v6')" >> "$LOG_FILE"
+
+        if [ "${LAN_FORWARD_MODE:-all}" = "home" ] && [ -z "$home_v4" ] && [ -z "$home_v6" ]; then
+            echo "[wg] WARNING: LAN_FORWARD_MODE=home but AllowedIPs has no non-default home subnets — LAN will not reach anything via wg0" >> "$LOG_FILE"
+        fi
 
         up_block=$( { _wg_pi_bypass_up_cmds   "$home_v4" "$home_v6"; _wg_iptables_up_cmds;   } )
         down_block=$( { _wg_iptables_down_cmds; _wg_pi_bypass_down_cmds "$home_v4" "$home_v6"; } )
@@ -720,9 +749,22 @@ do_start_wireguard() {
         systemctl enable wg-quick@wg0 >> "$LOG_FILE" 2>&1 || true
         return 0
     fi
+
+    # Before down/up: clear policy-routing leftovers so all↔home switches and
+    # Pi-bypass off transitions cannot leave a stale default in table 200.
+    # (PostDown of the *new* config may not flush when switching bypass off.)
+    flush_pi_bypass_leftovers "${LAN_IFACE:-}"
+    if [ -n "${PREV_LAN_IFACE:-}" ] && [ "${PREV_LAN_IFACE}" != "${LAN_IFACE:-}" ]; then
+        flush_pi_bypass_leftovers "$PREV_LAN_IFACE"
+    fi
+
     if ip link show wg0 >/dev/null 2>&1; then
         wg-quick down wg0 || true
     fi
+    # Flush again after down in case PostDown of the *old* config ran first
+    # and the new PostDown (already written) skipped the flush (bypass off).
+    flush_pi_bypass_leftovers "${LAN_IFACE:-}"
+
     wg-quick up wg0 && systemctl enable wg-quick@wg0
 }
 
@@ -795,6 +837,20 @@ reset_previous_lan_iface() {
     if iptables -C FORWARD -i wg0 -o "$old_iface" -m state --state RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1; then
         iptables -D FORWARD -i wg0 -o "$old_iface" -m state --state RELATED,ESTABLISHED -j ACCEPT >> "$LOG_FILE" 2>&1 || true
     fi
+    if [ -n "${WAN_IFACE:-}" ]; then
+        if iptables -C FORWARD -i "$old_iface" -o "$WAN_IFACE" -j ACCEPT >/dev/null 2>&1; then
+            iptables -D FORWARD -i "$old_iface" -o "$WAN_IFACE" -j ACCEPT >> "$LOG_FILE" 2>&1 || true
+        fi
+        if iptables -C FORWARD -i "$WAN_IFACE" -o "$old_iface" -m state --state RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1; then
+            iptables -D FORWARD -i "$WAN_IFACE" -o "$old_iface" -m state --state RELATED,ESTABLISHED -j ACCEPT >> "$LOG_FILE" 2>&1 || true
+        fi
+    fi
+
+    # Drop Pi-bypass policy rule for the *old* LAN so it cannot orphan.
+    local tbl="${WG_BYPASS_TABLE_ID:-200}" prio="${WG_BYPASS_RULE_PRIO:-100}"
+    ip rule del iif "$old_iface" lookup "$tbl" priority "$prio" 2>/dev/null || true
+    ip -6 rule del iif "$old_iface" lookup "$tbl" priority "$prio" 2>/dev/null || true
+
     # Tagged INPUT rule on the old LAN (added by ensure_wan_firewall_rules) is
     # cleaned up by remove_tagged_input_rules() on the next firewall apply.
 
@@ -803,6 +859,28 @@ reset_previous_lan_iface() {
         systemctl stop hostapd >> "$LOG_FILE" 2>&1 || true
         systemctl disable hostapd >> "$LOG_FILE" 2>&1 || true
     fi
+}
+
+# Tear down Pi-bypass policy routing leftovers (safe to call when already clean).
+# Used when switching LAN iface, disabling Pi-bypass, or before wg-quick restarts
+# so a mode change (all ↔ home) never leaves a stale default in table 200.
+flush_pi_bypass_leftovers() {
+    local iface="${1:-${LAN_IFACE:-}}"
+    local tbl="${WG_BYPASS_TABLE_ID:-200}"
+    local prio="${WG_BYPASS_RULE_PRIO:-100}"
+    echo "[bypass] Flushing Pi-bypass leftovers (iface=${iface:-none} table=$tbl)" >> "${LOG_FILE:-/dev/null}"
+    if [ -n "$iface" ]; then
+        # Delete repeatedly in case duplicates accumulated from older bugs.
+        local i
+        for i in 1 2 3 4 5; do
+            ip rule del iif "$iface" lookup "$tbl" priority "$prio" 2>/dev/null || break
+        done
+        for i in 1 2 3 4 5; do
+            ip -6 rule del iif "$iface" lookup "$tbl" priority "$prio" 2>/dev/null || break
+        done
+    fi
+    ip route flush table "$tbl" 2>/dev/null || true
+    ip -6 route flush table "$tbl" 2>/dev/null || true
 }
 
 save_config_var() {
@@ -1205,6 +1283,8 @@ run_step() {
 # Ensure iptables forwarding/NAT rules exist for LAN -> wg0 and LAN -> WAN.
 # These rules are persisted to disk regardless of WAN firewall opt-in, so they
 # survive reboots even if wg0 fails to come up at boot.
+# LAN -> WAN FORWARD is required for LAN_FORWARD_MODE=home (split-tunnel Internet
+# egress) and is harmless when mode=all.
 ensure_nat_rules() {
     echo "[ensure_nat_rules] Verifying iptables rules for $LAN_IFACE -> wg0/$WAN_IFACE" >> "$LOG_FILE"
     if ! iptables -C FORWARD -i "$LAN_IFACE" -o wg0 -j ACCEPT >/dev/null 2>&1; then
@@ -1212,6 +1292,14 @@ ensure_nat_rules() {
     fi
     if ! iptables -C FORWARD -i wg0 -o "$LAN_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1; then
         iptables -A FORWARD -i wg0 -o "$LAN_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT >> "$LOG_FILE" 2>&1
+    fi
+    if [ -n "$WAN_IFACE" ]; then
+        if ! iptables -C FORWARD -i "$LAN_IFACE" -o "$WAN_IFACE" -j ACCEPT >/dev/null 2>&1; then
+            iptables -A FORWARD -i "$LAN_IFACE" -o "$WAN_IFACE" -j ACCEPT >> "$LOG_FILE" 2>&1
+        fi
+        if ! iptables -C FORWARD -i "$WAN_IFACE" -o "$LAN_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1; then
+            iptables -A FORWARD -i "$WAN_IFACE" -o "$LAN_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT >> "$LOG_FILE" 2>&1
+        fi
     fi
     if ! iptables -t nat -C POSTROUTING -o wg0 -j MASQUERADE >/dev/null 2>&1; then
         iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE >> "$LOG_FILE" 2>&1
@@ -1409,8 +1497,8 @@ prompt_pi_bypass_routing() {
     fi
 
     prompt_q "🛡️  Enable Pi-bypass routing? (recommended)"
-    prompt_h "LAN clients go through the VPN tunnel; the Pi's own traffic stays on WAN."
-    prompt_h "  LAN clients  → wg0 (full-tunnel; kill-switch when wg0 is down)"
+    prompt_h "LAN clients use the VPN as configured next; the Pi's own traffic stays on WAN."
+    prompt_h "  LAN clients  → policy-routed via wg0 (all traffic or home-only — next question)"
     prompt_h "  Pi itself    → WAN (apt, Pi Connect, NTP, DNS, WG handshake)"
     prompt_h "Enabling rewrites wg0.conf (Table=off + policy-routing PostUp/PostDown)."
     if [ -n "$has_default_route" ]; then
@@ -1437,6 +1525,90 @@ prompt_pi_bypass_routing() {
         if [ -n "$has_default_route" ]; then
             warn "Default-route AllowedIPs will hijack the Pi's outbound traffic when wg0 comes up."
         fi
+        # Legacy / no-bypass: clear forward mode so it is not stale on re-enable.
+        LAN_FORWARD_MODE=""
+        save_config_var "LAN_FORWARD_MODE" ""
+    fi
+}
+
+# After Pi-bypass is enabled: all LAN traffic via VPN, or only home AllowedIPs.
+# Persists LAN_FORWARD_MODE=all|home. No-op when Pi-bypass is off.
+prompt_lan_forward_mode() {
+    if [ "${PI_BYPASS_ROUTING:-false}" != "true" ]; then
+        LAN_FORWARD_MODE=""
+        save_config_var "LAN_FORWARD_MODE" ""
+        return
+    fi
+
+    local home_list="" home_count=0
+    if [ -n "${WG_CONF_SRC:-}" ]; then
+        home_list=$(extract_home_subnets "$WG_CONF_SRC" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+        home_count=$(extract_home_subnets "$WG_CONF_SRC" 2>/dev/null | grep -c . || true)
+    fi
+
+    # Default: saved value, else "all" (preserves historic full-LAN-tunnel behaviour).
+    local default="${LAN_FORWARD_MODE:-all}"
+    case "$default" in
+        all|home) ;;
+        *) default="all" ;;
+    esac
+
+    if [ "$NONINTERACTIVE" = "true" ]; then
+        LAN_FORWARD_MODE="$default"
+        save_config_var "LAN_FORWARD_MODE" "$LAN_FORWARD_MODE"
+        info "Non-interactive: LAN_FORWARD_MODE = $LAN_FORWARD_MODE"
+        if [ "$LAN_FORWARD_MODE" = "home" ] && [ "$home_count" -eq 0 ]; then
+            warn "LAN_FORWARD_MODE=home but AllowedIPs has no home subnets (only default route?)."
+            warn "LAN clients will not reach anything via the tunnel until you add home CIDRs."
+        fi
+        return
+    fi
+
+    local cue="[1/2]"
+    [ "$default" = "home" ] && cue="[1/2, default: 2]"
+    [ "$default" = "all" ] && cue="[1/2, default: 1]"
+
+    prompt_q "🔀 What should LAN clients send through the VPN?"
+    prompt_h "1) all  — every destination via the tunnel (full site-to-site)."
+    prompt_h "         Kill-switch: when wg0 is down, LAN loses Internet."
+    prompt_h "2) home — only home-network subnets via the tunnel; other Internet via WAN."
+    prompt_h "         Use this for local home apps without forcing all traffic through VPN."
+    if [ "$home_count" -gt 0 ]; then
+        prompt_h "Home subnets from AllowedIPs: ${home_list}"
+    else
+        prompt_hw "No non-default home subnets found in AllowedIPs."
+        prompt_hw "Choosing 'home' needs CIDRs like 10.0.0.0/24 in AllowedIPs (not only 0.0.0.0/0)."
+    fi
+    prompt_cue "$cue"
+
+    local choice="$PROMPT_REPLY"
+    if [ -z "$choice" ]; then
+        choice="$default"
+    fi
+    case "$choice" in
+        1|all|ALL|a|A) LAN_FORWARD_MODE="all" ;;
+        2|home|HOME|h|H) LAN_FORWARD_MODE="home" ;;
+        *)
+            warn "Unrecognised choice '$choice'; using default ($default)."
+            LAN_FORWARD_MODE="$default"
+            ;;
+    esac
+
+    if [ "$LAN_FORWARD_MODE" = "home" ] && [ "$home_count" -eq 0 ]; then
+        prompt_q "No home subnets in AllowedIPs — continue with home-only mode?"
+        prompt_hw "LAN will not reach the tunnel for any destination until you fix AllowedIPs."
+        prompt_cue "[y/N]"
+        if [[ ! "$PROMPT_REPLY" =~ ^[Yy]$ ]]; then
+            LAN_FORWARD_MODE="all"
+            info "Falling back to LAN_FORWARD_MODE=all."
+        fi
+    fi
+
+    save_config_var "LAN_FORWARD_MODE" "$LAN_FORWARD_MODE"
+    if [ "$LAN_FORWARD_MODE" = "home" ]; then
+        success "LAN forward mode: home-only (Internet via WAN; home CIDRs via wg0)."
+    else
+        success "LAN forward mode: all traffic via VPN (kill-switch when wg0 is down)."
     fi
 }
 
@@ -1470,13 +1642,14 @@ infer_home_dns_mode_legacy() {
 #
 # Default priority when the operator opts into tunnel-forwarded DNS:
 #   1. WireGuard DNS= from the source config  -> MODE=custom (explicit intent)
-#   2. Else if AllowedIPs has a default route -> MODE=tunnel (public DNS @wg0)
-#   3. Else .1 of first home subnet           -> MODE=custom
-#   4. Else ask for an IP                     -> MODE=custom
+#   2. Else if LAN_FORWARD_MODE=home          -> MODE=custom (.1 / ask; not tunnel-exit)
+#   3. Else if AllowedIPs has a default route -> MODE=tunnel (public DNS @wg0)
+#   4. Else .1 of first home subnet           -> MODE=custom
+#   5. Else ask for an IP                     -> MODE=custom
 #
-# WireGuard DNS= is client-mode host resolv.conf semantics; under Pi-bypass
-# it is NOT applied to the Pi. We reuse the values for LAN dnsmasq only.
-# Interactive layout: question → dim helper → short input cue (see prompt_q).
+# Home-only forwarding prefers a real home resolver: tunnel-exit DNS still
+# works via @wg0 + default AllowedIPs, but would send lookups via home while
+# general Internet stays on WAN — usually not what operators want.
 
 prompt_home_dns() {
     if [ "${PI_BYPASS_ROUTING:-false}" != "true" ]; then
@@ -1497,6 +1670,12 @@ prompt_home_dns() {
 
     local tunnel_available="false"
     [ -n "$has_default_route" ] && tunnel_available="true"
+
+    # Prefer custom/home DNS when LAN only sends home CIDRs through the tunnel.
+    local prefer_tunnel_default="true"
+    if [ "${LAN_FORWARD_MODE:-all}" = "home" ]; then
+        prefer_tunnel_default="false"
+    fi
 
     _home_dns_accept_custom() {
         local normalized="$1"
@@ -1597,14 +1776,24 @@ prompt_home_dns() {
             _home_dns_set_tunnel
         elif [ -n "$wg_dns" ]; then
             _home_dns_accept_custom "$wg_dns" || true
-            [ "$HOME_DNS_MODE" = "custom" ] || _home_dns_set_tunnel
+            if [ "$HOME_DNS_MODE" != "custom" ]; then
+                if [ "$prefer_tunnel_default" = "true" ] && [ "$tunnel_available" = "true" ]; then
+                    _home_dns_set_tunnel
+                elif [ -n "$suggested_home_ip" ]; then
+                    _home_dns_accept_custom "$suggested_home_ip" || true
+                fi
+            fi
             info "Non-interactive: using WireGuard DNS= ($HOME_DNS_SERVERS)."
-        elif [ "$tunnel_available" = "true" ]; then
+        elif [ "$prefer_tunnel_default" = "true" ] && [ "$tunnel_available" = "true" ]; then
             _home_dns_set_tunnel
             info "Non-interactive: tunnel-exit mode."
         elif [ -n "$suggested_home_ip" ]; then
             _home_dns_accept_custom "$suggested_home_ip" || true
             info "Non-interactive: custom home DNS = ${HOME_DNS_SERVERS:-$suggested_home_ip}"
+        elif [ "$tunnel_available" = "true" ]; then
+            # Home-only mode with no .1 suggestion: tunnel-exit still works via @wg0.
+            _home_dns_set_tunnel
+            info "Non-interactive: tunnel-exit mode (no home DNS IP to suggest)."
         else
             HOME_DNS_MODE="skip"
             HOME_DNS_SERVERS=""
@@ -1632,21 +1821,40 @@ prompt_home_dns() {
         fi
 
         prompt_q "📡 Override LAN DNS upstream"
-        if [ "$tunnel_available" = "true" ]; then
+        if [ "$prefer_tunnel_default" = "true" ] && [ "$tunnel_available" = "true" ]; then
             prompt_h "Press Enter / type 'tunnel' → public DNS ${HOME_DNS_TUNNEL_DEFAULTS} via wg0"
+        elif [ "$tunnel_available" = "true" ]; then
+            prompt_h "Type 'tunnel' → public DNS ${HOME_DNS_TUNNEL_DEFAULTS} via wg0 (DNS via home; Internet via WAN)"
         fi
         prompt_h "Type other DNS IP(s) → custom upstream via the tunnel"
         prompt_h "Type 'skip' → use Pi WAN DNS (geo-leaks)"
-        if [ "$tunnel_available" = "true" ]; then
+        if [ "$prefer_tunnel_default" = "true" ] && [ "$tunnel_available" = "true" ]; then
             prompt_cue_default "Upstream" "tunnel-exit"
+        elif [ -n "$suggested_home_ip" ]; then
+            prompt_cue_default "Upstream" "$suggested_home_ip"
         else
             prompt_cue "IP(s) or 'skip'"
         fi
 
         while true; do
             local raw="$PROMPT_REPLY"
-            if [ -z "$raw" ] || [ "$raw" = "tunnel" ] || [ "$raw" = "tunnel-exit" ]; then
+            if [ -z "$raw" ]; then
+                if [ "$prefer_tunnel_default" = "true" ] && [ "$tunnel_available" = "true" ]; then
+                    _home_dns_set_tunnel
+                    break
+                elif [ -n "$suggested_home_ip" ]; then
+                    raw="$suggested_home_ip"
+                else
+                    warn "No DNS server entered. Try again, or type 'skip'."
+                    prompt_cue "IP(s) or 'skip'"
+                    continue
+                fi
+            fi
+            if [ "$raw" = "tunnel" ] || [ "$raw" = "tunnel-exit" ]; then
                 if [ "$tunnel_available" = "true" ]; then
+                    if [ "$prefer_tunnel_default" != "true" ]; then
+                        prompt_hw "With home-only forwarding, tunnel-exit DNS goes via home while other traffic uses WAN."
+                    fi
                     _home_dns_set_tunnel
                     break
                 fi
@@ -1679,7 +1887,7 @@ prompt_home_dns() {
         return
     fi
 
-    if [ "$tunnel_available" = "true" ]; then
+    if [ "$prefer_tunnel_default" = "true" ] && [ "$tunnel_available" = "true" ]; then
         prompt_q "📡 LAN DNS upstream"
         prompt_h "No DNS= in your WireGuard config. Default is tunnel-exit:"
         prompt_h "dnsmasq → ${HOME_DNS_TUNNEL_DEFAULTS} via wg0 (home peer NATs the lookup)."
@@ -1691,8 +1899,22 @@ prompt_home_dns() {
     elif [ -n "$suggested_home_ip" ]; then
         prompt_q "📡 LAN DNS upstream"
         prompt_h "Default: ${suggested_home_ip} (.1 of first home AllowedIPs subnet)."
-        prompt_hw "Tunnel-exit unavailable (no 0.0.0.0/0 in AllowedIPs)."
+        if [ "${LAN_FORWARD_MODE:-all}" = "home" ]; then
+            prompt_h "Home-only forwarding: prefer a DNS server inside the home network."
+        fi
+        if [ "$tunnel_available" != "true" ]; then
+            prompt_hw "Tunnel-exit unavailable (no 0.0.0.0/0 in AllowedIPs)."
+        else
+            prompt_h "Type 'tunnel' for public DNS via wg0, or 'skip' for WAN DNS."
+        fi
         prompt_cue_default "Upstream" "$suggested_home_ip"
+    elif [ "$tunnel_available" = "true" ]; then
+        prompt_q "📡 LAN DNS upstream"
+        prompt_h "Type one or more home-network DNS server IPs, 'tunnel', or 'skip'."
+        if [ "${LAN_FORWARD_MODE:-all}" = "home" ]; then
+            prompt_h "Home-only mode: a home resolver is preferred over tunnel-exit."
+        fi
+        prompt_cue "IP(s), 'tunnel', or 'skip'"
     else
         prompt_q "📡 LAN DNS upstream"
         prompt_h "Type one or more home-network DNS server IPs (space/comma separated)."
@@ -1703,17 +1925,24 @@ prompt_home_dns() {
     while true; do
         local raw="$PROMPT_REPLY"
         if [ -z "$raw" ] || [ "$raw" = "tunnel" ] || [ "$raw" = "tunnel-exit" ]; then
-            if [ "$tunnel_available" = "true" ]; then
+            if [ -z "$raw" ] && [ "$prefer_tunnel_default" = "true" ] && [ "$tunnel_available" = "true" ]; then
                 _home_dns_set_tunnel
                 break
             elif [ -z "$raw" ] && [ -n "$suggested_home_ip" ]; then
                 raw="$suggested_home_ip"
-            elif [ -z "$raw" ]; then
-                warn "No DNS server entered. Try again, or type 'skip'."
+            elif [ "$raw" = "tunnel" ] || [ "$raw" = "tunnel-exit" ]; then
+                if [ "$tunnel_available" = "true" ]; then
+                    if [ "$prefer_tunnel_default" != "true" ]; then
+                        prompt_hw "With home-only forwarding, tunnel-exit DNS goes via home while other traffic uses WAN."
+                    fi
+                    _home_dns_set_tunnel
+                    break
+                fi
+                warn "Tunnel-exit needs AllowedIPs 0.0.0.0/0 (or ::/0)."
                 prompt_cue "IP(s) or 'skip'"
                 continue
-            else
-                warn "Tunnel-exit needs AllowedIPs 0.0.0.0/0 (or ::/0)."
+            elif [ -z "$raw" ]; then
+                warn "No DNS server entered. Try again, or type 'skip'."
                 prompt_cue "IP(s) or 'skip'"
                 continue
             fi
@@ -1948,6 +2177,16 @@ get_lan_device_unit() {
     fi
 }
 
+# True if this looks like the Pi's soldered-on Ethernet, even when the SoC
+# exposes it on an internal USB bus (Pi 1 / 2 / 3B: smsc95xx, Pi 3B+: lan78xx).
+# External USB NICs use other drivers (cdc_ncm, ax88179_178a, r8152, ...).
+is_pi_onboard_ethernet_driver() {
+    case "$1" in
+        smsc95xx|lan78xx|bcmgenet) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 get_interface_details() {
     local iface="$1"
     local state mac ipv4 driver devpath bus_type
@@ -1970,6 +2209,9 @@ get_interface_details() {
     # Detect this first so we can label them as Wi-Fi regardless of bus.
     if [ -d "/sys/class/net/$iface/wireless" ] || [ -L "/sys/class/net/$iface/phy80211" ]; then
         bus_type="wifi"
+    elif is_pi_onboard_ethernet_driver "$driver"; then
+        # Pi 1/2/3 built-in LAN is USB-attached silicon but is not a dongle.
+        bus_type="onboard"
     elif [ -L "/sys/class/net/$iface/device" ]; then
         # Resolve to the absolute device path so the parent USB controller is
         # visible. `readlink` (without -f) only returns the relative target
@@ -1990,20 +2232,66 @@ get_interface_details() {
     echo "mac=$mac  driver=$driver  bus=$bus_type"
 }
 
-# Function to prompt for interface selection
+# Suggest a default interface for role=wan|lan, optionally excluding one iface.
+# WAN prefers Pi built-in / PCI; LAN prefers USB adapter, then Wi-Fi.
+suggest_iface_for_role() {
+    local role="$1"
+    local exclude="${2:-}"
+    local iface details bus state
+    local best_onboard="" best_usb="" best_wifi="" best_up="" first=""
+
+    for iface in $(get_interfaces); do
+        [ -n "$exclude" ] && [ "$iface" = "$exclude" ] && continue
+        details=$(get_interface_details "$iface")
+        bus=$(echo "$details" | sed -n '2p' | sed -n 's/.*bus=\([^ ]*\).*/\1/p')
+        state=$(echo "$details" | sed -n '1p' | sed -n 's/.*state=\([^ ]*\).*/\1/p')
+        [ -z "$first" ] && first="$iface"
+        case "$bus" in
+            onboard|pci) [ -z "$best_onboard" ] && best_onboard="$iface" ;;
+            usb)         [ -z "$best_usb" ] && best_usb="$iface" ;;
+            wifi)        [ -z "$best_wifi" ] && best_wifi="$iface" ;;
+        esac
+        if [ "$state" = "UP" ] && [ -z "$best_up" ]; then
+            best_up="$iface"
+        fi
+    done
+
+    if [ "$role" = "wan" ]; then
+        echo "${best_onboard:-${best_up:-$first}}"
+    else
+        # LAN: USB dongle / Wi-Fi AP first; fall back to leftover onboard.
+        echo "${best_usb:-${best_wifi:-${best_onboard:-${best_up:-$first}}}}"
+    fi
+}
+
+# Prompt for interface selection.
+#   $1 = list header text
+#   $2 = default iface name (may be empty; we may replace with a better default)
+#   $3 = optional excluded iface (shown dimmed / unavailable — used for WAN
+#        when picking LAN)
+#   $4 = role hint: wan|lan (drives default preference when $2 is empty/unusable)
 select_interface() {
     local prompt_text="$1"
     local default_iface="$2"
-    local interfaces=$(get_interfaces)
-    local chosen_iface=""
+    local exclude_iface="${3:-}"
+    local role="${4:-}"
+    local interfaces chosen_iface=""
+    interfaces=$(get_interfaces)
+
+    # If caller did not pass a usable default, pick one from role preference.
+    if [ -z "$default_iface" ] || [ "$default_iface" = "$exclude_iface" ]; then
+        if [ -n "$role" ]; then
+            default_iface=$(suggest_iface_for_role "$role" "$exclude_iface")
+        fi
+    fi
 
     # Print menu to stderr to keep stdout clean
     echo "" >&2
     echo -e "${BOLD}$prompt_text${NC}" >&2
 
-    # Build arrays for selection
     local idx=1
     local iface_list=()
+    local default_num=""
     for iface in $interfaces; do
         local details detail_line1 detail_line2 bus badge
         details=$(get_interface_details "$iface")
@@ -2011,11 +2299,17 @@ select_interface() {
         detail_line2=$(echo "$details" | sed -n '2p')
         bus=$(echo "$detail_line2" | sed -n 's/.*bus=\([^ ]*\).*/\1/p')
 
-        # Render a prominent badge so the operator can tell at a glance
-        # which interface is the Pi's built-in port versus a USB adapter
-        # or wireless radio. The built-in port is the most common LAN
-        # candidate on a Pi 4 (USB ports are typically used for the WAN
-        # uplink), so we highlight it distinctly.
+        if [ -n "$exclude_iface" ] && [ "$iface" = "$exclude_iface" ]; then
+            # Keep it visible so the operator sees what they already picked,
+            # but dim it and do not offer it as a selectable number.
+            badge="${CYAN}${BOLD}[ WAN — selected ]${NC}"
+            printf "       ${DIM}%-7s${NC} %b\n" "$iface" "$badge" >&2
+            printf "       ${DIM}%s${NC}\n" "$detail_line1" >&2
+            printf "       ${DIM}%s${NC}\n" "$detail_line2" >&2
+            printf "       ${DIM}(unavailable — already chosen as WAN)${NC}\n" >&2
+            continue
+        fi
+
         case "$bus" in
             onboard|pci) badge="${GREEN}${BOLD}[ Pi built-in ]${NC}" ;;
             usb)         badge="${YELLOW}${BOLD}[ USB adapter ]${NC}" ;;
@@ -2028,49 +2322,60 @@ select_interface() {
         printf "       ${DIM}%s${NC}\n" "$detail_line1" >&2
         printf "       ${DIM}%s${NC}\n" "$detail_line2" >&2
         iface_list+=("$iface")
+        if [ -n "$default_iface" ] && [ "$iface" = "$default_iface" ]; then
+            default_num="$idx"
+        fi
         idx=$((idx + 1))
     done
     echo "" >&2
 
+    if [ ${#iface_list[@]} -eq 0 ]; then
+        error "No selectable interfaces left." >&2
+        return 1
+    fi
+
+    # If the preferred default was excluded / missing, fall back to first entry.
+    if [ -z "$default_num" ]; then
+        default_iface="${iface_list[0]}"
+        default_num=1
+    fi
+
     local old_fd="$PROMPT_FD"
     PROMPT_FD=2
     prompt_q "👉 Select interface number"
-    if [ -n "$default_iface" ]; then
-        prompt_h "Press Enter for the default, or type a number from the list above."
-        prompt_cue_default "Number" "$default_iface"
-    else
-        prompt_h "Type a number from the list above."
-        prompt_cue "Number"
-    fi
+    prompt_h "Press Enter for the default, or type a number from the list above."
+    prompt_cue_default "Number" "$default_num"
     PROMPT_FD="$old_fd"
 
     while true; do
         local choice="$PROMPT_REPLY"
-        # If the default iface name was accepted via empty Enter, map it.
-        if [ -z "$choice" ] && [ -n "$default_iface" ]; then
+        if [ -z "$choice" ]; then
             chosen_iface="$default_iface"
             break
         fi
-        # Allow typing the interface name as well as the number / default name.
-        if [ -n "$default_iface" ] && [ "$choice" = "$default_iface" ]; then
-            chosen_iface="$default_iface"
+        # Allow typing the interface name.
+        local candidate="" i
+        for i in "${!iface_list[@]}"; do
+            if [ "${iface_list[$i]}" = "$choice" ]; then
+                candidate="${iface_list[$i]}"
+                break
+            fi
+        done
+        if [ -n "$candidate" ]; then
+            chosen_iface="$candidate"
             break
         fi
         if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#iface_list[@]}" ]; then
             chosen_iface="${iface_list[$((choice-1))]}"
             break
         fi
-        if [ -n "$default_iface" ]; then
-            warn "Invalid selection. Press Enter for default or choose a valid number." >&2
+        if [ -n "$exclude_iface" ] && [ "$choice" = "$exclude_iface" ]; then
+            warn "That interface is already selected as WAN. Pick a different one." >&2
         else
-            warn "Invalid selection. Please try again." >&2
+            warn "Invalid selection. Press Enter for default ($default_num) or choose a listed number." >&2
         fi
         PROMPT_FD=2
-        if [ -n "$default_iface" ]; then
-            prompt_cue_default "Number" "$default_iface"
-        else
-            prompt_cue "Number"
-        fi
+        prompt_cue_default "Number" "$default_num"
         PROMPT_FD="$old_fd"
     done
 
@@ -2592,6 +2897,31 @@ do_configure_pi_dns() {
     verify_or_repair_pi_dns
 }
 
+do_configure_hostapd() {
+    mkdir -p /etc/hostapd
+    cat > /etc/hostapd/hostapd.conf <<HOSTAPD_EOF
+interface=$LAN_IFACE
+driver=nl80211
+ssid=$AP_SSID
+hw_mode=g
+channel=7
+wmm_enabled=0
+macaddr_acl=0
+auth_algs=1
+ignore_broadcast_ssid=0
+wpa=2
+wpa_passphrase=$AP_PASS
+wpa_key_mgmt=WPA-PSK
+wpa_pairwise=CCMP
+rsn_pairwise=CCMP
+HOSTAPD_EOF
+    sed -i 's|#DAEMON_CONF=""|DAEMON_CONF="/etc/hostapd/hostapd.conf"|' /etc/default/hostapd 2>/dev/null || true
+    rfkill unblock wlan 2>/dev/null || true
+    systemctl unmask hostapd
+    systemctl enable hostapd
+    systemctl restart hostapd
+}
+
 do_configure_lan_interface() {
     # Idempotent: if the LAN already has the correct gateway IP, do not flush.
     # This preserves any in-flight SSH session over the LAN interface on re-runs.
@@ -2723,17 +3053,17 @@ main() {
         prompt_h "Identify which port is WAN (Internet) and which is LAN (private subnet)."
         
         prompt_q "Step 1: Select the WAN interface"
-        prompt_h "This port connects to the upstream Internet"
-        prompt_h "(USB adapter or built-in Ethernet to the site's router)."
-        WAN_IFACE=$(select_interface "Available interfaces:" "$WAN_IFACE")
+        prompt_h "This port connects to the upstream Internet."
+        prompt_h "Default preference: Pi built-in Ethernet (falls back to whatever is UP)."
+        WAN_IFACE=$(select_interface "Available interfaces:" "$WAN_IFACE" "" "wan")
         save_config_var "WAN_IFACE" "$WAN_IFACE"
         success "WAN Interface selected: $WAN_IFACE"
         
         prompt_q "Step 2: Select the LAN interface"
-        prompt_h "This port hosts the secure private subnet"
-        prompt_h "(e.g. built-in Ethernet to your Access Point)."
+        prompt_h "This port hosts the secure private subnet."
+        prompt_h "Default preference: USB adapter, then Wi-Fi (not the WAN port)."
         prompt_hw "If you select Wi-Fi (wlan0), the Pi becomes a Wi-Fi Access Point."
-        LAN_IFACE=$(select_interface "Available interfaces:" "$LAN_IFACE")
+        LAN_IFACE=$(select_interface "Available interfaces:" "$LAN_IFACE" "$WAN_IFACE" "lan")
         save_config_var "LAN_IFACE" "$LAN_IFACE"
         if [ -n "$PREV_LAN_IFACE" ] && [ "$PREV_LAN_IFACE" != "$LAN_IFACE" ]; then
             info "Detected LAN change: $PREV_LAN_IFACE -> $LAN_IFACE (cleaning old interface state)"
@@ -2914,23 +3244,21 @@ main() {
     ensure_wg_perms "$WG_CONF_SRC"
 
     if [ "$USE_EXISTING_CONFIG" = true ]; then
-        info "Using existing firewall and auto-update preferences from config."
         FIREWALL_ENABLED="${FIREWALL_ENABLED:-true}"
         AUTO_UPDATES_ENABLED="${AUTO_UPDATES_ENABLED:-false}"
         WATCHDOG_ENABLED="${WATCHDOG_ENABLED:-false}"
         WAN_STATIC_IP_ENABLED="${WAN_STATIC_IP_ENABLED:-false}"
-        # PI_BYPASS_ROUTING may be unset on legacy installs; ask explicitly the
-        # first time so we never rewrite an existing wg0.conf without consent.
+        # Full reconfigure with "use existing": keep saved values. To change
+        # one setting without a full walkthrough, use --edit / manage menu
+        # "Change one setting".
         if [ -z "${PI_BYPASS_ROUTING:-}" ]; then
             prompt_pi_bypass_routing
         else
             info "Pi-bypass routing: ${PI_BYPASS_ROUTING} (from saved config)."
         fi
-        # Dual-DNS plane: only meaningful when Pi-bypass is on. Reuse saved
-        # values where present (using ${VAR+x} so we distinguish "never set"
-        # from "set to empty"). Backward-compat for legacy configs that have
-        # only HOME_DNS_SERVERS but no HOME_DNS_MODE.
         if [ "${PI_BYPASS_ROUTING:-false}" = "true" ]; then
+            LAN_FORWARD_MODE="${LAN_FORWARD_MODE:-all}"
+            info "LAN forward mode: ${LAN_FORWARD_MODE} (from saved config)."
             infer_home_dns_mode_legacy
             if [ -z "${HOME_DNS_MODE+x}" ]; then
                 prompt_home_dns
@@ -2993,12 +3321,35 @@ main() {
         # Default Yes (strongly recommended); persisted so re-runs reuse it.
         prompt_pi_bypass_routing
 
+        # all vs home-only LAN forwarding (only when Pi-bypass is on).
+        prompt_lan_forward_mode
+
         # Dual-DNS plane (Option A): home DNS for LAN clients, public DNS for
         # the Pi itself. Only meaningful when Pi-bypass routing is enabled.
         if [ "${PI_BYPASS_ROUTING:-false}" = "true" ]; then
             prompt_home_dns
             prompt_pi_dns
         fi
+    fi
+
+    # Optional post-setup verification: Ookla WAN vs tunnel comparison.
+    # Asked even when reusing existing config (quick, non-destructive).
+    # Standalone re-runs are also available via the manage menu / --speedtest.
+    if [ "$NONINTERACTIVE" = "true" ]; then
+        SPEEDTEST_ENABLED="${SPEEDTEST_ENABLED:-false}"
+        save_config_var "SPEEDTEST_ENABLED" "$SPEEDTEST_ENABLED"
+    else
+        prompt_q "📶 Run WAN vs tunnel speedtest after setup?"
+        prompt_h "Installs Ookla CLI if needed; compares direct Internet vs WireGuard."
+        prompt_h "Live panel shows download/upload while tests run (~1–2 minutes)."
+        prompt_h "You can also run this later from the manage menu or --speedtest."
+        prompt_cue "[Y/n]"
+        if [[ "$PROMPT_REPLY" =~ ^[Nn]$ ]]; then
+            SPEEDTEST_ENABLED="false"
+        else
+            SPEEDTEST_ENABLED="true"
+        fi
+        save_config_var "SPEEDTEST_ENABLED" "$SPEEDTEST_ENABLED"
     fi
 
     # SSH-safety check is the LAST input-phase step. After this, no prompts
@@ -3044,7 +3395,11 @@ main() {
     fi
     
     progress_add_step "Configure firewall & NAT"
-    progress_add_step "Start WireGuard VPN"
+    if [ "${PI_BYPASS_ROUTING:-false}" = "true" ] && [ "${LAN_FORWARD_MODE:-all}" = "home" ]; then
+        progress_add_step "Start WireGuard VPN" "(home-only LAN forward)"
+    else
+        progress_add_step "Start WireGuard VPN"
+    fi
     
     if [ "$AUTO_UPDATES_ENABLED" = "true" ]; then
         progress_add_step "Enable auto-updates" "(nightly @ 03:00)"
@@ -3054,6 +3409,14 @@ main() {
     
     if [ "$WATCHDOG_ENABLED" = "true" ]; then
         progress_add_step "Enable hardware watchdog"
+    fi
+
+    if [ "${SPEEDTEST_ENABLED:-false}" = "true" ]; then
+        progress_add_step "WAN vs tunnel speedtest" "(Ookla CLI)"
+    fi
+
+    if [ "${PI_BYPASS_ROUTING:-false}" = "true" ]; then
+        progress_add_step "Verify routing" "(routes · DNS · public IPs)"
     fi
     
     # Draw initial progress box
@@ -3132,30 +3495,7 @@ main() {
     
     # Configure hostapd if wireless
     if [ "$IS_WIRELESS" = true ]; then
-        progress_run_step "Configure Access Point" "
-            mkdir -p /etc/hostapd
-            cat > /etc/hostapd/hostapd.conf <<HOSTAPD_EOF
-interface=$LAN_IFACE
-driver=nl80211
-ssid=$AP_SSID
-hw_mode=g
-channel=7
-wmm_enabled=0
-macaddr_acl=0
-auth_algs=1
-ignore_broadcast_ssid=0
-wpa=2
-wpa_passphrase=$AP_PASS
-wpa_key_mgmt=WPA-PSK
-wpa_pairwise=CCMP
-rsn_pairwise=CCMP
-HOSTAPD_EOF
-            sed -i 's|#DAEMON_CONF=\"\"|DAEMON_CONF=\"/etc/hostapd/hostapd.conf\"|' /etc/default/hostapd 2>/dev/null || true
-            rfkill unblock wlan 2>/dev/null || true
-            systemctl unmask hostapd
-            systemctl enable hostapd
-            systemctl restart hostapd
-        "
+        progress_run_step "Configure Access Point" "do_configure_hostapd"
     fi
     
     # Configure firewall
@@ -3169,7 +3509,8 @@ HOSTAPD_EOF
     if [ "$FIREWALL_ENABLED" = "true" ]; then
         ensure_wan_firewall_rules
     else
-        echo "[wan_firewall] Skipped (user disabled)" >> "$LOG_FILE"
+        echo "[wan_firewall] Disabled — removing any previously tagged INPUT rules" >> "$LOG_FILE"
+        remove_tagged_input_rules
     fi
     # Always persist iptables/NAT to disk regardless of WAN firewall toggle so
     # forwarding/MASQUERADE survives reboot even if wg0 fails to come up.
@@ -3187,6 +3528,50 @@ HOSTAPD_EOF
     if [ "$WATCHDOG_ENABLED" = "true" ]; then
         progress_run_step "Enable hardware watchdog" "do_hardware_watchdog_setup"
     fi
+
+    # Optional Ookla comparison. Uses its own live panel via ui_*;
+    # mark the progress row done afterward with a short summary extra.
+    if [ "${SPEEDTEST_ENABLED:-false}" = "true" ]; then
+        local st_idx
+        st_idx=$(progress_find_step "WAN vs tunnel speedtest")
+        if [ "$st_idx" != "-1" ]; then
+            progress_set_status "$st_idx" "running"
+            progress_draw_box
+        fi
+        # Leave a blank line under the progress box for the speedtest panel.
+        ui_echo ""
+        SPEEDTEST_BOX_LINES=0
+        do_speedtest_comparison
+        local st_extra
+        st_extra="WAN ${ST_WAN_DL}/${ST_WAN_UL} · wg0 ${ST_WG_DL}/${ST_WG_UL} Mbps"
+        if [ "$st_idx" != "-1" ]; then
+            progress_set_status "$st_idx" "done" "$st_extra"
+            # Panel above may have moved the cursor; reset so we don't erase it.
+            PROGRESS_BOX_LINES=0
+            progress_draw_box
+        fi
+    fi
+
+    # Always verify policy routing when Pi-bypass is on (fast, no network I/O).
+    if [ "${PI_BYPASS_ROUTING:-false}" = "true" ]; then
+        local vr_idx
+        vr_idx=$(progress_find_step "Verify routing")
+        if [ "$vr_idx" != "-1" ]; then
+            progress_set_status "$vr_idx" "running"
+            progress_draw_box
+        fi
+        ui_echo ""
+        do_verify_routes
+        if [ "$vr_idx" != "-1" ]; then
+            if [ "${VERIFY_FAIL_COUNT:-0}" -gt 0 ]; then
+                progress_set_status "$vr_idx" "fail" "${VERIFY_SUMMARY:-failed}"
+            else
+                progress_set_status "$vr_idx" "done" "${VERIFY_SUMMARY:-ok}"
+            fi
+            PROGRESS_BOX_LINES=0
+            progress_draw_box
+        fi
+    fi
     
     # Final redraw to show all complete
     progress_draw_box
@@ -3198,11 +3583,46 @@ HOSTAPD_EOF
     ui_echo "   • WAN Interface: ${BOLD}$WAN_IFACE${NC}"
     ui_echo "   • LAN Interface: ${BOLD}$LAN_IFACE${NC} (Gateway: $LAN_GATEWAY)"
     ui_echo "   • VPN Interface: ${BOLD}wg0${NC}"
+    if [ "${PI_BYPASS_ROUTING:-false}" = "true" ]; then
+        if [ "${LAN_FORWARD_MODE:-all}" = "home" ]; then
+            ui_echo "   • LAN via VPN:   ${BOLD}home subnets only${NC} (other Internet via WAN)"
+        else
+            ui_echo "   • LAN via VPN:   ${BOLD}all traffic${NC} (kill-switch when wg0 down)"
+        fi
+        if [ -n "${VERIFY_SUMMARY:-}" ]; then
+            if [ "${VERIFY_FAIL_COUNT:-0}" -gt 0 ]; then
+                ui_echo "   • Route checks:  ${RED}${VERIFY_SUMMARY}${NC}"
+            else
+                ui_echo "   • Route checks:  ${GREEN}${VERIFY_SUMMARY}${NC}"
+            fi
+        fi
+    fi
+    if [ "${SPEEDTEST_ENABLED:-false}" = "true" ]; then
+        ui_echo "   • Speedtest: WAN ${BOLD}${ST_WAN_DL:-—}${NC}/${BOLD}${ST_WAN_UL:-—}${NC} Mbps → tunnel ${BOLD}${ST_WG_DL:-—}${NC}/${BOLD}${ST_WG_UL:-—}${NC} Mbps"
+    fi
     ui_echo ""
     ui_echo "${BLUE}ℹ️${NC}  Setup log saved to: $LOG_FILE"
+    ui_echo "${DIM}   Re-run speedtest:     sudo ./gateway-manage-or-setup.sh --speedtest${NC}"
+    ui_echo "${DIM}   Re-check routes:      sudo ./scripts/setup-vpn-gateway.sh --verify-routes${NC}"
     
     save_config
     ui_echo "${BLUE}ℹ️${NC}  Configuration saved to: $CONFIG_FILE"
 }
+
+# Standalone speedtest (no full setup). Invoked by manage menu / --speedtest.
+if [ "${1:-}" = "--speedtest" ]; then
+    run_speedtest_only
+    exit $?
+fi
+
+if [ "${1:-}" = "--verify-routes" ]; then
+    run_verify_routes_only
+    exit $?
+fi
+
+if [ "${1:-}" = "--edit" ]; then
+    run_selective_edit
+    exit $?
+fi
 
 main

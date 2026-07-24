@@ -49,6 +49,8 @@ Build a **plug-and-play site-to-site VPN** with a single **Raspberry Pi** and **
    - Opt into WAN firewall hardening (allow SSH + WireGuard, drop other inbound).
    - Opt into automatic security updates (nightly at 03:00).
    - Opt into hardware watchdog (auto-reboot on system hang).
+   - With Pi-bypass: choose **all LAN traffic via VPN** or **home subnets only** (other Internet via WAN).
+   - Opt into a post-setup **WAN vs tunnel Ookla speedtest** (live comparison panel).
    - Review the progress box, then confirm to apply.
 5. **Connect devices**
    - Wired: plug a switch/AP into the Pi's LAN port.
@@ -62,11 +64,14 @@ sudo ./gateway-manage-or-setup.sh [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| *(none)* | Interactive menu (setup/cleanup/start/stop) |
-| `--setup` | Run setup wizard |
-| `--cleanup` | Remove gateway configuration |
+| *(none)* | Interactive menu |
+| `--setup` | Full setup wizard |
+| `--edit` | Change one setting (minimal reapply) |
+| `--apply` | Re-apply `vpn-gateway.conf` as-is (no prompts; for hand-edits) |
+| `--cleanup` | Remove the configured gateway |
 | `--start` | Start gateway services (WireGuard + dnsmasq + hostapd) |
 | `--stop` | Stop gateway services |
+| `--speedtest` | Ookla WAN vs WireGuard tunnel comparison (live panel) |
 | `--yes` | Non-interactive mode (use existing config, no prompts) |
 | `--help` | Show usage |
 
@@ -87,7 +92,7 @@ sudo ./gateway-manage-or-setup.sh [OPTIONS]
 
 ## How traffic is routed
 
-The setup wizard asks once whether to enable **Pi-bypass routing** (recommended). The two modes differ only in routing; the WireGuard config and firewall are otherwise identical.
+The setup wizard asks whether to enable **Pi-bypass routing** (recommended), then whether LAN clients should send **all** traffic or **only home-network** traffic through the VPN. The WireGuard peer config is otherwise left as-is (`AllowedIPs` is not rewritten).
 
 ### Pi-bypass routing (recommended)
 
@@ -99,26 +104,30 @@ The setup wizard asks once whether to enable **Pi-bypass routing** (recommended)
     iif=LAN_IFACE)  │      │            │     ┌─ encrypted ─┐
                     │      ▼            ├────►│   wg0       │──► home WG peer
                     │  table 200:       │     │             │
-                    │  default dev wg0  │     └─────────────┘
-                    │                   │
-                    │  Pi-local         │
-                    │  (apt, Pi Connect,│     ┌─ direct ────┐
-   Pi process  ─────│   NTP, DNS, WG    ├────►│ WAN gateway │──► Internet
-   (no iif)         │   handshake) →    │     │             │
-                    │  main: default    │     └─────────────┘
+                    │  all  → default   │     └─────────────┘
+                    │         + homes   │
+                    │  home → homes only│     ┌─ direct ────┐
+                    │    (else → main)  ├────►│ WAN gateway │──► Internet
+                    │                   │     │             │
+                    │  Pi-local         │     └─────────────┘
+                    │  (apt, Pi Connect,│
+   Pi process  ─────│   NTP, DNS, WG    ├────► WAN gateway ──► Internet
+   (no iif)         │   handshake) →    │
+                    │  main: default    │
                     │  via WAN gw       │
                     └───────────────────┘
 ```
 
-- **LAN client traffic** is forwarded through the Pi. The kernel sees `iif=$LAN_IFACE`, matches an `ip rule` at priority 100, and looks up routing in table 200, where the default route is `dev wg0`. Encrypted packets go to the home peer.
+- **LAN client traffic** is forwarded through the Pi. The kernel sees `iif=$LAN_IFACE`, matches an `ip rule` at priority 100, and looks up routing in table 200.
+  - **`LAN_FORWARD_MODE=all`** (default): table 200 has `default dev wg0` plus each home subnet — full site-to-site; Internet exits via the home peer.
+  - **`LAN_FORWARD_MODE=home`**: table 200 has **only** non-default `AllowedIPs` home subnets. Other destinations miss in table 200 and fall through to the main table → site WAN. Use this when you only need local home apps, not all traffic through the VPN.
 - **Pi-local traffic** (anything originating on the Pi itself) has no `iif` set. It skips the priority-100 rule and falls through to the **main** table, where the default route is the WAN gateway. The Pi can still reach the home subnet via `wg0` because each non-default `AllowedIPs` entry (e.g. `10.33.33.0/24`) is also added as an explicit route in the main table.
 - **WireGuard's own UDP handshake** is Pi-local traffic; it goes via WAN like any other Pi process. There is no chicken-and-egg problem when the tunnel restarts.
 
-#### Kill-switch semantics (intentional)
-- If `wg0` is down, packets routed through table 200 hit a route whose `dev wg0` no longer exists - the kernel drops them. **LAN clients lose Internet** rather than silently leaking via the Pi's WAN.
+#### Kill-switch semantics
+- **`all` mode:** If `wg0` is down, packets routed through table 200 hit a route whose `dev wg0` no longer exists — the kernel drops them. **LAN clients lose Internet** rather than silently leaking via the Pi's WAN.
+- **`home` mode:** Only home destinations use table 200. When `wg0` is down, home access fails; general Internet keeps working via WAN (intentional).
 - The Pi itself stays online because its traffic uses the main table, which is untouched. Remote management via Pi Connect, SSH-over-Internet, and apt continue to work.
-- This means an outage of the home WG peer disconnects LAN clients but never disconnects you from the Pi.
-
 #### DNS plane separation (dual-DNS, recommended)
 
 LAN clients query the Pi's `dnsmasq`. dnsmasq itself runs on the Pi, so where its *upstream* lookups go depends on which **mode** the operator picked at the prompt (`HOME_DNS_MODE` in `vpn-gateway.conf`):
@@ -169,12 +178,22 @@ On the Pi (with Pi-bypass enabled, this shows the *WAN* egress IP — not home):
 ```bash
 wg show
 curl https://ifconfig.me   # Pi-local traffic stays on WAN
+sudo ./scripts/setup-vpn-gateway.sh --verify-routes   # tunnel vs WAN routing report
 ```
+
+Optional: compare site ISP vs home egress with Ookla (also offered at the end of setup):
+```bash
+sudo ./gateway-manage-or-setup.sh --speedtest
+# or menu → 5) Speedtest
+```
+The panel binds direct tests to the WAN interface and tunnel tests to `wg0`
+(required under Pi-bypass, where Pi-local traffic would otherwise stay on WAN).
+
 On a client connected to the Pi LAN/AP (this shows the *home* egress IP):
 ```bash
 ping 10.10.10.1                 # gateway reachability
-ping 1.1.1.1                    # routing/NAT via the tunnel
-curl https://ifconfig.me        # should show your home/central egress IP
+ping 1.1.1.1                    # routing/NAT via the tunnel (all-mode) or via WAN (home-mode)
+curl https://ifconfig.me        # home egress in all-mode; site ISP in home-mode
 nslookup google.com 10.10.10.1  # DNS via dnsmasq
 ```
 
@@ -188,6 +207,7 @@ nslookup google.com 10.10.10.1  # DNS via dnsmasq
 ## Cleanup / revert
 ```bash
 sudo ./gateway-manage-or-setup.sh --cleanup
+# or menu → Remove the configured gateway
 # or directly:
 sudo ./scripts/cleanup-gateway.sh
 ```

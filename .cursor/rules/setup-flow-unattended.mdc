@@ -28,3 +28,30 @@ Every interactive question must use this order (helpers `prompt_q` / `prompt_h` 
 4. **Blank line + short input cue** — e.g. `[Y/n]:` or `IP:`
 
 Never put helper text before the question (ambiguous vs the previous answer) or after the input cue (unread before typing). Set `PROMPT_FD=2` when the caller captures stdout via command substitution.
+
+## Selective edit
+
+- Prefer `--edit` / manage menu "Change one setting" for single-value changes.
+- Reapply **only** the subsystems that setting needs (see `scripts/selective-edit.sh`).
+- **Apply saved configuration** (`--apply` / menu option 3) re-runs setup
+  non-interactively from `vpn-gateway.conf` — supported for hand-edits and
+  idempotent repair. Full setup remains for first-time install or multi-setting overhauls.
+
+## Interface picker
+
+When changing WAN/LAN interface selection UX in `scripts/setup-vpn-gateway.sh`:
+
+- Treat Pi onboard Ethernet drivers `smsc95xx` / `lan78xx` / `bcmgenet` as
+  `bus=onboard` (`[ Pi built-in ]`) even if the sysfs device path contains
+  `/usb` (Pi 1/2/3 expose LAN951x/LAN7515 on an internal USB bus).
+- Default preference: **WAN = built-in/PCI**, **LAN = USB then Wi-Fi**.
+- Cue must offer a default **number** (Enter accepts); do not leave Number blank when a sensible default exists.
+- On the LAN step, show the WAN iface dimmed with `[ WAN — selected ]` and
+  omit it from selectable numbers (do not allow picking the same iface twice).
+
+## Optional speedtest
+
+- `SPEEDTEST_ENABLED` is prompted in the input phase (before detach).
+- Tunnel leg must use `--interface=wg0` (Pi-bypass otherwise measures WAN only).
+- Standalone path: manage menu item / `--speedtest` → `setup-vpn-gateway.sh --speedtest`.
+- Speedtest failure must not fail setup.

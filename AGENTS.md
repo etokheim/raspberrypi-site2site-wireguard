@@ -38,6 +38,18 @@ Never put helper text before the question or after the input cue. Use the
 shared `prompt_q` / `prompt_h` / `prompt_cue` helpers in
 `scripts/setup-vpn-gateway.sh` (set `PROMPT_FD=2` when stdout is captured).
 
+### Selective edit (change one setting)
+
+Prefer `gateway-manage-or-setup.sh` → Edit → **Change one setting** (or
+`setup-vpn-gateway.sh --edit`) when the operator only wants to tweak one
+value. That path must **reapply only the subsystems that setting touches**
+(e.g. LAN forward mode → rewrite wg0 PostUp + reload wg + verify; HOME_DNS
+→ dnsmasq only). Do not force a full stack rebuild for a single-setting edit.
+
+**Apply saved configuration** (`--apply` / Edit menu option 3) must stay
+supported: re-apply `vpn-gateway.conf` with no prompts (hand-edits and
+idempotent repair). Full reconfigure remains for green-field or multi-setting
+prompt walkthroughs.
 ## Critical Operational Principles
 
 These principles must be preserved by any change to setup/cleanup/management scripts:
@@ -79,13 +91,29 @@ recommended mode and the only mode that keeps remote management (SSH
 over Internet, Pi Connect, apt) working when the user's `wg0.conf` has
 `AllowedIPs = 0.0.0.0/0`.
 
-- Forwarded packets (`iif=$LAN_IFACE`) -> table 200 -> default `dev wg0`.
+- Forwarded packets (`iif=$LAN_IFACE`) -> table 200 -> (see LAN_FORWARD_MODE).
 - Locally-generated packets (no `iif`) -> main table -> WAN.
 - Per-peer subnets (non-default `AllowedIPs` entries) get explicit
   `dev wg0` routes in BOTH the main table (so the Pi reaches them) and
   table 200 (so LAN clients reach them via the tunnel).
-- When `wg0` is down, table-200 packets drop (kill-switch). Pi-local
-  traffic continues via WAN, preserving remote management.
+- `LAN_FORWARD_MODE=all` (default): table 200 also has `default dev wg0`
+  (full LAN tunnel). When `wg0` is down, LAN Internet fails (kill-switch);
+  Pi-local traffic continues via WAN.
+- `LAN_FORWARD_MODE=home`: table 200 has **only** home subnet routes.
+  Other LAN Internet falls through to the main table (WAN). When `wg0`
+  is down, only home access fails. Do not rewrite AllowedIPs for this;
+  routing decides egress. Prefer `HOME_DNS_MODE=custom` over tunnel-exit.
+- Ensure LAN→WAN FORWARD (+ WAN MASQUERADE) via `ensure_nat_rules` so
+  home-only Internet egress works.
+- After WireGuard is up, run `do_verify_routes` (progress step +
+  `--verify-routes`): simulate LAN client lookups with
+  `ip route get <dest> from <lan-client> iif $LAN_IFACE`, probe DNS
+  reachability (PI_DNS / HOME_DNS), and compare public IPs (WAN egress vs
+  tunnel egress vs WG Endpoint host). Do not fail setup on a failed check.
+- Re-runs must remain conflict-free: flush table 200 / old `iif` rules before
+  wg restart; remove tagged firewall rules when firewall is disabled; always
+  allow changing `LAN_FORWARD_MODE` (and optionally other settings) when
+  reusing `vpn-gateway.conf`.
 
 Any change that re-introduces a default route via `wg0` in the main
 routing table - or that ties non-tunnel-related rules to `wg-quick`
@@ -123,8 +151,11 @@ The fix is two distinct DNS planes, controlled by three
   **Default priority** when forwarding LAN DNS through the tunnel:
   1. WireGuard `DNS =` from the source config → `MODE=custom` (operator
      already named a home resolver; confirm-or-override prompt).
-  2. Else if `AllowedIPs` has a default route → `MODE=tunnel`.
-  3. Else `.1` of the first home subnet → `MODE=custom`.
+  2. Else if `LAN_FORWARD_MODE=home` → prefer `MODE=custom` (home `.1`
+     / ask). Do **not** auto-default to tunnel-exit in home-only mode
+     (DNS via home while Internet via WAN is usually confusing).
+  3. Else if `AllowedIPs` has a default route → `MODE=tunnel`.
+  4. Else `.1` of the first home subnet → `MODE=custom`.
   `DNS =` itself is still *not* applied to the Pi under Pi-bypass (stripped
   from the installed `wg0.conf`); we only reuse the values for LAN dnsmasq.
 - `PI_DNS_SERVERS` (Pi plane): public resolvers (default
@@ -152,9 +183,10 @@ Rules:
   legacy mode the Pi's own traffic goes through the tunnel anyway, so
   the tunnel-side already provides DNS.
 - The default mode is `tunnel` only when the WireGuard config has **no**
-  `DNS =` line and `AllowedIPs` includes a default route. If `DNS =` is
-  present, default to `custom` with those servers and ask the operator
-  whether to keep or override them.
+  `DNS =` line, `AllowedIPs` includes a default route, **and**
+  `LAN_FORWARD_MODE` is not `home`. If `DNS =` is present (or mode is
+  home-only), default to `custom` with those / home servers and ask the
+  operator whether to keep or override them.
 - For `tunnel` mode every `server=<ip>@wg0` MUST use the `@wg0`
   source-interface binding. Without it, dnsmasq's outbound query
   follows the main table and goes via WAN (defeating the purpose);
@@ -181,6 +213,35 @@ Rules:
 - `do_configure_pi_dns` must use `nmcli dev reapply` (not `nmcli con
   up`) so changing DNS does not bounce the WAN link and drop SSH for
   an operator on the WAN interface.
+
+### Interface Picker UX
+
+WAN/LAN selection in `select_interface` must stay operator-friendly on every Pi model:
+
+- **Pi onboard Ethernet on an internal USB bus is still built-in.** Drivers
+  `smsc95xx` (Pi 1/2/3B), `lan78xx` (Pi 3B+), and `bcmgenet` (Pi 4+) must
+  label as `[ Pi built-in ]` / `bus=onboard`, even when sysfs path contains
+  `/usb`. External dongles (`cdc_ncm`, `r8152`, `ax88179_178a`, …) stay
+  `[ USB adapter ]`.
+- **Defaults:** WAN prefers built-in/PCI; LAN prefers USB, then Wi-Fi. Cue
+  shows the default **number** (Enter accepts it).
+- **LAN step:** the already-chosen WAN iface stays visible but dimmed with
+  `[ WAN — selected ]` and is not a selectable number.
+- USB-bus classification still drives `BindsTo=` for true hotplug dongles;
+  onboard smsc95xx/lan78xx must **not** get `BindsTo` (they are not removable).
+
+### Optional WAN vs tunnel speedtest
+
+Post-setup verification may run an Ookla CLI comparison (opt-in during the
+input phase via `SPEEDTEST_ENABLED`, or later via manage menu / `--speedtest`):
+
+- Direct test binds to `WAN_IFACE`; tunnel test binds to `wg0`
+  (`SO_BINDTODEVICE`). Under Pi-bypass, an unbound Pi-local speedtest would
+  only measure WAN — never skip the `wg0` bind for the tunnel leg.
+- Prompt **before** `become_unattended`. Do not add interactive prompts during
+  the speedtest itself (license flags: `--accept-license --accept-gdpr`).
+- Install Ookla only when opted in; do not add it to base package deps.
+- Failures must not abort setup (warn + continue). Live panel uses `ui_*`.
 
 ### Disconnect-Safe Execution
 
