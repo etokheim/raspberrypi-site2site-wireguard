@@ -254,6 +254,7 @@ The execution phase must finish on its own even if the operator's terminal goes 
 - Never add a prompt after the input phase. Any new question must move into the input-collection block.
 - Never reset the previous LAN during input collection. During execution preserve its addresses/connection if it is now WAN or carries SSH.
 - Keep generated config answers literal when sourced; never interpolate peer filenames into eval strings. Stage private configs with random mode-600 temporary files and checked writes before atomic replacement. Required setup/edit steps and firewall persistence must fail nonzero rather than reach a success banner.
+- Restrict `FW_RULE_TAG` to ASCII `^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$` before any setup/edit/start/cleanup firewall mutation. Only unset means `vpn-gateway`; empty is invalid. libxtables quoting is not shell quoting: unsupported historical tags need manual ownership review, not guessed decoding. Setup and cleanup must honor the same configured tag.
 
 ## Living Decisions (Automatic Maintenance)
 

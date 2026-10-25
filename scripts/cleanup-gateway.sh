@@ -378,11 +378,12 @@ restore_wan_dhcp() {
 }
 
 cleanup_wan_firewall_rules() {
+    local tag="${FW_RULE_TAG-vpn-gateway}"
+    validate_firewall_rule_tag "$tag" || return 1
     local wan_iface="$WAN_IFACE"
     local lan_iface="$LAN_IFACE"
     local ssh_port="${SSH_PORT:-22}"
     local wg_port="${WG_LISTEN_PORT:-}"
-    local tag="vpn-gateway"
 
     # Preferred path: remove every INPUT rule tagged by setup. Handles SSH_PORT
     # / WG_LISTEN_PORT / WAN_IFACE having changed since the rule was installed.
@@ -450,6 +451,7 @@ main() {
         source "$CONFIG_FILE"
         echo "Loaded configuration from $CONFIG_FILE" >> "$LOG_FILE"
     fi
+    validate_firewall_rule_tag "${FW_RULE_TAG-vpn-gateway}" || return 1
     
     print_header
 

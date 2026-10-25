@@ -1,4 +1,15 @@
 # Sourced firewall helpers shared by setup and cleanup. No eval of rule text.
+validate_firewall_rule_tag() {
+    # libxtables quoting is not shell quoting (notably apostrophes). Restrict
+    # ownership identities instead of trying to deserialize arbitrary comments.
+    # An unset setting gets the default; an explicitly empty setting is invalid.
+    local LC_ALL=C
+    if [[ ! ${1-} =~ ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$ ]]; then
+        echo 'Unsupported firewall ownership tag: expected 1-64 ASCII characters matching [A-Za-z0-9][A-Za-z0-9_.:-]*. Existing unsupported tags require manual review; no firewall changes made.' >&2
+        return 1
+    fi
+}
+
 ensure_lan_egress_guard() {
     # Table-200 routes disappear with wg0; prevent fallthrough to WAN, including
     # established flows. Deliberately independent of wg-quick PostDown.
@@ -30,8 +41,8 @@ remove_lan_egress_guard() {
 }
 
 remove_gateway_input_rules() {
-    local tag="$1" saved numbers number
-    [ -n "$tag" ] || return 1
+    local tag="${1-}" saved numbers number
+    validate_firewall_rule_tag "$tag" || return 1
     # Legacy NAT setup and standalone cleanup also use this helper. Do not fall
     # back to whitespace matching if Python is absent (or install from cleanup).
     command -v python3 >/dev/null 2>&1 || {

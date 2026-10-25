@@ -228,6 +228,7 @@ _edit_refresh_lan_gateway() {
 # Apply only what EDIT_KEY requires. Uses progress box + optional detach.
 _edit_apply_setting() {
     local key="$1"
+    validate_firewall_rule_tag "${FW_RULE_TAG-vpn-gateway}" || return 1
     _edit_refresh_lan_gateway
     validate_site_routing "$WG_CONF_SRC" || return 1
 
@@ -419,6 +420,7 @@ _edit_apply_setting() {
 
 run_selective_edit() {
     load_config
+    validate_firewall_rule_tag "${FW_RULE_TAG-vpn-gateway}" || return 1
     NONINTERACTIVE=false
     init_log
     check_root

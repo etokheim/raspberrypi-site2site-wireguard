@@ -198,11 +198,9 @@ remove_gateway_input_rules "$TAG"
             ('vpn-gateway', '"vpn-gateway"'),
             ('vpn-gateway', "'vpn-gateway'"),
             ('vpn-gateway', r'vpn\-gateway'),
-            ('vpn gateway', r'vpn\ gateway'),
-            ('vpn "gateway"', r'"vpn \"gateway\""'),
-            (r'vpn\gateway', r'"vpn\\gateway"'),
-            (r'vpn\gateway', r'vpn\\gateway'),
-            ('vpn#gateway', 'vpn#gateway'),
+            ('Site_2.prod:WAN-01', '"Site_2.prod:WAN-01"'),
+            ('a', 'a'),
+            ('a' * 64, 'a' * 64),
         ]
         for tag, encoded in cases:
             with self.subTest(tag=tag, encoded=encoded):
@@ -213,6 +211,90 @@ remove_gateway_input_rules "$TAG"
                     f'-A INPUT -m comment --comment {encoded} -j DROP', tag)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual((self.dir / 'deletions').read_text(), '<-D><INPUT><2>\n')
+
+    def test_libxtables_apostrophe_tag_counterexamples_fail_closed(self):
+        # Actual libxtables output for comment vpn'gateway. shlex decodes this
+        # to a DIFFERENT identity: vpn\'gateway, so neither identity is allowed.
+        listing = r'''-A INPUT -m comment --comment "vpn\'gateway" -j ACCEPT'''
+        for tag in ("vpn'gateway", r"vpn\'gateway"):
+            with self.subTest(tag=tag):
+                result = self.remove_input_listing(listing, tag)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('Unsupported firewall ownership tag', result.stderr)
+                self.assertFalse((self.dir / 'deletions').exists())
+
+    def test_unsupported_tags_refused_before_any_iptables_call(self):
+        invalid = ["vpn'gateway", r"vpn\'gateway", '', 'vpn gateway',
+                   r'vpn\gateway', 'vpn"gateway', 'vpn#gateway', '-vpn',
+                   'a' * 65, 'vpn\ngateway', 'vépñ', '$(touch INJECTED)']
+        calls = self.dir / 'calls'
+        for cleanup, entry in ((False, 'remove_gateway_input_rules "$FW_RULE_TAG"'),
+                               (False, 'remove_tagged_input_rules'),
+                               (False, 'ensure_wan_firewall_rules'),
+                               (True, 'cleanup_wan_firewall_rules')):
+            for tag in invalid:
+                with self.subTest(cleanup=cleanup, entry=entry, tag=tag):
+                    calls.unlink(missing_ok=True)
+                    prelude = (f'source {shlex.quote(str(ROOT / "scripts/cleanup-gateway.sh"))}\n'
+                               if cleanup else '')
+                    result = self.shell(prelude + '''
+iptables() { printf '%s\n' "$*" >> "$CALLS"; }
+persist_iptables_rules() { echo persist >> "$CALLS"; }
+''' + entry, FW_RULE_TAG=tag, CALLS=str(calls))
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('Unsupported firewall ownership tag', result.stderr)
+                    self.assertFalse(calls.exists())
+                    self.assertFalse((self.dir / 'INJECTED').exists())
+
+    def test_public_entrypoints_reject_tags_before_execution_phase(self):
+        calls = self.dir / 'calls'
+        for cleanup, entry in ((False, 'main'), (False, 'prepare_saved_start'),
+                               (False, 'run_selective_edit'),
+                               (False, '_edit_apply_setting wan_iface'),
+                               (False, '_edit_apply_setting firewall'),
+                               (True, 'main')):
+            for tag in ("vpn'gateway", r"vpn\'gateway", ''):
+                with self.subTest(cleanup=cleanup, entry=entry, tag=tag):
+                    calls.unlink(missing_ok=True)
+                    self.saved.write_text('FW_RULE_TAG=' + shlex.quote(tag) + '\n')
+                    prelude = (f'source {shlex.quote(str(ROOT / "scripts/cleanup-gateway.sh"))}\n'
+                               if cleanup else '')
+                    # Keep all paths local even after sourcing standalone cleanup.
+                    prelude += f'CONFIG_FILE={shlex.quote(str(self.saved))}\n'
+                    result = self.shell(prelude + '''
+init_log() { :; }; check_root() { :; }
+iptables() { echo iptables >> "$CALLS"; }
+ip() { echo ip >> "$CALLS"; }
+systemctl() { echo systemctl >> "$CALLS"; }
+wg-quick() { echo wg-quick >> "$CALLS"; }
+_edit_refresh_lan_gateway() { echo refresh >> "$CALLS"; }
+print_header() { echo header >> "$CALLS"; }
+''' + entry, FW_RULE_TAG=tag, CALLS=str(calls))
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('Unsupported firewall ownership tag', result.stderr)
+                    self.assertFalse(calls.exists())
+
+    def test_safe_custom_tag_install_and_cleanup_preserve_default_owner(self):
+        state = self.dir / 'net.json'
+        tag = 'Site_2.prod:WAN-01'
+        result = self.shell(self.net_prelude() + '''
+persist_iptables_rules() { :; }
+iptables -A INPUT -m comment --comment vpn-gateway -j ACCEPT
+ensure_wan_firewall_rules || exit 1
+ensure_wan_firewall_rules || exit 2
+''', FW_RULE_TAG=tag, MOCK_NET_STATE=str(state))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rules = json.loads(state.read_text())['chains']['filter:INPUT']
+        self.assertEqual(sum(r[-1] == 'DROP' for r in rules), 1)
+        self.assertEqual(sum(tag in r for r in rules), 6)
+        result = self.shell(self.net_prelude() + f'''
+source {shlex.quote(str(ROOT / 'scripts/cleanup-gateway.sh'))}
+LOG_FILE={shlex.quote(str(self.dir / 'cleanup.log'))}
+cleanup_wan_firewall_rules
+''', FW_RULE_TAG=tag, MOCK_NET_STATE=str(state))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(state.read_text())['chains']['filter:INPUT'],
+                         [['-m', 'comment', '--comment', 'vpn-gateway', '-j', 'ACCEPT']])
 
     def test_escaped_embedded_comment_and_shell_text_remain_data(self):
         listing = '\n'.join([

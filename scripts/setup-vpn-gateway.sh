@@ -2172,13 +2172,14 @@ prompt_wan_static_ip() {
 }
 
 remove_tagged_input_rules() {
-    remove_gateway_input_rules "${FW_RULE_TAG:-vpn-gateway}"
+    remove_gateway_input_rules "${FW_RULE_TAG-vpn-gateway}"
 }
 
 ensure_wan_firewall_rules() {
-    echo "[wan_firewall] Applying hardened INPUT rules for WAN=$WAN_IFACE (tag=${FW_RULE_TAG:-vpn-gateway})" >> "$LOG_FILE"
+    local tag="${FW_RULE_TAG-vpn-gateway}"
+    validate_firewall_rule_tag "$tag" || return 1
+    echo "[wan_firewall] Applying hardened INPUT rules for WAN=$WAN_IFACE (tag=$tag)" >> "$LOG_FILE"
     local ssh_port="${SSH_PORT:-22}"
-    local tag="${FW_RULE_TAG:-vpn-gateway}"
 
     # Wipe previous tagged rules first, so SSH_PORT/WG_LISTEN_PORT/WAN_IFACE
     # changes from a re-run don't leave stale ACCEPTs or a stranded DROP.
@@ -3037,6 +3038,7 @@ main() {
         SITE_NEW_INSTALL=true
     fi
     load_config # Load defaults from file if it exists
+    validate_firewall_rule_tag "${FW_RULE_TAG-vpn-gateway}" || return 1
     NONINTERACTIVE="${NONINTERACTIVE:-false}"
     USE_EXISTING_CONFIG=false
     if has_full_config; then
@@ -3672,6 +3674,7 @@ main() {
 # Standalone speedtest (no full setup). Invoked by manage menu / --speedtest.
 prepare_saved_start() {
     load_config
+    validate_firewall_rule_tag "${FW_RULE_TAG-vpn-gateway}" || return 1
     init_log
     check_root
     has_full_config || return 1
