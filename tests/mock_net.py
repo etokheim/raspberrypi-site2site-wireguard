@@ -2,6 +2,7 @@
 """Small stateful command-generation test double; never touches networking."""
 import json
 import os
+import shlex
 import sys
 from pathlib import Path
 
@@ -35,14 +36,28 @@ if command == 'iptables':
         elif action == '-C':
             status = 0 if rule in rules else 1
         elif action == '-D':
-            if rule in rules:
+            if len(rule) == 1 and rule[0].isdigit():
+                index = int(rule[0]) - 1
+                if 0 <= index < len(rules):
+                    del rules[index]
+                else:
+                    status = 1
+            elif rule in rules:
                 rules.remove(rule)
             else:
                 status = 1
         elif action == '-A':
             rules.append(rule)
+        elif action == '-S':
+            output = '\n'.join(shlex.join(['-A', chain] + r) for r in rules) + '\n'
         elif action == '-I':
             rules.insert(int(rule[0]) - 1, rule[1:])
+        elif action == '-R':
+            index = int(rule[0]) - 1
+            if 0 <= index < len(rules):
+                rules[index] = rule[1:]
+            else:
+                status = 1
         else:
             raise ValueError(args)
 elif command == 'ip':

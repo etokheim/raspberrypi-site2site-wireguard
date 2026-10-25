@@ -370,6 +370,7 @@ source "$SCRIPT_DIR/verify-routes.sh"
 # shellcheck source=selective-edit.sh
 source "$SCRIPT_DIR/selective-edit.sh"
 source "$SCRIPT_DIR/site-routing.sh"
+source "$SCRIPT_DIR/firewall-common.sh"
 
 # Make this script survive a hangup of its controlling terminal (SSH drop,
 # Pi Connect WebRTC failure, serial console close, etc.) so that the
@@ -668,17 +669,13 @@ _wg_pi_bypass_down_cmds() {
 # Inject PostUp/PostDown lines (and Table = off when Pi-bypass is on) into the
 # user's wg0.conf. Always strips any prior PostUp / PostDown / Table lines we
 # may have written in a previous run, so re-runs converge on the chosen mode.
-do_configure_wg_firewall_rules() {
+do_configure_wg_firewall_rules() (
+    umask 077
     validate_site_routing "$WG_CONF_DEST" || return 1
-    if ! grep -q '\[Interface\]' "$WG_CONF_DEST"; then
+    if ! grep -qE '^[[:space:]]*\[Interface\][[:space:]]*(#.*)?$' "$WG_CONF_DEST"; then
         echo "ERROR: No [Interface] section found in $WG_CONF_DEST" >> "$LOG_FILE"
         return 1
     fi
-
-    # Always strip previously-injected lines first (idempotent re-run).
-    sed -i '/^PostUp = /d' "$WG_CONF_DEST"
-    sed -i '/^PostDown = /d' "$WG_CONF_DEST"
-    sed -i '/^Table = /d'   "$WG_CONF_DEST"
 
     local pi_bypass="false"
     local up_block down_block
@@ -689,7 +686,6 @@ do_configure_wg_firewall_rules() {
         # when the tunnel comes up (that would make Pi DNS depend on wg0).
         if grep -qE '^[[:space:]]*DNS[[:space:]]*=' "$WG_CONF_DEST"; then
             echo "[wg] Stripping DNS= from $WG_CONF_DEST (Pi-bypass: Pi DNS is PI_DNS_SERVERS via WAN)" >> "$LOG_FILE"
-            sed -i '/^[[:space:]]*DNS[[:space:]]*=/d' "$WG_CONF_DEST"
         fi
         # Split AllowedIPs home subnets into IPv4 / IPv6 buckets.
         local home_v4="" home_v6=""
@@ -724,23 +720,50 @@ do_configure_wg_firewall_rules() {
     # Rewrite wg0.conf: copy lines through, and right after the [Interface]
     # header insert (a) Table = off when Pi-bypass is on, (b) all PostUp lines,
     # (c) all PostDown lines. Done in plain bash to avoid awk's -v newline limit.
-    local tmp_file="${WG_CONF_DEST}.tmp" inserted="false"
+    local tmp_file inserted="false"
+    tmp_file=$(mktemp "${WG_CONF_DEST}.tmp.XXXXXX") || return 1
+    trap 'rm -f -- "$tmp_file"' EXIT
     {
         while IFS= read -r line || [ -n "$line" ]; do
-            printf '%s\n' "$line"
-            if [ "$inserted" = "false" ] && [[ "$line" =~ ^\[Interface\][[:space:]]*$ ]]; then
+            line=${line%$'\r'}
+            # Filter valid wg-quick whitespace/CRLF into a private replacement;
+            # never partially strip the live file before generation succeeds.
+            [[ "$line" =~ ^[[:space:]]*(PostUp|PostDown|Table)[[:space:]]*= ]] && continue
+            if [ "$pi_bypass" = true ] && [[ "$line" =~ ^[[:space:]]*DNS[[:space:]]*= ]]; then
+                continue
+            fi
+            printf '%s\n' "$line" || return 1
+            if [ "$inserted" = "false" ] && [[ "$line" =~ ^[[:space:]]*\[Interface\][[:space:]]*(#.*)?$ ]]; then
                 if [ "$pi_bypass" = "true" ]; then
-                    printf 'Table = off\n'
+                    printf 'Table = off\n' || return 1
                 fi
-                printf '%s\n' "$up_lines"
-                printf '%s\n' "$down_lines"
+                printf '%s\n' "$up_lines" || return 1
+                printf '%s\n' "$down_lines" || return 1
                 inserted="true"
             fi
         done < "$WG_CONF_DEST"
-    } > "$tmp_file" && mv "$tmp_file" "$WG_CONF_DEST"
-}
+    } > "$tmp_file" && [ "$inserted" = true ] &&
+        chmod 600 "$tmp_file" && mv -f -- "$tmp_file" "$WG_CONF_DEST"
+)
+
+# Keep peer filenames as arguments, not text for progress_run_step's eval.
+# Stage with restrictive permissions before publishing any private key bytes.
+install_wireguard_config() (
+    umask 077
+    [ -f "$WG_CONF_SRC" ] || return 1
+    if [ "$WG_CONF_SRC" -ef "$WG_CONF_DEST" ]; then
+        chmod 600 -- "$WG_CONF_DEST"
+        return $?
+    fi
+    local tmp_file
+    tmp_file=$(mktemp "${WG_CONF_DEST}.install.XXXXXX") || return 1
+    trap 'rm -f -- "$tmp_file"' EXIT
+    cat -- "$WG_CONF_SRC" > "$tmp_file" &&
+        chmod 600 "$tmp_file" && mv -f -- "$tmp_file" "$WG_CONF_DEST"
+)
 
 do_start_wireguard() {
+    ensure_lan_egress_guard || return 1
     # Pi DNS must work before wg-quick resolves a hostname Endpoint=.
     if [ "${PI_BYPASS_ROUTING:-false}" = "true" ] && [ -n "${PI_DNS_SERVERS:-}" ]; then
         verify_or_repair_pi_dns
@@ -828,8 +851,15 @@ reset_previous_lan_iface() {
 
     echo "[Reconfig] Clearing previous LAN interface $old_iface" >> "$LOG_FILE"
 
+    local preserve_link=false ssh_iface
+    ssh_iface=$(detect_ssh_iface)
+    if [ "$old_iface" = "${WAN_IFACE:-}" ] || [ "$old_iface" = "$ssh_iface" ]; then
+        preserve_link=true
+        echo "[Reconfig] Preserving addresses/connection on WAN or SSH interface $old_iface" >> "$LOG_FILE"
+    fi
+
     # Detach NetworkManager configuration on the previous LAN interface
-    if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager; then
+    if [ "$preserve_link" != true ] && command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager; then
         local old_con
         old_con=$(nmcli -t -f NAME,DEVICE connection show | grep ":$old_iface$" | cut -d: -f1 | head -n1)
         if [ -n "$old_con" ]; then
@@ -839,7 +869,9 @@ reset_previous_lan_iface() {
     fi
 
     # Flush any static addresses on the old LAN interface
-    ip addr flush dev "$old_iface" >> "$LOG_FILE" 2>&1 || true
+    if [ "$preserve_link" != true ]; then
+        ip addr flush dev "$old_iface" >> "$LOG_FILE" 2>&1 || true
+    fi
 
     # Remove FORWARD and NAT rules tied to the OLD LAN iface so re-runs don't
     # accumulate stale forwarding rules each time the interface is changed.
@@ -895,33 +927,33 @@ flush_pi_bypass_leftovers() {
     ip -6 route flush table "$tbl" 2>/dev/null || true
 }
 
-save_config_var() {
+save_config_var() (
+    umask 077
     local var_name="$1"
     local var_value="$2"
-    
-    echo "[DEBUG] Saving $var_name..." >> "$LOG_FILE"
-    
-    # Create file if not exists
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo "# VPN Gateway Configuration" > "$CONFIG_FILE"
-        echo "# Generated on $(date)" >> "$CONFIG_FILE"
-        chmod 600 "$CONFIG_FILE"
-    fi
-    
-    # Check if var exists in file
-    if grep -q "^$var_name=" "$CONFIG_FILE"; then
-        # Use grep -v to remove the line and then append the new one
-        # This avoids complex sed escaping issues
-        grep -v "^$var_name=" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp"
-        echo "$var_name=\"$var_value\"" >> "${CONFIG_FILE}.tmp"
-        mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-        chmod 600 "$CONFIG_FILE"
+    [[ "$var_name" =~ ^[a-zA-Z_][a-zA-Z_0-9]*$ ]] || return 1
+    local tmp_file escaped
+    tmp_file=$(mktemp "${CONFIG_FILE}.tmp.XXXXXX") || return 1
+    trap 'rm -f -- "$tmp_file"' EXIT
+    # Escape shell-active characters; encode newlines as a single-line Bash
+    # assignment so subsequent replacements cannot leave orphaned lines.
+    if [[ "$var_value" == *$'\n'* ]]; then
+        printf -v escaped '%q' "$var_value"
     else
-        # Append new var
-        echo "$var_name=\"$var_value\"" >> "$CONFIG_FILE"
+        escaped=${var_value//\\/\\\\}
+        escaped=${escaped//\"/\\\"}
+        escaped=${escaped//\$/\\\$}
+        escaped=${escaped//\`/\\\`}
+        escaped="\"$escaped\""
     fi
-    echo "[DEBUG] Saved $var_name." >> "$LOG_FILE"
-}
+    if [ -f "$CONFIG_FILE" ]; then
+        awk -v key="$var_name" 'index($0, key "=") != 1' "$CONFIG_FILE" > "$tmp_file" || return 1
+    else
+        printf '# VPN Gateway Configuration\n# Generated on %s\n' "$(date)" > "$tmp_file" || return 1
+    fi
+    printf '%s=%s\n' "$var_name" "$escaped" >> "$tmp_file" &&
+        chmod 600 "$tmp_file" && mv -f -- "$tmp_file" "$CONFIG_FILE"
+)
 
 save_full_config() {
     # Legacy function kept for final save, but now redundant with incremental saves
@@ -1066,7 +1098,9 @@ progress_run_step() {
     if [ "$idx" = "-1" ]; then
         # Step not in list, just run it
         eval "$cmd" >> "$LOG_FILE" 2>&1
-        return $?
+        local exit_code=$?
+        [ "$exit_code" -eq 0 ] || exit "$exit_code"
+        return 0
     fi
     
     progress_set_status "$idx" "running"
@@ -1102,7 +1136,10 @@ progress_run_step() {
     fi
     progress_draw_box
     
-    return $exit_code
+    # Required-step failures must not reach the final success banner.
+    # Verification/optional speedtest implement their own warning-only policy.
+    [ "$exit_code" -eq 0 ] || exit "$exit_code"
+    return 0
 }
 
 progress_skip_step() {
@@ -1298,26 +1335,27 @@ run_step() {
 # LAN -> WAN FORWARD is required for LAN_FORWARD_MODE=home (split-tunnel Internet
 # egress) and is harmless when mode=all.
 ensure_nat_rules() {
+    ensure_lan_egress_guard || return 1
     echo "[ensure_nat_rules] Verifying iptables rules for $LAN_IFACE -> wg0/$WAN_IFACE" >> "$LOG_FILE"
     if ! iptables -C FORWARD -i "$LAN_IFACE" -o wg0 -j ACCEPT >/dev/null 2>&1; then
-        iptables -A FORWARD -i "$LAN_IFACE" -o wg0 -j ACCEPT >> "$LOG_FILE" 2>&1
+        iptables -A FORWARD -i "$LAN_IFACE" -o wg0 -j ACCEPT >> "$LOG_FILE" 2>&1 || return 1
     fi
     if ! iptables -C FORWARD -i wg0 -o "$LAN_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1; then
-        iptables -A FORWARD -i wg0 -o "$LAN_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT >> "$LOG_FILE" 2>&1
+        iptables -A FORWARD -i wg0 -o "$LAN_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT >> "$LOG_FILE" 2>&1 || return 1
     fi
     if [ -n "$WAN_IFACE" ]; then
         if ! iptables -C FORWARD -i "$LAN_IFACE" -o "$WAN_IFACE" -j ACCEPT >/dev/null 2>&1; then
-            iptables -A FORWARD -i "$LAN_IFACE" -o "$WAN_IFACE" -j ACCEPT >> "$LOG_FILE" 2>&1
+            iptables -A FORWARD -i "$LAN_IFACE" -o "$WAN_IFACE" -j ACCEPT >> "$LOG_FILE" 2>&1 || return 1
         fi
         if ! iptables -C FORWARD -i "$WAN_IFACE" -o "$LAN_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1; then
-            iptables -A FORWARD -i "$WAN_IFACE" -o "$LAN_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT >> "$LOG_FILE" 2>&1
+            iptables -A FORWARD -i "$WAN_IFACE" -o "$LAN_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT >> "$LOG_FILE" 2>&1 || return 1
         fi
     fi
     if ! iptables -t nat -C POSTROUTING -o wg0 -j MASQUERADE >/dev/null 2>&1; then
-        iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE >> "$LOG_FILE" 2>&1
+        iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE >> "$LOG_FILE" 2>&1 || return 1
     fi
     if [ -n "$WAN_IFACE" ] && ! iptables -t nat -C POSTROUTING -o "$WAN_IFACE" -j MASQUERADE >/dev/null 2>&1; then
-        iptables -t nat -A POSTROUTING -o "$WAN_IFACE" -j MASQUERADE >> "$LOG_FILE" 2>&1
+        iptables -t nat -A POSTROUTING -o "$WAN_IFACE" -j MASQUERADE >> "$LOG_FILE" 2>&1 || return 1
     fi
 }
 
@@ -1326,10 +1364,13 @@ ensure_nat_rules() {
 persist_iptables_rules() {
     if command -v netfilter-persistent >/dev/null 2>&1; then
         echo "[persist] Saving iptables rules via netfilter-persistent..." >> "$LOG_FILE"
-        netfilter-persistent save >> "$LOG_FILE" 2>&1 || true
+        netfilter-persistent save >> "$LOG_FILE" 2>&1
     elif command -v iptables-save >/dev/null 2>&1 && [ -d /etc/iptables ]; then
         echo "[persist] Saving iptables rules to /etc/iptables/rules.v4..." >> "$LOG_FILE"
-        iptables-save > /etc/iptables/rules.v4 2>>"$LOG_FILE" || true
+        iptables-save > /etc/iptables/rules.v4 2>>"$LOG_FILE"
+    else
+        echo '[persist] No supported firewall persistence backend available' >> "$LOG_FILE"
+        return 1
     fi
 }
 
@@ -2131,43 +2172,32 @@ prompt_wan_static_ip() {
 }
 
 remove_tagged_input_rules() {
-    local tag="$FW_RULE_TAG"
-    # iptables-save preserves rule order; keep deleting matched lines until none.
-    local saved
-    saved=$(iptables-save 2>/dev/null) || return 0
-    echo "$saved" | awk -v tag="$tag" '
-        /^-A INPUT/ && index($0, "--comment \"" tag "\"") {
-            sub(/^-A /, "-D ")
-            print
-        }' | while read -r rule; do
-        # shellcheck disable=SC2086
-        iptables $rule >> "$LOG_FILE" 2>&1 || true
-    done
+    remove_gateway_input_rules "${FW_RULE_TAG:-vpn-gateway}"
 }
 
 ensure_wan_firewall_rules() {
-    echo "[wan_firewall] Applying hardened INPUT rules for WAN=$WAN_IFACE (tag=$FW_RULE_TAG)" >> "$LOG_FILE"
+    echo "[wan_firewall] Applying hardened INPUT rules for WAN=$WAN_IFACE (tag=${FW_RULE_TAG:-vpn-gateway})" >> "$LOG_FILE"
     local ssh_port="${SSH_PORT:-22}"
-    local tag="$FW_RULE_TAG"
+    local tag="${FW_RULE_TAG:-vpn-gateway}"
 
     # Wipe previous tagged rules first, so SSH_PORT/WG_LISTEN_PORT/WAN_IFACE
     # changes from a re-run don't leave stale ACCEPTs or a stranded DROP.
-    remove_tagged_input_rules
+    remove_tagged_input_rules || return 1
 
     # Order matters: ACCEPT rules MUST be installed before the final DROP.
-    iptables -A INPUT -i lo -m comment --comment "$tag" -j ACCEPT >> "$LOG_FILE" 2>&1
-    iptables -A INPUT -i "$LAN_IFACE" -m comment --comment "$tag" -j ACCEPT >> "$LOG_FILE" 2>&1
-    iptables -A INPUT -i wg0 -m comment --comment "$tag" -j ACCEPT >> "$LOG_FILE" 2>&1
+    iptables -A INPUT -i lo -m comment --comment "$tag" -j ACCEPT >> "$LOG_FILE" 2>&1 || return 1
+    iptables -A INPUT -i "$LAN_IFACE" -m comment --comment "$tag" -j ACCEPT >> "$LOG_FILE" 2>&1 || return 1
+    iptables -A INPUT -i wg0 -m comment --comment "$tag" -j ACCEPT >> "$LOG_FILE" 2>&1 || return 1
     iptables -A INPUT -i "$WAN_IFACE" -m state --state RELATED,ESTABLISHED \
-        -m comment --comment "$tag" -j ACCEPT >> "$LOG_FILE" 2>&1
+        -m comment --comment "$tag" -j ACCEPT >> "$LOG_FILE" 2>&1 || return 1
     iptables -A INPUT -i "$WAN_IFACE" -p tcp --dport "$ssh_port" \
-        -m comment --comment "$tag" -j ACCEPT >> "$LOG_FILE" 2>&1
+        -m comment --comment "$tag" -j ACCEPT >> "$LOG_FILE" 2>&1 || return 1
     if [ -n "${WG_LISTEN_PORT:-}" ]; then
         iptables -A INPUT -i "$WAN_IFACE" -p udp --dport "$WG_LISTEN_PORT" \
-            -m comment --comment "$tag" -j ACCEPT >> "$LOG_FILE" 2>&1
+            -m comment --comment "$tag" -j ACCEPT >> "$LOG_FILE" 2>&1 || return 1
     fi
     # Final drop on WAN INPUT - always installed last so SSH ACCEPT precedes it.
-    iptables -A INPUT -i "$WAN_IFACE" -m comment --comment "$tag" -j DROP >> "$LOG_FILE" 2>&1
+    iptables -A INPUT -i "$WAN_IFACE" -m comment --comment "$tag" -j DROP >> "$LOG_FILE" 2>&1 || return 1
 
     persist_iptables_rules
 }
@@ -3087,10 +3117,7 @@ main() {
         prompt_hw "If you select Wi-Fi (wlan0), the Pi becomes a Wi-Fi Access Point."
         LAN_IFACE=$(select_interface "Available interfaces:" "$LAN_IFACE" "$WAN_IFACE" "lan")
         save_config_var "LAN_IFACE" "$LAN_IFACE"
-        if [ -n "$PREV_LAN_IFACE" ] && [ "$PREV_LAN_IFACE" != "$LAN_IFACE" ]; then
-            info "Detected LAN change: $PREV_LAN_IFACE -> $LAN_IFACE (cleaning old interface state)"
-            reset_previous_lan_iface "$PREV_LAN_IFACE" "$LAN_IFACE" "$PREV_IS_WIRELESS"
-        fi
+
         success "LAN Interface selected: $LAN_IFACE"
         echo ""
     fi
@@ -3497,7 +3524,7 @@ main() {
     fi
 
     # Install WireGuard config
-    progress_run_step "Install WireGuard config" "cp \"$WG_CONF_SRC\" \"$WG_CONF_DEST\" && chmod 600 \"$WG_CONF_DEST\""
+    progress_run_step "Install WireGuard config" "install_wireguard_config"
     
     # Enable IP forwarding
     progress_run_step "Enable IP forwarding" "echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-vpn-gateway.conf && sysctl -p /etc/sysctl.d/99-vpn-gateway.conf"
@@ -3508,6 +3535,9 @@ main() {
     fi
 
     # Configure LAN interface
+    if [ -n "$PREV_LAN_IFACE" ] && [ "$PREV_LAN_IFACE" != "$LAN_IFACE" ]; then
+        reset_previous_lan_iface "$PREV_LAN_IFACE" "$LAN_IFACE" "$PREV_IS_WIRELESS"
+    fi
     progress_run_step "Configure LAN interface" "do_configure_lan_interface"
 
     # Configure Pi-local DNS (Option A: dual-DNS plane). Must run before
@@ -3532,16 +3562,16 @@ main() {
     progress_run_step "Start WireGuard VPN" "do_start_wireguard"
 
     # Enforce required NAT/forward rules (runs silently as part of firewall step)
-    ensure_nat_rules
+    ensure_nat_rules || return 1
     if [ "$FIREWALL_ENABLED" = "true" ]; then
-        ensure_wan_firewall_rules
+        ensure_wan_firewall_rules || return 1
     else
         echo "[wan_firewall] Disabled — removing any previously tagged INPUT rules" >> "$LOG_FILE"
-        remove_tagged_input_rules
+        remove_tagged_input_rules || return 1
     fi
     # Always persist iptables/NAT to disk regardless of WAN firewall toggle so
     # forwarding/MASQUERADE survives reboot even if wg0 fails to come up.
-    persist_iptables_rules
+    persist_iptables_rules || return 1
 
     # Auto-updates
     if [ "$AUTO_UPDATES_ENABLED" = "true" ]; then
@@ -3651,15 +3681,12 @@ prepare_saved_start() {
     validate_site_routing "$WG_CONF_SRC" || return 1
     WG_PREV_HASH=""
     [ ! -f "$WG_CONF_DEST" ] || WG_PREV_HASH=$(sha256sum "$WG_CONF_DEST" | awk '{print $1}')
-    if [ "$(readlink -f "$WG_CONF_SRC")" != "$(readlink -f "$WG_CONF_DEST")" ]; then
-        cp "$WG_CONF_SRC" "$WG_CONF_DEST" || return 1
-    fi
-    chmod 600 "$WG_CONF_DEST"
+    install_wireguard_config || return 1
     do_configure_wg_firewall_rules || return 1
     do_configure_lan_ready_service || return 1
     do_software_watchdog_setup || return 1
     do_start_wireguard || return 1
-    ensure_nat_rules
+    ensure_nat_rules || return 1
     persist_iptables_rules
 }
 
