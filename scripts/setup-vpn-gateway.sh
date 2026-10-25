@@ -7,7 +7,7 @@
 set -o pipefail
 
 # --- Paths & Configuration ---
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 LOG_DIR="$ROOT_DIR/logs"
 LOG_FILE="$LOG_DIR/vpn_setup.log"
@@ -29,6 +29,7 @@ load_config() {
     if [ -f "$CONFIG_FILE" ]; then
         source "$CONFIG_FILE"
     fi
+    infer_site_routing_legacy
 }
 
 has_full_config() {
@@ -71,6 +72,7 @@ show_existing_config() {
     printf "${CYAN}│${NC}  LAN interface:   ${BOLD}%-${field_w}s${NC} ${CYAN}│${NC}\n" "${LAN_IFACE:-<unset>}"
     printf "${CYAN}│${NC}  LAN CIDR:        ${BOLD}%-${field_w}s${NC} ${CYAN}│${NC}\n" "${LAN_CIDR:-<unset>}"
     printf "${CYAN}│${NC}  WireGuard:       ${DIM}%-${field_w}s${NC} ${CYAN}│${NC}\n" "$wg_display"
+    printf "${CYAN}│${NC}  Site access:     ${BOLD}%-${field_w}s${NC} ${CYAN}│${NC}\n" "${SITE_ROUTING_MODE:-nat} (${SITE_INBOUND_ACCESS:-outbound})"
     if [ "${PI_BYPASS_ROUTING:-false}" = "true" ]; then
         local fwd_label="all traffic via VPN"
         [ "${LAN_FORWARD_MODE:-all}" = "home" ] && fwd_label="home subnets only"
@@ -168,6 +170,10 @@ detect_pi_connect_active() {
 # Echoes one CIDR per line. Empty output is valid (no specific subnets).
 extract_home_subnets() {
     local cfg="$1"
+    if [ "${SITE_ROUTING_MODE:-nat}" = routed ]; then
+        printf '%s\n' ${SITE_REMOTE_CIDRS//,/ }
+        return
+    fi
     [ -f "$cfg" ] || return 0
     awk '
         /^[[:space:]]*AllowedIPs[[:space:]]*=/ {
@@ -363,6 +369,7 @@ source "$SCRIPT_DIR/verify-routes.sh"
 # Selective single-setting edit (run_selective_edit / --edit).
 # shellcheck source=selective-edit.sh
 source "$SCRIPT_DIR/selective-edit.sh"
+source "$SCRIPT_DIR/site-routing.sh"
 
 # Make this script survive a hangup of its controlling terminal (SSH drop,
 # Pi Connect WebRTC failure, serial console close, etc.) so that the
@@ -586,6 +593,7 @@ WG_BYPASS_RULE_PRIO=100
 # Build the iptables FORWARD/MASQUERADE Up/Down commands shared by both modes.
 # Echoes one command per line.
 _wg_iptables_up_cmds() {
+    _site_iptables_up_cmds
     cat <<EOF
 iptables -C FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT
 iptables -C FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT
@@ -594,6 +602,7 @@ EOF
 }
 
 _wg_iptables_down_cmds() {
+    _site_iptables_down_cmds
     cat <<EOF
 iptables -D FORWARD -i $LAN_IFACE -o wg0 -j ACCEPT 2>/dev/null || true
 iptables -D FORWARD -i wg0 -o $LAN_IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
@@ -660,6 +669,7 @@ _wg_pi_bypass_down_cmds() {
 # user's wg0.conf. Always strips any prior PostUp / PostDown / Table lines we
 # may have written in a previous run, so re-runs converge on the chosen mode.
 do_configure_wg_firewall_rules() {
+    validate_site_routing "$WG_CONF_DEST" || return 1
     if ! grep -q '\[Interface\]' "$WG_CONF_DEST"; then
         echo "ERROR: No [Interface] section found in $WG_CONF_DEST" >> "$LOG_FILE"
         return 1
@@ -761,6 +771,8 @@ do_start_wireguard() {
     if ip link show wg0 >/dev/null 2>&1; then
         wg-quick down wg0 || true
     fi
+    # New PostDown may describe different site networks/interfaces (or NAT).
+    remove_site_routing_rules
     # Flush again after down in case PostDown of the *old* config ran first
     # and the new PostDown (already written) skipped the flush (bypass off).
     flush_pi_bypass_leftovers "${LAN_IFACE:-}"
@@ -1458,6 +1470,12 @@ do_configure_wan_static_ip() {
 # consent because doing so rewrites /etc/wireguard/wg0.conf to set
 # `Table = off` and adds policy-routing PostUp/PostDown lines.
 prompt_pi_bypass_routing() {
+    if [ "${SITE_ROUTING_MODE:-nat}" = routed ]; then
+        PI_BYPASS_ROUTING=true
+        info 'TWO-WAY keeps Pi-bypass enabled so Pi Connect and Pi Internet stay on WAN.'
+        save_config_var PI_BYPASS_ROUTING true
+        return 0
+    fi
     local has_default_route=""
     if [ -n "${WG_CONF_SRC:-}" ]; then
         has_default_route=$(detect_wg_default_route "$WG_CONF_SRC" 2>/dev/null || true)
@@ -1569,12 +1587,12 @@ prompt_lan_forward_mode() {
     [ "$default" = "all" ] && cue="[1/2, default: 1]"
 
     prompt_q "🔀 What should LAN clients send through the VPN?"
-    prompt_h "1) all  — every destination via the tunnel (full site-to-site)."
+    prompt_h "1) all  — all Pi-side device Internet traffic via the VPN."
     prompt_h "         Kill-switch: when wg0 is down, LAN loses Internet."
-    prompt_h "2) home — only home-network subnets via the tunnel; other Internet via WAN."
+    prompt_h "2) home — only VPN-server-side networks via the tunnel; other Internet via WAN."
     prompt_h "         Use this for local home apps without forcing all traffic through VPN."
     if [ "$home_count" -gt 0 ]; then
-        prompt_h "Home subnets from AllowedIPs: ${home_list}"
+        prompt_h "VPN-server-side networks: ${home_list}"
     else
         prompt_hw "No non-default home subnets found in AllowedIPs."
         prompt_hw "Choosing 'home' needs CIDRs like 10.0.0.0/24 in AllowedIPs (not only 0.0.0.0/0)."
@@ -2984,6 +3002,10 @@ do_configure_lan_interface() {
 
 main() {
     trap cleanup_on_interrupt SIGINT
+    SITE_NEW_INSTALL=false
+    if [ ! -f "$CONFIG_FILE" ] && [ ! -f "$LEGACY_CONFIG_1" ] && [ ! -f "$LEGACY_CONFIG_2" ]; then
+        SITE_NEW_INSTALL=true
+    fi
     load_config # Load defaults from file if it exists
     NONINTERACTIVE="${NONINTERACTIVE:-false}"
     USE_EXISTING_CONFIG=false
@@ -3321,7 +3343,10 @@ main() {
         # Default Yes (strongly recommended); persisted so re-runs reuse it.
         prompt_pi_bypass_routing
 
-        # all vs home-only LAN forwarding (only when Pi-bypass is on).
+        # Site access and Internet egress are independent choices.
+        prompt_site_routing || return 1
+
+        # Ask after site selection so explicit networks also work with default AllowedIPs.
         prompt_lan_forward_mode
 
         # Dual-DNS plane (Option A): home DNS for LAN clients, public DNS for
@@ -3351,6 +3376,8 @@ main() {
         fi
         save_config_var "SPEEDTEST_ENABLED" "$SPEEDTEST_ENABLED"
     fi
+
+    validate_site_routing "$WG_CONF_SRC" || return 1
 
     # SSH-safety check is the LAST input-phase step. After this, no prompts
     # may appear until "Setup Complete". The script must run unattended so the
@@ -3605,11 +3632,46 @@ main() {
     ui_echo "${DIM}   Re-run speedtest:     sudo ./gateway-manage-or-setup.sh --speedtest${NC}"
     ui_echo "${DIM}   Re-check routes:      sudo ./scripts/setup-vpn-gateway.sh --verify-routes${NC}"
     
+    if [ "${SITE_ROUTING_MODE:-nat}" = routed ]; then
+        site_routing_instructions
+    fi
     save_config
     ui_echo "${BLUE}ℹ️${NC}  Configuration saved to: $CONFIG_FILE"
 }
 
 # Standalone speedtest (no full setup). Invoked by manage menu / --speedtest.
+prepare_saved_start() {
+    load_config
+    init_log
+    check_root
+    has_full_config || return 1
+    WG_CONF_SRC="$WG_CONF_PATH"
+    WG_CONF_DEST="/etc/wireguard/wg0.conf"
+    _edit_refresh_lan_gateway
+    validate_site_routing "$WG_CONF_SRC" || return 1
+    WG_PREV_HASH=""
+    [ ! -f "$WG_CONF_DEST" ] || WG_PREV_HASH=$(sha256sum "$WG_CONF_DEST" | awk '{print $1}')
+    if [ "$(readlink -f "$WG_CONF_SRC")" != "$(readlink -f "$WG_CONF_DEST")" ]; then
+        cp "$WG_CONF_SRC" "$WG_CONF_DEST" || return 1
+    fi
+    chmod 600 "$WG_CONF_DEST"
+    do_configure_wg_firewall_rules || return 1
+    do_configure_lan_ready_service || return 1
+    do_software_watchdog_setup || return 1
+    do_start_wireguard || return 1
+    ensure_nat_rules
+    persist_iptables_rules
+}
+
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+    return 0
+fi
+
+if [ "${1:-}" = "--prepare-start" ]; then
+    prepare_saved_start
+    exit $?
+fi
+
 if [ "${1:-}" = "--speedtest" ]; then
     run_speedtest_only
     exit $?

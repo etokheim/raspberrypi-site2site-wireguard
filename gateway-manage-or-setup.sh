@@ -130,6 +130,13 @@ run_start() {
         return
     fi
 
+    # Validate and prepare saved routing before changing any live interfaces.
+    # Missing site fields keep legacy NAT; repair boot units without full setup.
+    if ! NONINTERACTIVE=true bash "$SETUP_SCRIPT" --prepare-start; then
+        echo "Could not prepare saved WireGuard routing. Check configuration and setup log." >&2
+        return 1
+    fi
+
     # Ensure LAN interface has its static IP (may not be set if systemd service didn't run)
     if [ -n "${LAN_IFACE:-}" ] && [ -n "${LAN_CIDR:-}" ]; then
         local lan_gw
@@ -174,7 +181,7 @@ run_start() {
     fi
 
     if is_wg_active; then
-        echo "WireGuard (wg0) already active."
+        echo "WireGuard (wg0) active with saved routing."
         return
     fi
     echo "Starting WireGuard (wg0)..."
