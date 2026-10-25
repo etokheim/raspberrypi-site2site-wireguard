@@ -316,6 +316,10 @@ cleanup_gateway_nat_rules() {
     ip route flush table "$bypass_table" >> "$LOG_FILE" 2>&1 || true
     ip -6 route flush table "$bypass_table" >> "$LOG_FILE" 2>&1 || true
 
+    # Fixed-name owned chains are removed even if saved CIDRs/interfaces changed.
+    source "$(dirname "${BASH_SOURCE[0]}")/site-routing.sh"
+    remove_site_routing_rules
+
     # Remove specific forward rules (LAN -> wg0 and LAN -> WAN)
     if [ -n "$lan_iface" ]; then
         if iptables -C FORWARD -i "$lan_iface" -o wg0 -j ACCEPT >/dev/null 2>&1; then

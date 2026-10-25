@@ -254,6 +254,16 @@ The execution phase must finish on its own even if the operator's terminal goes 
 
 ## Living Decisions (Automatic Maintenance)
 
+### Guided IPv4 two-way site routing
+
+- New routed selections default/recommend `sites`: all protocols both directions between selected networks, not arbitrary Internet peers. Preserve saved restricted/outbound choices; explain the trust boundary and offer both alternatives.
+
+- Use stable **Pi-side** / **VPN-server-side** labels. Recommend TWO-WAY only for new installs; missing `SITE_*` fields always retain legacy `nat`, including `--apply` and `--start`. Migration is explicit via Edit → setting 13.
+- Keep explicit `SITE_REMOTE_CIDRS` separate from peer AllowedIPs and `LAN_FORWARD_MODE` (Internet egress). Strictly validate canonical IPv4 CIDRs, peer coverage, access-source subsets and LAN/WAN overlap before executing/generated shell hooks. Never infer site networks from default routes.
+- Routed mode requires Pi-bypass. Add site routes to main and table 200 without touching the WAN default; allow NEW inbound only from selected/restricted sources or choose outbound-only. Terminate NAT traversal with ACCEPT exemptions before existing MASQUERADE, retaining Internet NAT.
+- Own reversible `VPN_SITE_FWD`/`VPN_SITE_NAT` chains; remove them regardless of changed settings on restart/cleanup. Explain external server peer Networks behind client, return routes and Site Magic advertisement. Do not claim IPv6 support for this feature.
+- Rootless regression tests: `python3 -m unittest discover -s tests -v`; mock network commands, never apply live networking in tests.
+
 When a user prompt introduces a new durable project decision:
 
 1. Update this `AGENTS.md` with that decision.

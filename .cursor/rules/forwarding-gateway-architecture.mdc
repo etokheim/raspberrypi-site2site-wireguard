@@ -5,6 +5,10 @@ alwaysApply: true
 
 # Forwarding Gateway, Not Full-Tunnel Client
 
+New routed selections default/recommend `SITE_INBOUND_ACCESS=sites`: all protocols both directions between selected site networks and the Pi-side LAN, not arbitrary Internet peers. Preserve saved restricted/outbound policies on Enter; retain both as explicit alternatives and explain trust in selected devices.
+
+For IPv4 TWO-WAY (`SITE_ROUTING_MODE=routed`), require Pi-bypass and explicit validated `SITE_REMOTE_CIDRS` (not default AllowedIPs). Add these routes in main and table 200; keep the Pi WAN default. Own reversible `VPN_SITE_FWD`/`VPN_SITE_NAT` chains: selected/restricted NEW inbound only (or outbound-only), NAT ACCEPT exemptions before MASQUERADE, keep Internet NAT. Missing SITE fields mean legacy NAT even on apply/start; only new installs recommend TWO-WAY by default. Explain external server peer Networks behind client/return routes/Site Magic advertisement. Use Pi-side / VPN-server-side labels and do not claim IPv6 completeness. Run rootless command-generation tests in `tests/`.
+
 This repository configures the Raspberry Pi as a site-to-site forwarding gateway. The gateway's own outbound traffic must NEVER go through the VPN by default. Locally-generated traffic from the Pi (apt, Pi Connect, NTP, DNS, the WireGuard handshake itself) must always egress via WAN, even when the user's `AllowedIPs` includes `0.0.0.0/0`.
 
 The mechanism is **Pi-bypass routing**, controlled by `PI_BYPASS_ROUTING` in `vpn-gateway.conf`:

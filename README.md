@@ -2,14 +2,14 @@
 SEO-friendly terms: *Raspberry Pi site-to-site VPN*, *WireGuard gateway*, *home network extension*, *remote office Wi‑Fi to home network*, *plug-and-play VPN router*.
 
 ## Pitch
-Set up a **Raspberry Pi WireGuard site-to-site VPN** in minutes. One Ethernet cable in, optional Pi Wi‑Fi out, and every device on that Wi‑Fi (or LAN) behaves as if it's on your **home network**—no router changes, no port forwarding, fully NAT-friendly. Perfect for remote offices, cabins, and temporary sites.
+Set up a **Raspberry Pi WireGuard gateway** for a remote office, cabin, or temporary site. Choose **TWO-WAY routed access** (recommended for new installs; requires VPN-server-side routes) or keep **OUTBOUND NAT** (legacy, outbound access only). Both work behind NAT/CGNAT without inbound port forwarding on the Pi-side WAN. See [guided two-way setup](docs/two-way-site-routing.md).
 
 ---
 
 Build a **plug-and-play site-to-site VPN** with a single **Raspberry Pi** and **one Ethernet cable**. The script turns the Pi into:
 - A **WireGuard VPN client** that extends your home network to a remote site.
-- A **DHCP router + NAT** for a private subnet.
-- An optional **Wi‑Fi access point** so every device on that Wi‑Fi "pretends" to be on your home network—no router changes needed.
+- A **DHCP router** for a private subnet, with routed site access or legacy NAT.
+- An optional **Wi‑Fi access point** for Pi-side devices; TWO-WAY access needs VPN-server-side return routes.
 
 ## Why this is simple
 - Works behind **NAT/CGNAT** (outbound WireGuard only; no port forwarding required).
@@ -91,6 +91,8 @@ sudo ./gateway-manage-or-setup.sh [OPTIONS]
 - **Persistence**: all settings survive reboots (systemd services, static IPs, iptables).
 
 ## How traffic is routed
+
+**New: [guided TWO-WAY IPv4 access](docs/two-way-site-routing.md).** New installs recommend routed access with all protocols in both directions between the Pi-side LAN and explicitly selected VPN-server-side networks, not arbitrary Internet peers. Restricted-source and outbound-only access remain alternatives; saved routed choices are retained. Saved NAT installs stay NAT unless explicitly migrated using Edit → setting 13. TWO-WAY changes site traffic only; Internet forwarding below remains a separate choice. Legacy sections that derive home routes from AllowedIPs apply to NAT mode; routed mode uses explicit `SITE_REMOTE_CIDRS` instead.
 
 The setup wizard asks whether to enable **Pi-bypass routing** (recommended), then whether LAN clients should send **all** traffic or **only home-network** traffic through the VPN. The WireGuard peer config is otherwise left as-is (`AllowedIPs` is not rewritten).
 

@@ -12,6 +12,7 @@ _edit_setting_value() {
         lan_cidr)      echo "${LAN_CIDR:-<unset>}" ;;
         wg_conf)       echo "${WG_CONF_PATH:-<unset>}" ;;
         pi_bypass)     echo "${PI_BYPASS_ROUTING:-false}" ;;
+        site_routing)  echo "${SITE_ROUTING_MODE:-nat}: ${SITE_REMOTE_CIDRS:-no site networks}" ;;
         lan_forward)
             if [ "${PI_BYPASS_ROUTING:-false}" != "true" ]; then
                 echo "n/a (Pi-bypass off)"
@@ -58,6 +59,7 @@ _edit_print_menu() {
     printf "   ${CYAN}%2s)${NC} %-22s ${DIM}%s${NC}\n" "10" "WAN firewall"         "$(_edit_setting_value firewall)"
     printf "   ${CYAN}%2s)${NC} %-22s ${DIM}%s${NC}\n" "11" "Auto-updates"         "$(_edit_setting_value auto_updates)"
     printf "   ${CYAN}%2s)${NC} %-22s ${DIM}%s${NC}\n" "12" "Hardware watchdog"    "$(_edit_setting_value watchdog)"
+    printf "   ${CYAN}%2s)${NC} %-22s ${DIM}%s${NC}\n" "13" "Two-way site access"   "$(_edit_setting_value site_routing)"
     echo ""
     echo -e "   ${DIM}q)${NC} Cancel"
     echo ""
@@ -68,6 +70,17 @@ _edit_prompt_setting() {
     local key="$1"
     EDIT_KEY="$key"
     case "$key" in
+        site_routing)
+            SITE_NEW_INSTALL=false
+            local old_bypass="${PI_BYPASS_ROUTING:-false}"
+            prompt_site_routing || return 1
+            SITE_ENABLE_BYPASS=false
+            if [ "$old_bypass" != true ] && [ "${PI_BYPASS_ROUTING:-false}" = true ]; then
+                SITE_ENABLE_BYPASS=true
+                prompt_home_dns
+                prompt_pi_dns
+            fi
+            ;;
         wan_iface)
             prompt_q "Select the WAN interface"
             prompt_h "Upstream Internet port."
@@ -109,6 +122,10 @@ _edit_prompt_setting() {
             save_config_var "WG_CONF_PATH" "$WG_CONF_PATH"
             ;;
         pi_bypass)
+            if [ "${SITE_ROUTING_MODE:-nat}" = routed ]; then
+                warn 'TWO-WAY requires Pi-bypass for Pi Connect safety. Choose OUTBOUND NAT in option 13 before disabling it.'
+                return 1
+            fi
             prompt_pi_bypass_routing
             if [ "${PI_BYPASS_ROUTING:-false}" = "true" ]; then
                 prompt_lan_forward_mode
@@ -212,6 +229,7 @@ _edit_refresh_lan_gateway() {
 _edit_apply_setting() {
     local key="$1"
     _edit_refresh_lan_gateway
+    validate_site_routing "$WG_CONF_SRC" || return 1
 
     progress_clear
     APPLYING_CHANGES=true
@@ -230,11 +248,11 @@ _edit_apply_setting() {
             progress_add_step "Reload WireGuard"
             progress_add_step "Verify routing"
             ;;
-        wg_conf|pi_bypass|lan_forward)
+        wg_conf|pi_bypass|lan_forward|site_routing)
             progress_add_step "Install WireGuard config"
             progress_add_step "Update WireGuard policy routing"
             progress_add_step "Reload WireGuard"
-            if [ "$key" = "pi_bypass" ] && [ "${PI_BYPASS_ROUTING:-false}" = "true" ]; then
+            if { [ "$key" = "pi_bypass" ] || [ "${SITE_ENABLE_BYPASS:-false}" = true ]; } && [ "${PI_BYPASS_ROUTING:-false}" = "true" ]; then
                 progress_add_step "Configure Pi-local DNS"
                 progress_add_step "Configure DHCP server"
             fi
@@ -277,7 +295,7 @@ _edit_apply_setting() {
 
     # Detach for network-disruptive changes only.
     case "$key" in
-        lan_iface|lan_cidr|wg_conf|pi_bypass|lan_forward|wan_iface|wan_static)
+        lan_iface|lan_cidr|wg_conf|pi_bypass|lan_forward|site_routing|wan_iface|wan_static)
             become_unattended
             ;;
     esac
@@ -324,7 +342,7 @@ _edit_apply_setting() {
             persist_iptables_rules
             progress_run_step "Verify routing" "do_verify_routes"
             ;;
-        wg_conf|pi_bypass|lan_forward)
+        wg_conf|pi_bypass|lan_forward|site_routing)
             WG_PREV_HASH=""
             if [ -f "$WG_CONF_DEST" ]; then
                 WG_PREV_HASH=$(sha256sum "$WG_CONF_DEST" | awk '{print $1}')
@@ -332,7 +350,7 @@ _edit_apply_setting() {
             progress_run_step "Install WireGuard config" "cp \"$WG_CONF_SRC\" \"$WG_CONF_DEST\" && chmod 600 \"$WG_CONF_DEST\""
             progress_run_step "Update WireGuard policy routing" "do_configure_wg_firewall_rules"
             progress_run_step "Reload WireGuard" "do_start_wireguard"
-            if [ "$key" = "pi_bypass" ] && [ "${PI_BYPASS_ROUTING:-false}" = "true" ]; then
+            if { [ "$key" = "pi_bypass" ] || [ "${SITE_ENABLE_BYPASS:-false}" = true ]; } && [ "${PI_BYPASS_ROUTING:-false}" = "true" ]; then
                 if [ -n "${PI_DNS_SERVERS:-}" ]; then
                     progress_run_step "Configure Pi-local DNS" "do_configure_pi_dns"
                 fi
@@ -427,6 +445,7 @@ run_selective_edit() {
         read -r choice < /dev/tty
         case "$choice" in
             1) key="wan_iface" ;;
+            13) key="site_routing" ;;
             2) key="lan_iface" ;;
             3) key="lan_cidr" ;;
             4) key="wg_conf" ;;
