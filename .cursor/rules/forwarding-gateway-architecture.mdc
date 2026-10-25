@@ -23,10 +23,12 @@ The mechanism is **Pi-bypass routing**, controlled by `PI_BYPASS_ROUTING` in `vp
 
 Rules:
 
+- Validate `FW_RULE_TAG` as ASCII `^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$` before setup/edit/start/cleanup can mutate firewall state. Default only unset values to `vpn-gateway`; reject explicit empty values. Use the same configured tag for install and cleanup. libxtables apostrophe/backslash escaping is not shell quoting; unsupported existing tags require manual review, not guessed decoding/deletion.
 - Do not add a default route via `wg0` to the main routing table.
 - Do not couple WAN MASQUERADE or LAN→WAN FORWARD to `wg-quick` PostUp/PostDown — they belong in `ensure_nat_rules` and persist independently. LAN→WAN FORWARD is required for `LAN_FORWARD_MODE=home`.
 - The `iif=$LAN_IFACE` rule is the single source of truth for "forwarded LAN packet". Source-IP-based rules (`from <CIDR>`) are weaker - they can match Pi-local traffic that happens to use the LAN gateway address as a source.
 - Kill-switch (`LAN_FORWARD_MODE=all`): when `wg0` is down, LAN clients lose Internet but the Pi stays online. Do not "fix" this by adding fallback routes via WAN for LAN traffic in `all` mode.
+- Enforce that IPv4 kill-switch with persistent owned `VPN_GW_EGRESS` FORWARD rules independent of PostDown: table-200 routes/rules disappear on down and otherwise fall through to WAN. Preserve Pi OUTPUT; clear the guard for home/legacy, replace it safely on LAN changes, and remove it on cleanup. Test actual generated down hooks and mock link removal, not only up-route strings.
 - Home-only (`LAN_FORWARD_MODE=home`): when `wg0` is down, only home destinations fail; general Internet continues via WAN. That is intentional.
 - The constants `WG_BYPASS_TABLE_ID=200` and `WG_BYPASS_RULE_PRIO=100` are duplicated between `scripts/setup-vpn-gateway.sh` and `scripts/cleanup-gateway.sh`. Keep them in sync.
 - `LAN_FORWARD_MODE=home` needs non-default home CIDRs in AllowedIPs; warn if missing. Prefer `HOME_DNS_MODE=custom` (not tunnel-exit) in home mode.

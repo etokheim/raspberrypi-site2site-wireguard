@@ -93,6 +93,7 @@ over Internet, Pi Connect, apt) working when the user's `wg0.conf` has
 
 - Forwarded packets (`iif=$LAN_IFACE`) -> table 200 -> (see LAN_FORWARD_MODE).
 - Locally-generated packets (no `iif`) -> main table -> WAN.
+- Keep the IPv4 `VPN_GW_EGRESS` FORWARD guard independent of wg-quick hooks: in bypass/all mode reject LAN egress other than wg0 even after PostDown/link removal. Persist it, clear it for home/legacy, and remove it on cleanup. Policy-table fallthrough alone is not a kill-switch.
 - Per-peer subnets (non-default `AllowedIPs` entries) get explicit
   `dev wg0` routes in BOTH the main table (so the Pi reaches them) and
   table 200 (so LAN clients reach them via the tunnel).
@@ -251,6 +252,9 @@ The execution phase must finish on its own even if the operator's terminal goes 
 - Keep a dedicated FD open on the operator's TTY for the progress box/spinner. Detailed command output (apt, wg-quick, systemctl) stays in the log only — do **not** auto-tail the full log onto the TTY (that interleaves with the spinner and makes the UI unreadable). Operators who want the raw stream can `tail -f` the log themselves.
 - Detect remote-management daemons (Raspberry Pi Connect, etc.) before the execution phase and warn explicitly when WireGuard `AllowedIPs` includes a default route (`0.0.0.0/0`, `::/0`, or `0.0.0.0/1` + `128.0.0.0/1`) - that single setting is the most common way a remote-managed Pi loses its management plane after `wg-quick up`.
 - Never add a prompt after the input phase. Any new question must move into the input-collection block.
+- Never reset the previous LAN during input collection. During execution preserve its addresses/connection if it is now WAN or carries SSH.
+- Keep generated config answers literal when sourced; never interpolate peer filenames into eval strings. Stage private configs with random mode-600 temporary files and checked writes before atomic replacement. Required setup/edit steps and firewall persistence must fail nonzero rather than reach a success banner.
+- Restrict `FW_RULE_TAG` to ASCII `^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$` before any setup/edit/start/cleanup firewall mutation. Only unset means `vpn-gateway`; empty is invalid. libxtables quoting is not shell quoting: unsupported historical tags need manual ownership review, not guessed decoding. Setup and cleanup must honor the same configured tag.
 
 ## Living Decisions (Automatic Maintenance)
 

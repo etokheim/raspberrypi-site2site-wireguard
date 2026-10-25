@@ -228,6 +228,7 @@ _edit_refresh_lan_gateway() {
 # Apply only what EDIT_KEY requires. Uses progress box + optional detach.
 _edit_apply_setting() {
     local key="$1"
+    validate_firewall_rule_tag "${FW_RULE_TAG-vpn-gateway}" || return 1
     _edit_refresh_lan_gateway
     validate_site_routing "$WG_CONF_SRC" || return 1
 
@@ -303,12 +304,12 @@ _edit_apply_setting() {
     case "$key" in
         wan_iface)
             progress_run_step "Update NAT / firewall for WAN" "
-                ensure_nat_rules
+                ensure_nat_rules &&
                 if [ \"${FIREWALL_ENABLED:-true}\" = true ]; then
                     ensure_wan_firewall_rules
                 else
                     remove_tagged_input_rules
-                fi
+                fi &&
                 persist_iptables_rules
             "
             if [ "${PI_BYPASS_ROUTING:-false}" = "true" ]; then
@@ -332,14 +333,14 @@ _edit_apply_setting() {
             fi
             # Force rewrite of PostUp (iif=LAN) even if peer file unchanged.
             progress_run_step "Update WireGuard policy routing" "
-                cp \"\$WG_CONF_SRC\" \"\$WG_CONF_DEST\" && chmod 600 \"\$WG_CONF_DEST\"
+                install_wireguard_config &&
                 do_configure_wg_firewall_rules
             "
             # Force restart so new iif rule applies.
             WG_PREV_HASH="force-reload"
             progress_run_step "Reload WireGuard" "do_start_wireguard"
-            ensure_nat_rules
-            persist_iptables_rules
+            ensure_nat_rules || return 1
+            persist_iptables_rules || return 1
             progress_run_step "Verify routing" "do_verify_routes"
             ;;
         wg_conf|pi_bypass|lan_forward|site_routing)
@@ -347,7 +348,7 @@ _edit_apply_setting() {
             if [ -f "$WG_CONF_DEST" ]; then
                 WG_PREV_HASH=$(sha256sum "$WG_CONF_DEST" | awk '{print $1}')
             fi
-            progress_run_step "Install WireGuard config" "cp \"$WG_CONF_SRC\" \"$WG_CONF_DEST\" && chmod 600 \"$WG_CONF_DEST\""
+            progress_run_step "Install WireGuard config" "install_wireguard_config"
             progress_run_step "Update WireGuard policy routing" "do_configure_wg_firewall_rules"
             progress_run_step "Reload WireGuard" "do_start_wireguard"
             if { [ "$key" = "pi_bypass" ] || [ "${SITE_ENABLE_BYPASS:-false}" = true ]; } && [ "${PI_BYPASS_ROUTING:-false}" = "true" ]; then
@@ -356,8 +357,8 @@ _edit_apply_setting() {
                 fi
                 progress_run_step "Configure DHCP server" "do_configure_dnsmasq"
             fi
-            ensure_nat_rules
-            persist_iptables_rules
+            ensure_nat_rules || return 1
+            persist_iptables_rules || return 1
             progress_run_step "Verify routing" "do_verify_routes"
             ;;
         home_dns)
@@ -383,7 +384,7 @@ _edit_apply_setting() {
                     ensure_wan_firewall_rules
                 else
                     remove_tagged_input_rules
-                fi
+                fi &&
                 persist_iptables_rules
             "
             ;;
@@ -419,6 +420,7 @@ _edit_apply_setting() {
 
 run_selective_edit() {
     load_config
+    validate_firewall_rule_tag "${FW_RULE_TAG-vpn-gateway}" || return 1
     NONINTERACTIVE=false
     init_log
     check_root

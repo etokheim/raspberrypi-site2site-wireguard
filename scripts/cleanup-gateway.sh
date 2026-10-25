@@ -6,7 +6,8 @@
 
 set -o pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/firewall-common.sh"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 LOG_DIR="$ROOT_DIR/logs"
 LOG_FILE="$LOG_DIR/vpn_cleanup.log"
@@ -319,6 +320,7 @@ cleanup_gateway_nat_rules() {
     # Fixed-name owned chains are removed even if saved CIDRs/interfaces changed.
     source "$(dirname "${BASH_SOURCE[0]}")/site-routing.sh"
     remove_site_routing_rules
+    remove_lan_egress_guard
 
     # Remove specific forward rules (LAN -> wg0 and LAN -> WAN)
     if [ -n "$lan_iface" ]; then
@@ -376,26 +378,16 @@ restore_wan_dhcp() {
 }
 
 cleanup_wan_firewall_rules() {
+    local tag="${FW_RULE_TAG-vpn-gateway}"
+    validate_firewall_rule_tag "$tag" || return 1
     local wan_iface="$WAN_IFACE"
     local lan_iface="$LAN_IFACE"
     local ssh_port="${SSH_PORT:-22}"
     local wg_port="${WG_LISTEN_PORT:-}"
-    local tag="vpn-gateway"
 
     # Preferred path: remove every INPUT rule tagged by setup. Handles SSH_PORT
     # / WG_LISTEN_PORT / WAN_IFACE having changed since the rule was installed.
-    local saved
-    saved=$(iptables-save 2>/dev/null) || saved=""
-    if [ -n "$saved" ]; then
-        echo "$saved" | awk -v tag="$tag" '
-            /^-A INPUT/ && index($0, "--comment \"" tag "\"") {
-                sub(/^-A /, "-D ")
-                print
-            }' | while read -r rule; do
-            # shellcheck disable=SC2086
-            iptables $rule >> "$LOG_FILE" 2>&1 || true
-        done
-    fi
+    remove_gateway_input_rules "$tag" || return 1
 
     # Legacy fallback: remove un-tagged rules from older installs.
     if iptables -C INPUT -i lo -j ACCEPT >/dev/null 2>&1; then
@@ -459,6 +451,7 @@ main() {
         source "$CONFIG_FILE"
         echo "Loaded configuration from $CONFIG_FILE" >> "$LOG_FILE"
     fi
+    validate_firewall_rule_tag "${FW_RULE_TAG-vpn-gateway}" || return 1
     
     print_header
 
@@ -648,4 +641,6 @@ main() {
     fi
 }
 
-main
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main
+fi
